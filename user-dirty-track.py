@@ -1,12 +1,25 @@
 import os
 import sys
-import fcntl
+from fcntl import ioctl
 import psutil
 import struct
 import time
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
+
+def get_major_num(device_path):
+    """获取设备文件的 major number"""
+    if not os.path.exists(device_path):
+        raise FileNotFoundError(f"设备文件不存在：{device_path}")
+    st = os.stat(device_path)
+    return os.major(st.st_rdev)
+
+try:
+    MAJOR_NUM = get_major_num(DEVICE_PATH)
+except FileNotFoundError as e:
+    print(e)
+    sys.exit(1)
 
 # 定义ioctl命令
 IOC_NRBITS = 8
@@ -27,8 +40,6 @@ IOC_IN = IOC_WRITE << IOC_DIRSHIFT
 IOC_OUT = IOC_READ << IOC_DIRSHIFT
 IOC_IO = (IOC_WRITE | IOC_READ) << IOC_DIRSHIFT
 
-MAJOR_NUM = 114
-
 def _IO(type, nr):
     return (IOC_NONE | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
 
@@ -41,11 +52,12 @@ def _IOW(type, nr, size):
 def _IOWR(type, nr, size):
     return (IOC_IO | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
 
-IOCTL_SET_DIRTY_MAP_PATH = _IOW(MAJOR_NUM, 1, 256)
-IOCTL_START_PID = _IOWR(MAJOR_NUM, 2, 4)
-IOCTL_STOP_PID = _IOWR(MAJOR_NUM, 3, 4)
-IOCTL_STOP_ALL = _IO(MAJOR_NUM, 4)
-IOCTL_GET_DIRTY_MAP_PATH = _IOR(MAJOR_NUM, 5, 256)
+DIRTY_TRACK_MAGIC = ord('d')
+IOCTL_SET_DIRTY_MAP_PATH = _IOW(DIRTY_TRACK_MAGIC, 1, 256)
+IOCTL_START_PID = _IOW(DIRTY_TRACK_MAGIC, 2, 4)
+IOCTL_STOP_PID = _IOW(DIRTY_TRACK_MAGIC, 3, 4)
+IOCTL_STOP_ALL = _IO(DIRTY_TRACK_MAGIC, 4)
+IOCTL_GET_DIRTY_MAP_PATH = _IOR(DIRTY_TRACK_MAGIC, 5, 256)
 
 # 定义容器进程树的 pid列表
 container_pids = []
@@ -55,29 +67,29 @@ def ioctl_set_dirty_map_path(device_fd, path):
     # 路径字符串打包为定长字节数组
     buf = struct.pack(f'{len(path)}s', path.encode('utf-8'))
     # 调用 ioctl 传递路径给内核模块
-    fcntl.ioctl(device_fd, IOCTL_SET_DIRTY_MAP_PATH, buf)
+    ioctl(device_fd, IOCTL_SET_DIRTY_MAP_PATH, buf)
 
 def ioctl_start_pid(device_fd, pid):
     """通过ioctl启动指定进程的脏页跟踪"""
     # pid_t 在 Python 中可以用 struct.pack 来打包
     buf = bytearray(struct.pack('I', pid))
-    fcntl.ioctl(device_fd, IOCTL_START_PID, buf)
+    ioctl(device_fd, IOCTL_START_PID, buf)
     ret = struct.unpack_from('I', buf)[0]
 
 def ioctl_stop_pid(device_fd, pid):
     """通过ioctl停止指定进程的脏页跟踪"""
     buf = bytearray(struct.pack('I', pid))
-    fcntl.ioctl(device_fd, IOCTL_STOP_PID, buf)
+    ioctl(device_fd, IOCTL_STOP_PID, buf)
     ret = struct.unpack_from('I', buf)[0]
 
 def ioctl_stop_all(device_fd):
     """通过ioctl停止所有进程的脏页跟踪"""
-    fcntl.ioctl(device_fd, IOCTL_STOP_ALL, None)
+    ioctl(device_fd, IOCTL_STOP_ALL, None)
 
 def ioctl_get_dirty_map_path(device_fd):
     """通过ioctl获取脏页跟踪的目录路径"""
     buf = bytearray(struct.pack('256s', b'\0' * 256))
-    fcntl.ioctl(device_fd, IOCTL_GET_DIRTY_MAP_PATH, buf)
+    ioctl(device_fd, IOCTL_GET_DIRTY_MAP_PATH, buf)
     # 解包路径字符串
     path = struct.unpack_from(f'{len(buf)}s', buf)[0]
     return path
@@ -131,6 +143,11 @@ if __name__ == '__main__':
             get_runc_container_pidtree(args.container)
 
     with open(DEVICE_PATH, 'wb') as device_fd:
+        print ("{0}的MAJOR_NUM为{1}".format(DEVICE_PATH, MAJOR_NUM))
+        print ("IOCTL_SET_DIRTY_MAP_PATH的值为{0:o}".format(IOCTL_SET_DIRTY_MAP_PATH))
+        print ("IOCTL_START_PID的值为{0:o}".format(IOCTL_START_PID))
+        print ("IOCTL_STOP_PID的值为{0:o}".format(IOCTL_STOP_PID))
+        print ("IOCTL_GET_DIRTY_MAP_PATH的值为{0:o}".format(IOCTL_GET_DIRTY_MAP_PATH))
         # 设置脏页跟踪的目录路径
         if args.action == 'set_path':
             global tmpfs_path
@@ -152,9 +169,9 @@ if __name__ == '__main__':
                 mount_cmd = 'mount -t tmpfs none '+ tmpfs_path
                 ret = os.system(mount_cmd)
             print(f"设置脏页跟踪的目录路径为: {tmpfs_path}")
-            ioctl_set_dirty_map_path(device_fd.fileno(), tmpfs_path)
+            ioctl_set_dirty_map_path(device_fd, tmpfs_path)
         else:
-            path = ioctl_get_dirty_map_path(device_fd.fileno())
+            path = ioctl_get_dirty_map_path(device_fd)
             # print(path)
             path = path.decode('utf-8').rstrip('\0')
             if not path:
@@ -162,16 +179,16 @@ if __name__ == '__main__':
                 sys.exit(1)
             # 根据用户指定的操作进行跟踪控制
             elif args.action == 'stop_all':
-                ioctl_stop_all(device_fd.fileno())
+                ioctl_stop_all(device_fd)
             elif args.action == 'start':
                 print("dirty-map path: {0}".format(path))
                 time.sleep(2)
                 # 启动指定容器的脏页跟踪
                 for pid in container_pids:
-                    # ioctl_start_pid(device_fd.fileno(), pid)
+                    # ioctl_start_pid(device_fd, pid)
                     buffer = bytearray(struct.pack('i', pid))
                     # print(type(buffer))
-                    fcntl.ioctl(device_fd.fileno(), IOCTL_START_PID, buffer)
+                    ioctl(device_fd, IOCTL_START_PID, buffer)
                     ret = struct.unpack_from('i', buffer)[0]
                     # print("start ret = {0}".format(ret))
                     while ret != 0:
@@ -183,10 +200,10 @@ if __name__ == '__main__':
             elif args.action == 'stop':
                 # 停止指定容器的页面跟踪
                 for pid in container_pids:
-                    # ioctl_stop_pid(device_fd.fileno(), pid)
+                    # ioctl_stop_pid(device_fd, pid)
                     buffer = bytearray(4)
                     struct.pack_into('i', buffer, 0, pid)
-                    fcntl.ioctl(device_fd.fileno(), IOCTL_STOP_PID, buffer)
+                    ioctl(device_fd, IOCTL_STOP_PID, buffer)
                     ret = struct.unpack_from('I', buffer)[0]
                     while ret != 0:
                         print("stop ret = {0}".format(ret))

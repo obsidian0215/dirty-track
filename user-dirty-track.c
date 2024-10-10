@@ -145,7 +145,7 @@ void handle_stop_pid(int fd, pid_t pid) {
 
 // 处理停止所有进程跟踪的逻辑
 void handle_stop_all(int fd) {
-    if (ioctl(fd, IOCTL_STOP_ALL) < 0) {
+    if (ioctl(fd, IOCTL_CLEAR_SOFT_DIRTY) < 0) {
         error_exit("无法停止所有进程的脏页跟踪");
     }
     printf("所有进程的脏页跟踪停止\n");
@@ -219,6 +219,10 @@ int main(int argc, char *argv[]) {
         error_exit("无法打开设备文件");
     }
 
+    printf("IOCTL_SET_DIRTY_MAP_PATH = 0x%o\n", IOCTL_SET_DIRTY_MAP_PATH);
+    printf("IOCTL_START_PID = 0x%o\n", IOCTL_START_PID);
+    printf("IOCTL_STOP_PID = 0x%o\n", IOCTL_STOP_PID);
+    printf("IOCTL_GET_DIRTY_MAP_PATH = 0x%o\n", IOCTL_GET_DIRTY_MAP_PATH);
     // 进入命令处理循环
     run_loop(fd);
 
