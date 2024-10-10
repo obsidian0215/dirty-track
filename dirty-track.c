@@ -240,6 +240,7 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
         if (addr_dirty) {
             // 此次页错误为soft-dirty，则写错误次数+1
             addr_dirty->write_count++;
+            addr_dirty->page_type = PAGE_PMD;
         } else {
             // 初始化新的页记录并加入dirty-map
             addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
@@ -273,6 +274,7 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
         if (addr_dirty) {
             // 此次页错误为soft-dirty，则写错误次数+1
             addr_dirty->write_count++;
+            addr_dirty->page_type = PAGE_PTE;
         } else {
             // 初始化新的页记录并加入dirty-map
             addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
