@@ -185,30 +185,30 @@ if __name__ == '__main__':
                 time.sleep(2)
                 # 启动指定容器的脏页跟踪
                 for pid in container_pids:
-                    # ioctl_start_pid(device_fd, pid)
-                    buffer = bytearray(struct.pack('i', pid))
-                    # print(type(buffer))
-                    ioctl(device_fd, IOCTL_START_PID, buffer)
-                    ret = struct.unpack_from('i', buffer)[0]
-                    # print("start ret = {0}".format(ret))
-                    while ret != 0:
-                        print("start ret = {0}".format(ret))
-                        time.sleep(1)
-                        ret = struct.unpack('I', buffer)[0]
+                    ioctl_start_pid(device_fd, pid)
+                    # buffer = bytearray(struct.pack('i', pid))
+                    # # print(type(buffer))
+                    # ioctl(device_fd, IOCTL_START_PID, buffer)
+                    # ret = struct.unpack_from('i', buffer)[0]
+                    # # print("start ret = {0}".format(ret))
+                    # while ret != 0:
+                    #     print("start ret = {0}".format(ret))
+                    #     time.sleep(1)
+                    #     ret = struct.unpack('I', buffer)[0]
+
                     print(f"启动对容器 {args.container} (PID: {pid}) 的脏页跟踪")
-                    # time.sleep(5)
             elif args.action == 'stop':
                 # 停止指定容器的页面跟踪
                 for pid in container_pids:
-                    # ioctl_stop_pid(device_fd, pid)
-                    buffer = bytearray(4)
-                    struct.pack_into('i', buffer, 0, pid)
-                    ioctl(device_fd, IOCTL_STOP_PID, buffer)
-                    ret = struct.unpack_from('I', buffer)[0]
-                    while ret != 0:
-                        print("stop ret = {0}".format(ret))
-                        time.sleep(1)
-                        ret = struct.unpack('I', buffer)[0]
+                    ioctl_stop_pid(device_fd, pid)
+                    # buffer = bytearray(4)
+                    # struct.pack_into('i', buffer, 0, pid)
+                    # ioctl(device_fd, IOCTL_STOP_PID, buffer)
+                    # ret = struct.unpack_from('I', buffer)[0]
+                    # while ret != 0:
+                    #     print("stop ret = {0}".format(ret))
+                    #     time.sleep(1)
+                    #     ret = struct.unpack('I', buffer)[0]
 
                     print(f"停止对容器 {args.container} (PID: {pid}) 的脏页跟踪")
             else:
