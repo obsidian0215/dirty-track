@@ -45,7 +45,7 @@ static struct cdev dirty_track_cdev;
 #define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
-#define INIT_DELAY 100000                    // 页表项复位的初始延时，单位为ns
+#define INIT_DELAY 1000000                    // 页表项复位的初始延时，单位为ns
 unsigned long delay_timer = INIT_DELAY;     // 页表项处理延时
 unsigned int delay_penalty = 1;             // 延迟惩罚因子，初始为1
 #define MAX_TRACKED_PROCESSES 64            // 最大可跟踪进程数
@@ -229,10 +229,10 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
     pmd_t pmd = *pmdp;
     dirty_address_t *addr_dirty;
 
-    if (pmd_trans_unstable(pmdp)) {
-        printk(KERN_INFO "find unstable pmd, addr: 0x%lx, value: 0x%lx\n", addr, pmd.pmd);
-        return true;
-    }
+    // if (pmd_trans_unstable(pmdp)) {
+    //     printk(KERN_INFO "find unstable pmd, addr: 0x%lx, value: 0x%lx\n", addr, pmd.pmd);
+    //     return true;
+    // }
 
     if ((pmd_present(pmd) && pmd_soft_dirty(pmd)) || (is_swap_pmd(pmd) && pmd_swp_soft_dirty(pmd))) {
         // 从pid对应的xarray中查找该地址对应页的写错误次数
@@ -580,6 +580,7 @@ static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
     struct vm_area_struct *vma;
     struct vma_info *vma_entry;
+    pid_t pid = dti->pid;
     int ret = 0;
     // 测量时间
     ktime_t start, end;
@@ -590,18 +591,18 @@ static int wp_fault_track(void *data) {
     end = ktime_get();
     delta_ns = ktime_to_ns(ktime_sub(end, start));
     if (!ret) {
-        printk(KERN_INFO "first clear_soft_dirty_once's execution time: %lld ns\n", delta_ns);
+        printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         dti->soft_cleared = 1;
     }
     else
-        printk(KERN_ERR "first clear_soft_dirty_once has encountered an error %d\n", ret);
+        printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);
 
     if (ret) 
         return -EFAULT;
 
     while (!kthread_should_stop()) {
         if (mm_struct_can_be_freed(dti->mm)) {
-            printk(KERN_INFO "Trackee mm_struct can be freed, we should stop dirty track on %d\n", dti->pid);
+            printk(KERN_INFO "[PID %d]Trackee mm_struct can be freed, we should stop dirty-tracking\n", pid);
             break;
         }
         else {
@@ -611,7 +612,7 @@ static int wp_fault_track(void *data) {
             end = ktime_get();
             delta_ns = ktime_to_ns(ktime_sub(end, start));
 
-            printk(KERN_INFO "clear_soft_dirty_once's execution time: %lld ns\n", delta_ns);
+            printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
 
             if (ret)
                 break;
