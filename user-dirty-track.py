@@ -182,9 +182,10 @@ if __name__ == '__main__':
                 ioctl_stop_all(device_fd)
             elif args.action == 'start':
                 print("dirty-map path: {0}".format(path))
-                time.sleep(2)
+                # time.sleep(1)
                 # 启动指定容器的脏页跟踪
                 for pid in container_pids:
+                    # time.sleep(1)
                     ioctl_start_pid(device_fd, pid)
                     # buffer = bytearray(struct.pack('i', pid))
                     # # print(type(buffer))
@@ -200,6 +201,7 @@ if __name__ == '__main__':
             elif args.action == 'stop':
                 # 停止指定容器的页面跟踪
                 for pid in container_pids:
+                    # time.sleep(1)
                     ioctl_stop_pid(device_fd, pid)
                     # buffer = bytearray(4)
                     # struct.pack_into('i', buffer, 0, pid)

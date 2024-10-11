@@ -45,10 +45,12 @@ static struct cdev dirty_track_cdev;
 #define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
-#define INIT_DELAY 1000000                    // 页表项复位的初始延时，单位为ns
-unsigned long delay_timer = INIT_DELAY;     // 页表项处理延时
-unsigned int delay_penalty = 1;             // 延迟惩罚因子，初始为1
-#define MAX_TRACKED_PROCESSES 64            // 最大可跟踪进程数
+// 页表项复位的初始延时，单位为ns --> 3ms
+#define INIT_DELAY 3000000
+// 页表项复位的最大延时，单位为ns --> 1s
+#define MAX_DELAY 1000000000
+// 最大可跟踪进程数
+#define MAX_TRACKED_PROCESSES 24
 
 static atomic_t tracked_processes = ATOMIC_INIT(0); // 当前跟踪的进程数
 
@@ -67,18 +69,17 @@ typedef struct dirty_track {
     struct task_struct *track_worker;       // 脏页追踪内核线程
 
     char dirty_map_path[256];               // 定位保存dirty-map的共享内存(tmpfs文件)
-    struct xarray dirty_xarray;             // 记录进程页写入次数的dirty-map(Xarray)
-    
+    struct xarray dirty_xarray;             // 记录进程页写入次数的dirty-map(Xarray)    
+    bool dirty_map_updated;                 // 是否更新过dirty-map
+
     struct list_head list;                  // 脏页追踪实例的链表节点
 
-    struct xarray vma_xarray;               // 维护当前被追踪的vma
     bool soft_cleared;                      // 是否清除过soft-dirty位
+    
+    unsigned long delay_timer;     // 页表项处理延时，单位为ns
+    unsigned int delay_penalty;             // 延迟惩罚因子，初始为1
+    
 } dirty_track_t;
-
-// 被追踪的vma信息
-typedef struct vma_info {
-    struct vm_area_struct *vma;
-} vma_info_t;
 
 // 保存单个页的修改历史
 typedef struct dirty_address {
@@ -91,15 +92,6 @@ typedef struct dirty_address {
 static LIST_HEAD(dirty_track_list);
 // 脏页追踪线程的链表rw锁
 static rwlock_t dirty_track_rwlock;
-
-// 延迟清空页表项wp位的相关结构
-static struct hrtimer clear_wp_timer;   // 延迟计时器
-// 延迟清空页表项wp位的工作队列
-static struct workqueue_struct *delay_clear_wp_wq;
-typedef struct clear_wp_work {
-    struct work_struct work;
-    dirty_track_t *dti;
-} clear_wp_work_t;
 
 // 通知内核线程已经停止的相关结构
 typedef struct wqtask_completion {
@@ -229,12 +221,11 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
     pmd_t pmd = *pmdp;
     dirty_address_t *addr_dirty;
 
-    // if (pmd_trans_unstable(pmdp)) {
-    //     printk(KERN_INFO "find unstable pmd, addr: 0x%lx, value: 0x%lx\n", addr, pmd.pmd);
-    //     return true;
-    // }
-
     if ((pmd_present(pmd) && pmd_soft_dirty(pmd)) || (is_swap_pmd(pmd) && pmd_swp_soft_dirty(pmd))) {
+        // 标记dirty-map被更新
+        if (!dti->dirty_map_updated)
+            dti->dirty_map_updated = true;
+
         // 从pid对应的xarray中查找该地址对应页的写错误次数
         addr_dirty = xa_load(&dti->dirty_xarray, addr);
         if (addr_dirty) {
@@ -269,6 +260,10 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
     dirty_address_t *addr_dirty;
 
     if ((pte_present(pte) && pte_soft_dirty(pte)) || (is_swap_pte(pte) && pte_swp_soft_dirty(pte))) {
+        // 标记dirty-map被更新
+        if (!dti->dirty_map_updated)
+            dti->dirty_map_updated = true;
+
         // 从pid对应的xarray中查找该地址对应页的写错误次数
         addr_dirty = xa_load(&dti->dirty_xarray, addr);
         if (addr_dirty) {
@@ -320,7 +315,8 @@ static inline void clear_pmd_soft_dirty(pmd_t *pmdp, unsigned long addr,
 // 清除pte的soft dirty标志位
 static inline void clear_pte_soft_dirty(pte_t *pte, unsigned long addr, 
             struct vm_area_struct *vma) {
-	pte_t ptent = ptep_get(pte);
+	// pte_t ptent = ptep_get(pte);
+    pte_t ptent = *pte;
 
 	if (pte_present(ptent)) {
 		pte_t old_pte;
@@ -347,9 +343,13 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
 
     ptl = pmd_trans_huge_lock(pmd, vma);
     if (ptl) {
-        // if (pmd_bad(*pmd)) {
-        //     printk(KERN_ALERT "Bad pmd at 0x%p\n", pmd);
-        //     goto clear;
+        // // 确保只有trans_Huge pmd进行soft-dirty
+        // pmd_t pmdval = pmd_read_atomic(pmd);
+        // if (pmd_bad(pmd_wrprotect(pmdval))) {
+        //     printk(KERN_ALERT "Not trans_huge pmd: 0x%p, value: 0x%lx at addr: 0x%lx\n", pmd, pmdval, addr);
+            
+        //     // spin_unlock(ptl);
+        //     goto no_clear;
         // }
 
         if (dti->soft_cleared)
@@ -358,6 +358,7 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
 clear:
         if (need_clear)
             clear_pmd_soft_dirty(pmd, addr, vma);
+no_clear:
         spin_unlock(ptl);
 		return 0;
     }
@@ -366,9 +367,6 @@ clear:
 		return 0;
 
     pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
-    if (!pte)
-        return -1;
-    
     for (; addr != end; pte++, addr += PAGE_SIZE) {
         need_clear = true;
         // ptent = ptep_get(pte);
@@ -393,11 +391,10 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long addr,
     pmd_t *pmd;
 	unsigned long next;
 
-    // 忽略不可写的vma
-    if (!(vma->vm_flags & VM_WRITE)) {
+    // if (dti->soft_cleared && !(vma->vm_flags & VM_WRITE)) {
         // printk(KERN_INFO "unwriteable vma: %lx-%lx, flags: %lx", vma->vm_start, vma->vm_end, vma->vm_flags);
-        return 0;
-    }
+    //     return 0;
+    // }
 
     pgd = pgd_offset(dti->mm, addr);
     do {
@@ -425,8 +422,7 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long addr,
             do {
 again_pud:        
                 next = pud_addr_end(addr, end);
-                if (pud_none(*pud) || 
-                        (!vma && (pud_leaf(*pud) || !pud_present(*pud)))) {
+                if (pud_none(*pud)) {
                     continue;
                 }
                 if (vma)
@@ -449,12 +445,8 @@ again_pmd:
                     }
 
                     err = handle_pmd_range_wp(pmd, addr, next, vma, dti);
-                    if (err) {
-                        if (err == -1)
-                            goto again_pmd;
-                        else 
-                            break;
-                    }
+                    if (err)
+                        break;
                 } while (pmd++, addr = next, addr != end);
             } while (pud++, addr = next, addr != end);
         } while (p4d++, addr = next, addr != end);
@@ -463,51 +455,56 @@ again_pmd:
     return err;
 }
 
-// 将符合追踪条件的vma加入dti的追踪列表中
-// 暂时用不上
-static int add_vma_to_dti(dirty_track_t *dti, unsigned long start, 
-            unsigned long end, struct vm_area_struct *vma) {
-    struct vma_info *vma_entry;
-    if (!vma || start >= end)
-        return 0;
+// // 将符合追踪条件的vma加入dti的追踪列表中s
+// static int add_vma_to_dti(dirty_track_t *dti, unsigned long start, 
+//             unsigned long end, struct vm_area_struct *vma) {
+//     struct vma_info *vma_entry;
+//     if (!vma || start >= end)
+//         return 0;
     
-    vma_entry = kmalloc(sizeof(struct vma_info), GFP_KERNEL);
-    if (!vma_entry) {
-        printk(KERN_ERR "Failed to allocate memory for vma_info\n");
-        return -ENOMEM;
-    }
-    kfree(vma_entry);
-    return 0;
-}
+//     vma_entry = kmalloc(sizeof(struct vma_info), GFP_KERNEL);
+//     if (!vma_entry) {
+//         printk(KERN_ERR "Failed to allocate memory for vma_info\n");
+//         return -ENOMEM;
+//     }
+//     kfree(vma_entry);
+//     return 0;
+// }
 
 // 遍历进程的所有vma，并调用回调函数处理
 static int traverse_vmas(dirty_track_t *dti, int (*callback)(dirty_track_t *, 
             unsigned long, unsigned long, struct vm_area_struct *)) {
     unsigned long start = 0, next, end = -1;
-    struct vm_area_struct *vma, *walk;
+    struct vm_area_struct *vma, *walk_vma;
     int err = 0;
+
+    if (!dti->mm) {
+        return -EINVAL;
+    }
 
     mmap_assert_locked(dti->mm);
 
-    walk = find_vma(dti->mm, start);
+    vma = find_vma(dti->mm, start);
     do {
-        if (!walk) {    // 遍历完所有vma
-            vma = NULL;
+        if (!vma) {    // 遍历完所有vma
+            walk_vma = NULL;
 			next = end;
         }
-        else if (start < walk->vm_start) {      // 处于vma外
-            vma = NULL;
-            next = min(end, walk->vm_start);
+        else if (start < vma->vm_start) {      // 处于vma外
+            walk_vma = NULL;
+            next = min(end, vma->vm_start);
         }
         else {      // 处于vma内
-            vma = walk;
-            next = min(end, walk->vm_end);
-            walk = find_vma(dti->mm, walk->vm_end);
-             // 忽略PFN映射的vma
-            if (vma->vm_flags & VM_PFNMAP)
+            walk_vma = vma;
+            next = min(end, vma->vm_end);
+            vma = find_vma(dti->mm, vma->vm_end);
+            // 忽略以下vma：PFN映射、不可写、hugetlb页
+            if ((walk_vma->vm_flags & VM_PFNMAP) || 
+                    !(walk_vma->vm_flags & VM_WRITE) || 
+                    is_vm_hugetlb_page(walk_vma))
                 continue;
             if (callback)
-                err = callback(dti, start, next, vma);
+                err = callback(dti, start, next, walk_vma);
         }
         if (err)
             break;
@@ -547,35 +544,31 @@ static int clear_soft_dirty_once(dirty_track_t *dti) {
         mmap_write_unlock(mm);
 out:
     }
-    if (!dti->soft_cleared && err == 0) {
-        dti->soft_cleared = 1;
-        printk(KERN_INFO "Soft-dirty cleared for PID %d\n", dti->pid);
-    }
 
     return err;
 }
 
-// // 向指定pid进程的clear_refs写入4以启用soft-dirty tracking
-// static int write_clear_refs_pid(pid_t pid) {
-//     char *argv[] = {"/bin/bash", "-c", NULL, NULL};
-//     char cmd[256];
-//     char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-//     int ret;
+// 向指定pid进程的clear_refs写入4以启用soft-dirty tracking
+static int write_clear_refs_pid(pid_t pid) {
+    char *argv[] = {"/bin/bash", "-c", NULL, NULL};
+    char cmd[256];
+    char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
+    int ret;
 
-//     // 设置目标PID并构建shell命令
-//     snprintf(cmd, sizeof(cmd), "echo 4 > /proc/%d/clear_refs", pid);
+    // 设置目标PID并构建shell命令
+    snprintf(cmd, sizeof(cmd), "echo 4 > /proc/%d/clear_refs", pid);
 
-//     argv[2] = cmd;
+    argv[2] = cmd;
 
-//     // 执行shell命令
-//     ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-//     if (ret != 0) {
-//         printk(KERN_ERR "Enabling soft-dirty tracking failed: %d\n", ret);
-//     } else {
-//         printk(KERN_INFO "Soft-dirty tracking of process %d enabled\n", pid);
-//     }
-//     return ret;
-// }
+    // 执行shell命令
+    ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+    if (ret != 0) {
+        printk(KERN_ERR "Enabling soft-dirty tracking failed: %d\n", ret);
+    } else {
+        printk(KERN_INFO "Soft-dirty tracking of process %d enabled\n", pid);
+    }
+    return ret;
+}
 
 // 脏页追踪线程的主函数
 static int wp_fault_track(void *data) {
@@ -590,17 +583,17 @@ static int wp_fault_track(void *data) {
     
     start = ktime_get();
     ret = clear_soft_dirty_once(dti);
+    // ret = write_clear_refs_pid(pid);
     end = ktime_get();
     delta_ns = ktime_to_ns(ktime_sub(end, start));
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
-        dti->soft_cleared = 1;
+        dti->soft_cleared = true;
     }
-    else
-        printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);
-
-    if (ret) 
+    else {
+        printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);       
         return -EFAULT;
+    }
 
     while (!kthread_should_stop()) {
         if (mm_struct_can_be_freed(dti->mm)) {
@@ -608,20 +601,51 @@ static int wp_fault_track(void *data) {
             break;
         }
         else {
-            msleep(1000);  // 需要确定检查间隔
+            dti->dirty_map_updated = false;
             start = ktime_get();
             ret = clear_soft_dirty_once(dti);
             end = ktime_get();
             delta_ns = ktime_to_ns(ktime_sub(end, start));
 
-            printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
-
-            if (ret)
+            if (ret) {
+                printk(KERN_ERR "[PID %d]clear_soft_dirty_once has encountered an error %d\n", pid, ret);
                 break;
+            }
+            else {
+                // 检查dirty_map是否有更新或xarray是否为空
+                bool need_wait = false;
+                if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
+                    need_wait = true;
+                }
+
+                // 满足上述条件则逐步增加执行周期
+                if (need_wait) {
+                    // printk(KERN_INFO "[PID %d]No write detected, waiting for %lu ms\n", pid, dti->delay_timer / NSEC_PER_MSEC);
+                    dti->delay_penalty *= 2;
+                    dti->delay_timer = INIT_DELAY * dti->delay_penalty;
+                    // 避免delay_timer过大
+                    if (dti->delay_timer > MAX_DELAY) {
+                        dti->delay_timer = MAX_DELAY;
+                    }
+                    msleep(dti->delay_timer / NSEC_PER_MSEC);
+                } else {
+                    // 根据delta_ns调整delay_timer
+                    dti->delay_penalty = 1;
+                    if (delta_ns > dti->delay_timer) {
+                        dti->delay_timer = delta_ns + INIT_DELAY;
+                    } else if (dti->delay_timer > 2 * delta_ns) {
+                        dti->delay_timer = INIT_DELAY;
+                    } else {
+                        dti->delay_timer = 2 * delta_ns;
+                    }
+                    msleep(dti->delay_timer / NSEC_PER_MSEC);  // 需要确定检查间隔
+                }           
+                // printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
+            }
         }
     }
 
-    printk(KERN_INFO "[1]Stopped dirty-tracking PID %d\n", dti->pid);
+    printk(KERN_INFO "[1]Stopped dirty-tracking PID %d\n", pid);
     return ret;
 }
 
@@ -632,7 +656,7 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     wqtask_completion_t *wqtc = sw->wq_comp;
 
     if (!dti) {
-        printk(KERN_ERR "No dirty_track_t instance provided to stop\n");
+        printk(KERN_ERR "No dirty_track instance provided to stop\n");
         complete(&wqtc->wq_comp);
         kfree(sw);
         return;
@@ -645,15 +669,19 @@ static void nbstop_kthread_fn(struct work_struct *work) {
         printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
     }
 
-    // 关闭并清理 dirty_map 文件
-    struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
-    if (!IS_ERR(file)) {
-        loff_t pos = 0;
-        dirty_map_to_file(&dti->dirty_xarray, file, &pos);
-        filp_close(file, NULL);
-    } else {
-        printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
-    }
+    // 写入dirty_map文件
+    if (!xa_empty(&dti->dirty_xarray)) {
+        struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
+        if (!IS_ERR(file)) {
+            loff_t pos = 0;
+            dirty_map_to_file(&dti->dirty_xarray, file, &pos);
+            filp_close(file, NULL);
+        } else {
+            printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
+        }
+    } else
+        printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
+
 
     // 清理dirty_xarray
     unsigned long addr;
@@ -662,14 +690,6 @@ static void nbstop_kthread_fn(struct work_struct *work) {
         kfree(addr_dirty);
     }
     xa_destroy(&dti->dirty_xarray);
-
-    // 清理vma_xarray
-    unsigned long addr_vma;
-    vma_info_t *vma_info;
-    xa_for_each(&dti->vma_xarray, addr_vma, vma_info) {
-        kfree(vma_info);
-    }
-    xa_destroy(&dti->vma_xarray);
     
     // 解除对进程mm的引用
     mmput(dti->mm);
@@ -683,6 +703,8 @@ static void nbstop_kthread_fn(struct work_struct *work) {
 static int start_dirty_track(pid_t pid) {
     dirty_track_t *dti;
     struct task_struct *task;
+    struct timespec64 ts;
+    char timestamp[16];  // 用于存储时间戳
     int err;
 
     // 检查是否已跟踪此 PID
@@ -707,6 +729,12 @@ static int start_dirty_track(pid_t pid) {
     if (!dti)
         return -ENOMEM;
     
+    // 初始化控制字段
+    dti->soft_cleared = false;
+    dti->dirty_map_updated = false;
+    dti->delay_timer = INIT_DELAY;
+    dti->delay_penalty = 1;
+
     // 初始化pid以及mm_struct字段
     dti->pid = pid;
     task = pid_task(find_get_pid(pid), PIDTYPE_PID);
@@ -722,23 +750,25 @@ static int start_dirty_track(pid_t pid) {
         return -EINVAL;
     }
 
+    // 获取当前时间
+    ktime_get_real_ts64(&ts);
+
+    // 获取毫秒级时间戳
+    snprintf(timestamp, sizeof(timestamp), "%lld", (long long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000));
+
     // 初始化tmpfs文件路径名和dirty-map
-    snprintf(dti->dirty_map_path, sizeof(dti->dirty_map_path), "%s/dirtymap-%d.img", tmpfs_dir, pid);
+    snprintf(dti->dirty_map_path, sizeof(dti->dirty_map_path), "%s/%d-%s.img", tmpfs_dir, pid, timestamp);
     xa_init(&dti->dirty_xarray);
-    xa_init(&dti->vma_xarray);
 
     dti->track_worker = kthread_run(wp_fault_track, dti, "track_worker_%d", pid);
     if (IS_ERR(dti->track_worker)) {
         err = PTR_ERR(dti->track_worker);
         printk(KERN_ERR "Failed to create tracking thread for PID %d: %d\n", pid, err);
         xa_destroy(&dti->dirty_xarray);
-        xa_destroy(&dti->vma_xarray);
         mmput(dti->mm);
         kfree(dti);
         return err;
     }
-
-    dti->soft_cleared = false;
 
     // 将dti添加到dirty_track_list链表
     write_lock(&dirty_track_rwlock);
