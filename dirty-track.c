@@ -788,6 +788,12 @@ static int stop_dirty_track(pid_t pid) {
     wqtask_completion_t *wqtc;
     nbstop_kthread_t *sw;
 
+    // 不存在进程的脏页追踪
+    if (atomic_read(&tracked_processes) == 0 || list_empty(&dirty_track_list)) {
+        printk(KERN_ERR "No active dirty-tracking\n");
+        return -ENOENT;
+    }
+
     write_lock(&dirty_track_rwlock);
     list_for_each_entry_safe(dti, tmp, &dirty_track_list, list) {
         if (dti->pid == pid) {
@@ -830,9 +836,6 @@ static int stop_dirty_track(pid_t pid) {
         write_unlock(&dirty_track_rwlock);
     }
 
-    // 当已有的进程的脏页追踪都结束时，禁用对页错误函数的hook
-    if (atomic_read(&tracked_processes) == 0) {
-    }
     return 0;
 }
 
