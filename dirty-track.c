@@ -580,12 +580,18 @@ static int wp_fault_track(void *data) {
     // 测量时间
     ktime_t start, end;
     s64 delta_ns;
+    unsigned long default_delay = INIT_DELAY;
     
     start = ktime_get();
     ret = clear_soft_dirty_once(dti);
     // ret = write_clear_refs_pid(pid);
     end = ktime_get();
     delta_ns = ktime_to_ns(ktime_sub(end, start));
+    // 应对内存空间较大的情况
+    if (delta_ns >= default_delay / 2) {
+        msleep(default_delay);
+        default_delay = delta_ns;
+    }
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         dti->soft_cleared = true;
@@ -622,7 +628,7 @@ static int wp_fault_track(void *data) {
                 if (need_wait) {
                     // printk(KERN_INFO "[PID %d]No write detected, waiting for %lu ms\n", pid, dti->delay_timer / NSEC_PER_MSEC);
                     dti->delay_penalty *= 2;
-                    dti->delay_timer = INIT_DELAY * dti->delay_penalty;
+                    dti->delay_timer = default_delay * dti->delay_penalty;
                     // 避免delay_timer过大
                     if (dti->delay_timer > MAX_DELAY) {
                         dti->delay_timer = MAX_DELAY;
@@ -632,13 +638,13 @@ static int wp_fault_track(void *data) {
                     // 根据delta_ns调整delay_timer
                     dti->delay_penalty = 1;
                     if (delta_ns > dti->delay_timer) {
-                        dti->delay_timer = delta_ns + INIT_DELAY;
+                        dti->delay_timer = delta_ns + default_delay;
                     } else if (dti->delay_timer > 2 * delta_ns) {
-                        dti->delay_timer = INIT_DELAY;
+                        dti->delay_timer = default_delay;
                     } else {
                         dti->delay_timer = 2 * delta_ns;
                     }
-                    msleep(dti->delay_timer / NSEC_PER_MSEC);  // 需要确定检查间隔
+                    msleep(dti->delay_timer / NSEC_PER_MSEC);
                 }           
                 // printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
             }

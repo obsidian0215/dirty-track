@@ -185,7 +185,8 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
         with open(newest_img_path, 'wb') as f:
             for address, info in consolidated.items():
                 # write_count为浮点数，需要转换为整数
-                write_count_weighted = int(info['write_count'])
+                # 需要避免write_count加权和小于1
+                write_count_weighted = max(int(info['write_count']), 1)
                 packed = struct.pack('<QQI', address, write_count_weighted, info['page_type'])
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
