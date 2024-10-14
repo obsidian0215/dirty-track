@@ -589,7 +589,7 @@ static int wp_fault_track(void *data) {
     delta_ns = ktime_to_ns(ktime_sub(end, start));
     // 应对内存空间较大的情况
     if (delta_ns >= default_delay / 2) {
-        msleep(default_delay);
+        msleep(default_delay / NSEC_PER_MSEC);
         default_delay = delta_ns;
     }
     if (!ret) {
