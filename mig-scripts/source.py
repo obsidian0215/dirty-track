@@ -13,6 +13,7 @@ import json
 from fcntl import ioctl
 import psutil
 import struct
+import threading
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -296,7 +297,6 @@ def prepare(base_path, image_path, parent_path):
         os.mkdir(i)
     os.mkdir(image_path)
 
-
 # 功能函数：获取目录下特定模式文件的总大小
 # pattern: 文件名模式, e.g. "pages*.img"
 def getdirsize(path, pattern=None):
@@ -354,6 +354,25 @@ def convert_byte(tsize):
                 return(round(MBX,2),'MB')
             else:
                 return(round(MBX/1024,2),'GB')
+
+# 带宽测量（使用异步或多线程）
+def measure_bandwidth(dest_ip, result_container):
+    try:
+        # 使用 iperf3 进行短时间带宽测量
+        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '5', '-f', 'm', '-J'], 
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print("带宽测量失败:", result.stderr)
+            result_container.append(0)
+            return
+        iperf_output = json.loads(result.stdout)
+        bandwidth = iperf_output['end']['sum_sent']['bits_per_second'] / 8  # 转换为Bytes/s
+        print(f"测得带宽: {bandwidth} Bytes/s")
+        result_container.append(bandwidth)
+    except Exception as e:
+        print("带宽测量异常:", e)
+        result_container.append(0)
+
 
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
@@ -519,7 +538,7 @@ def iterate_predump(container_path, parent_path, max_iter, diskless, dest, dirty
             break
     return last_iter
 
-def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap, device_fd):
+def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap, device_fd, time_constraint):
     global rst_time
     base_path = runc_base + container
     image_path = base_path + "/image"
@@ -528,6 +547,11 @@ def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap
     dirtymap_path = base_path + "/dirty_map"
 
     prepare(image_path, parent_path)
+
+    # 测量初始带宽和最大传输值
+    global mea_bandwidth
+    mea_bandwidth = measure_bandwidth(dest, container)
+    max_xfer_size = mea_bandwidth * time_constraint
 
     socket.setdefaulttimeout(10)
     cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -676,6 +700,7 @@ parser.add_argument('-s', '--shell-job', dest='tty', action='store_true', help="
 parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="avoid the synchronization of rootfs")
 parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
+parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -689,6 +714,7 @@ if __name__ == '__main__':
     netdump = False
     rootfs = True
     dirtymap = False
+    time_constraint = args.time_constraint
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
@@ -749,7 +775,8 @@ if __name__ == '__main__':
         set_dirty_map_path(device_fd, dirtymap_path)
 
         # 开始热迁移
-        migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap, device_fd)
+        migrate(container, dest, pre, lazy, tty, netdump, rootfs, 
+                    max_iter, dirtymap, device_fd, time_constraint)
 
         if diskless:
             print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))
