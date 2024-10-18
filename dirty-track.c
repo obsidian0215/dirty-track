@@ -84,8 +84,8 @@ typedef struct dirty_track {
 // 保存单个页的修改历史
 typedef struct dirty_address {
     /* unsigned long address;       // 本次写错误的地址，已被xarray索引替代 */
-    unsigned long write_count;      // 写入错误次数
-    unsigned int page_type;         // 页类型
+    unsigned int write_count;       // 写入错误次数
+    unsigned char page_type;        // 页类型
 } dirty_address_t;
 
 // 脏页追踪线程的双向链表头

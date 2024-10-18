@@ -2,6 +2,8 @@ import os
 import struct
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
+import statistics
+import math
 
 @dataclass
 class DirtyMapEntry:
@@ -165,46 +167,53 @@ def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
         'consolidated_dirtymaps': consolidated_dirtymaps
     }
 
-def compute_write_count_distribution(dirtymap: List[DirtyMapEntry]) -> Dict[str, float]:
+def get_wc_threshold(dirtymap: List[DirtyMapEntry]) -> float:
     """
-    计算给定 dirtymap 中 write_count 的统计分布数据。
+    计算给定 dirtymap 中划分异常高 write_count 的阈值。
     
     Args:
-        dirtymap (List[DirtyMapEntry]): DirtyMapEntry 实例的列表。
+        dirtymap (List[DirtyMapEntry]): DirtyMapEntry 列表。
     
     Returns:
-        Dict[str, float]: 包含最小值、最大值、平均值、中位数、标准差等统计信息的字典。
+        float: dirtymap 中异常高 write_count 的阈值。
     """
     if not dirtymap:
-        return {}
+        return 0
     
     write_counts = sorted(entry.write_count for entry in dirtymap)
     n = len(write_counts)
-    min_write = write_counts[0]
-    max_write = write_counts[-1]
-    sum_write = sum(write_counts)
-    mean_write = sum_write / n
-    
-    # 计算中位数
-    if n % 2 == 1:
-        median_write = write_counts[n // 2]
+
+    # 使用四分位数方法检测异常值
+    q1 = statistics.quantiles(write_counts, n=4)[0]  # 第一四分位数
+    q3 = statistics.quantiles(write_counts, n=4)[2]  # 第三四分位数
+    iqr = q3 - q1
+    threshold = q3 + 1.5 * iqr  # 常用的异常高值检测阈值
+
+    if n <= 10000:
+        # 对于小规模数据，使用均值和标准差
+        try:
+            mean_wc = statistics.mean(write_counts)
+            stdev_wc = statistics.stdev(write_counts) if n > 1 else 0
+            high_threshold = mean_wc + 2 * stdev_wc
+            medium_threshold = mean_wc + stdev_wc
+        except statistics.StatisticsError:
+            mean_wc = statistics.mean(write_counts)
+            stdev_wc = 0
+            high_threshold = mean_wc
+            medium_threshold = mean_wc
     else:
-        median_write = (write_counts[n // 2 - 1] + write_counts[n // 2]) / 2
-    
-    # 计算标准差
-    variance = sum((wc - mean_write) ** 2 for wc in write_counts) / n
-    std_dev = math.sqrt(variance)
-    
-    distribution = {
-        'count': n,
-        'min': min_write,
-        'max': max_write,
-        'mean': mean_write,
-        'median': median_write,
-        'std_dev': std_dev
-    }
-    
-    return distribution
+        # 对于大规模数据，使用分位数
+        try:
+            percentile_95 = statistics.quantiles(write_counts, n=100)[94]  # 95th 百分位
+            percentile_75 = statistics.quantiles(write_counts, n=100)[74]  # 75th 百分位
+            high_threshold = percentile_95
+            medium_threshold = percentile_75
+        except statistics.StatisticsError:
+            # 无法计算分位数时，使用最大值和中位数
+            high_threshold = max(write_counts)
+            medium_threshold = statistics.median(write_counts)
+
+    return threshold
 
 def find_exceptionally_high_write_counts(dirtymap: List[DirtyMapEntry], multiplier: float = 3.0) -> List[DirtyMapEntry]:
     """
@@ -218,13 +227,9 @@ def find_exceptionally_high_write_counts(dirtymap: List[DirtyMapEntry], multipli
     Returns:
         List[DirtyMapEntry]: 异常高 write_count 的 DirtyMapEntry 列表。
     """
-    distribution = compute_write_count_distribution(dirtymap)
-    if not distribution:
+    threshold = get_wc_threshold(dirtymap)
+    if threshold == 0:
         return []
-    
-    mean = distribution['mean']
-    std_dev = distribution['std_dev']
-    threshold = mean + multiplier * std_dev
     
     exceptional_entries = [entry for entry in dirtymap if entry.write_count > threshold]
     
@@ -248,7 +253,7 @@ def assign_heat_level(dirtymap: List[DirtyMapEntry], num_intervals: int = 5) -> 
         return
     
     # 首先计算分布
-    distribution = compute_write_count_distribution(dirtymap)
+    distribution = get_wc_threshold(dirtymap)
     mean = distribution.get('mean', 0)
     std_dev = distribution.get('std_dev', 0)
     threshold = mean + 3 * std_dev  # 使用3倍标准差作为异常高的阈值
@@ -305,7 +310,7 @@ def process_dirtymap_entries(dirtymap: List[DirtyMapEntry], num_intervals: int =
     Returns:
         None: 直接修改每个 DirtyMapEntry 的 heat_level 属性。
     """
-    distribution = compute_write_count_distribution(dirtymap)
+    distribution = get_wc_threshold(dirtymap)
     print(f"DirtyMap 统计信息: {distribution}")
     
     exceptional_entries = find_exceptionally_high_write_counts(dirtymap, multiplier=3.0)

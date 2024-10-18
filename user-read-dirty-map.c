@@ -12,11 +12,11 @@ const char* page_type_names [] = {
     "PAGE_PUD",
 };
 
-// 脏页信息
+// 脏页信息(8 + 4 + 1 = 13 Btyes)
 struct __attribute__((__packed__)) dirty_page{
 	unsigned long address;
-    unsigned long write_count;
-    unsigned int page_type;
+    unsigned int write_count;
+    unsigned char page_type;
 };
 
 int main(int argc, char *argv[]) {
