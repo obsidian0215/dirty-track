@@ -405,14 +405,9 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
     if postcopy:
         cmd += ' --lazy-pages'
         cmd += ' --page-server localhost:27'
-        try:
-            os.unlink('/tmp/postcopy-pipe')
-        except:
-            pass
-        os.mkfifo('/tmp/postcopy-pipe')
-        p_pipe = os.open('/tmp/postcopy-pipe', os.O_RDONLY)
+        p_pipe = os.pipe()
         #cmd += ' --status-fd /tmp/postcopy-pipe'
-        cmd += ' --status-fd ' + str(p_pipe)
+        cmd += ' --status-fd ' + str(p_pipe[1])
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
     cmd += ' ' + container
@@ -421,10 +416,11 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
     p = subprocess.Popen(cmd, shell=True)
     if postcopy:
         #p_pipe = os.open('/tmp/postcopy-pipe', os.O_RDONLY)
-        ret = os.read(p_pipe, 1)
+        ret = os.read(p_pipe[0], 1)
         if ret == '\0':
             print('Ready for lazy page transfer')
-            os.close(p_pipe)
+            os.close(p_pipe[0])
+            os.close(p_pipe[1])
         ret = 0
     else:
         ret = p.wait()
