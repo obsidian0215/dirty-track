@@ -10,16 +10,30 @@ import distutils.util
 import time
 import subprocess
 
-def prepare(image_path, parent_path):
+def prepare(base_path, image_path, parent_path):
     try:
         shutil.rmtree(image_path)
     except:
         pass
+
+    # 尝试清空之前存在的parent_{}目录
     try:
-        shutil.rmtree(parent_path)
+        dir_list = os.listdir(base_path)
+        for entry in dir_list:
+            entry_path = os.path.join(base_path, entry)
+            # print(entry)
+            # print(entry_path)
+            if os.path.isdir(entry_path) and entry.startswith('parent'):
+                umount_cmd = 'umount ' + entry_path
+                subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+                shutil.rmtree(entry_path)
     except:
         pass
-    os.mkdir(parent_path)
+
+    if parent_path:
+        for i in parent_path:
+            os.mkdir(i)
+
     os.mkdir(image_path)
 
 def migrate_server():
@@ -68,8 +82,8 @@ def migrate_server():
                 match msg:
                     case {'pageserver':_}:
                         #os.system('criu -V')
-                        mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['precopy_path']
-                        umount_cmd = 'umount ' + msg['pageserver']['precopy_path']
+                        mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
+                        umount_cmd = 'umount ' + msg['pageserver']['path']
 
                         terminate = False
                         if msg['pageserver'] == 'terminate':
@@ -87,8 +101,8 @@ def migrate_server():
                             print("start page server")
                             os.system(mount_cmd)
 
-                            cmd = 'criu page-server --images-dir ' + msg['pageserver']['precopy_path']
-                            cmd += ' --port 27 -vv -o ' + old_cwd + '/logs/ps.log'
+                            cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
+                            cmd += ' --port 27 --auto-dedup -vv -o ' + old_cwd + '/logs/ps.log'
                             print ("Running page server for pre-copy: " + cmd)
                             ps = subprocess.Popen(cmd, shell=True)
                             exitcode = ps.poll()
@@ -98,20 +112,21 @@ def migrate_server():
                             else:
                                 continue
                 
-                    case {'prepare':_}:
-                        path = msg['prepare']['path']
-                        image_path = msg['prepare']['image_path']
-                        parent_path = msg['prepare']['parent_path']
+                    case {'prepare': prepare_info}:
+                        path = prepare_info['path']
+                        image_path = prepare_info['image_path']
+
+                        if 'parent_path' in prepare_info:
+                            parent_paths = prepare_info['parent_path']  # parent_path为列表
+                        else:
+                            parent_paths = []
+
                         path_exist = os.path.exists(path)
                         if not path_exist:
                             reply = 'cannot find corresponding container bundle'
                         else:
-                            try:
-                                umount_cmd = 'umount ' + parent_path
-                                os.system(umount_cmd)
-                            except:
-                                pass
-                            prepare(image_path, parent_path)
+                            prepare(path, image_path, parent_paths)
+                            # parent_path为None时，仅准备image_path
                             continue
 
                     case {'restore':_}:
@@ -143,6 +158,19 @@ def migrate_server():
                             #Please, read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/Userfaultfd for more information.
                             #The daemon tracks and prints the flow of time and clearly prints when it starts requesting faulted pages and when it finishes, along with an indication of the number of transferred faulted pages.
                             #Note that each page is 4KB.                            
+                            # lazy_cmd = "criu lazy-pages --page-server --address " + addr
+                            # lazy_cmd += " --port 27 -vv -D "
+                            # lazy_cmd += msg['restore']['image_path']
+                            # lazy_cmd += " -W "
+                            # lazy_cmd += msg['restore']['image_path']
+                            # lazy_cmd += " -o logs/lp.log"
+                            # print ("Running lazy-pages server: " + lazy_cmd)
+                            # lp = subprocess.Popen(lazy_cmd, shell=True)
+                        cmd += ' ' + msg['restore']['name']
+                        print("Running " +  cmd)
+                        start = time.perf_counter() * 1000
+                        p = subprocess.Popen(cmd, shell=True)
+                        if lazy:
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
                             lazy_cmd += " --port 27 -vv -D "
                             lazy_cmd += msg['restore']['image_path']
@@ -151,19 +179,6 @@ def migrate_server():
                             lazy_cmd += " -o logs/lp.log"
                             print ("Running lazy-pages server: " + lazy_cmd)
                             lp = subprocess.Popen(lazy_cmd, shell=True)
-                        cmd += ' ' + msg['restore']['name']
-                        print("Running " +  cmd)
-                        start = time.perf_counter() * 1000
-                        p = subprocess.Popen(cmd, shell=True)
-                        # if lazy:
-                        #     lazy_cmd = "criu lazy-pages --page-server --address " + addr
-                        #     lazy_cmd += " --port 27 -vv -D "
-                        #     lazy_cmd += msg['restore']['image_path']
-                        #     lazy_cmd += " -W "
-                        #     lazy_cmd += msg['restore']['image_path']
-                        #     lazy_cmd += " -o logs/lp.log"
-                        #     print ("Running lazy-pages server: " + lazy_cmd)
-                        #     lp = subprocess.Popen(lazy_cmd, shell=True)
                         ret = p.wait()
                         end = time.perf_counter() * 1000
                         if ret == 0:
