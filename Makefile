@@ -9,12 +9,12 @@ obj-m := $(MODULE_NAME).o
 
 # 默认目标
 all:
-	make -C $(KERNEL_SRC) M=$(PWD) modules
+    make -C $(KERNEL_SRC) M=$(PWD) modules
 
 # 清理生成的文件
 # rm -f $(MODULE_NAME).ko $(MODULE_NAME).o
 clean:
-	make -C $(KERNEL_SRC) M=$(PWD) clean
+    make -C $(KERNEL_SRC) M=$(PWD) clean
 
 # 安装模块
 install:
