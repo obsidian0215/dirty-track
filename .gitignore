@@ -1,3 +1,8 @@
-/user_dirty_track
-/read_dirty_map
+user_dirty_track
+read_dirty_map
 dirty_map/
+*.mod*
+*.ko
+*.o
+*.symvers
+modules.order
