@@ -211,10 +211,10 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
         for (timestamp, file_path), weight in zip(sorted_files, weight_factors):
             with open(file_path, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
-                    address, write_count, page_type = struct.unpack('<QQI', data)
+                    address, write_count, page_type = struct.unpack('<QIB', data)
                     if address in consolidated:
                         consolidated[address]['write_count'] += write_count * weight
                     else:
@@ -229,7 +229,7 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
             for address, info in consolidated.items():
                 # write_count为浮点数，需要转换为整数
                 write_count_weighted = int(info['write_count'])
-                packed = struct.pack('<QQI', address, write_count_weighted, info['page_type'])
+                packed = struct.pack('<QIB', address, write_count_weighted, info['page_type'])
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
 
@@ -254,10 +254,10 @@ def consolidate_dirty_maps(dirty_map_path):
         for file in sorted(files):
             with open(file, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
-                    address, write_count, page_type = struct.unpack('<QQI', data)
+                    address, write_count, page_type = struct.unpack('<QIB', data)
                     if address in consolidated:
                         consolidated[address]['write_count'] += write_count
                     else:
@@ -269,7 +269,7 @@ def consolidate_dirty_maps(dirty_map_path):
         newest_img_path = os.path.join(dirty_map_path, f'newest-{pid}.img')
         with open(newest_img_path, 'wb') as f:
             for address, info in consolidated.items():
-                packed = struct.pack('<QQI', address, info['write_count'], info['page_type'])
+                packed = struct.pack('<QIB', address, info['write_count'], info['page_type'])
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
 
