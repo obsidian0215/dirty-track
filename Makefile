@@ -12,14 +12,14 @@ all:
 	make -C $(KERNEL_SRC) M=$(PWD) modules
 
 # 清理生成的文件
+# rm -f $(MODULE_NAME).ko $(MODULE_NAME).o
 clean:
-    # rm -f $(MODULE_NAME).ko $(MODULE_NAME).o
 	make -C $(KERNEL_SRC) M=$(PWD) clean
 
 # 安装模块
 install:
-    sudo insmod $(MODULE_NAME).ko
+	sudo insmod $(MODULE_NAME).ko
 
 # 卸载模块
 uninstall:
-    sudo rmmod $(MODULE_NAME)
+	sudo rmmod $(MODULE_NAME)
