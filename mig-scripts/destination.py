@@ -102,7 +102,7 @@ def migrate_server():
                             os.system(mount_cmd)
 
                             cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
-                            cmd += ' --port 27 --auto-dedup -vv -o ' + old_cwd + '/logs/ps.log'
+                            cmd += ' --port 27 --auto-dedup -v4 -o ' + old_cwd + '/logs/ps.log'
                             print ("Running page server for pre-copy: " + cmd)
                             ps = subprocess.Popen(cmd, shell=True)
                             exitcode = ps.poll()
@@ -154,25 +154,18 @@ def migrate_server():
                         #The daemon receives userfault file descriptors from restore via UNIX socket.
                         if lazy:
                             cmd += ' --lazy-pages'
-                            #This new command starts the lazy-pages daemon. The daemon monitors the UFFD events and repopulates the tasks address space by requesting lazy pages to the page server running on the source.
-                            #Please, read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/Userfaultfd for more information.
-                            #The daemon tracks and prints the flow of time and clearly prints when it starts requesting faulted pages and when it finishes, along with an indication of the number of transferred faulted pages.
-                            #Note that each page is 4KB.                            
-                            # lazy_cmd = "criu lazy-pages --page-server --address " + addr
-                            # lazy_cmd += " --port 27 -vv -D "
-                            # lazy_cmd += msg['restore']['image_path']
-                            # lazy_cmd += " -W "
-                            # lazy_cmd += msg['restore']['image_path']
-                            # lazy_cmd += " -o logs/lp.log"
-                            # print ("Running lazy-pages server: " + lazy_cmd)
-                            # lp = subprocess.Popen(lazy_cmd, shell=True)
                         cmd += ' ' + msg['restore']['name']
                         print("Running " +  cmd)
                         start = time.perf_counter() * 1000
                         p = subprocess.Popen(cmd, shell=True)
+                        
+                        #This new command starts the lazy-pages daemon. The daemon monitors the UFFD events and repopulates the tasks address space by requesting lazy pages to the page server running on the source.
+                        #Please, read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/Userfaultfd for more information.
+                        #The daemon tracks and prints the flow of time and clearly prints when it starts requesting faulted pages and when it finishes, along with an indication of the number of transferred faulted pages.
+                        #Note that each page is 4KB.       
                         if lazy:
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
-                            lazy_cmd += " --port 27 -vv -D "
+                            lazy_cmd += " --port 27 -v4 -D "
                             lazy_cmd += msg['restore']['image_path']
                             lazy_cmd += " -W "
                             lazy_cmd += msg['restore']['image_path']

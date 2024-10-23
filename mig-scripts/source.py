@@ -433,11 +433,11 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
         #     pass
         # os.mkfifo('/tmp/postcopy-pipe')
         # p_pipe = os.open('/tmp/postcopy-pipe', os.O_WRONLY)
+        #cmd += ' --status-fd /tmp/postcopy-pipe'
         status_fds = os.pipe()
         fd = status_fds[1]
         fdflags = fcntl.fcntl(fd, fcntl.F_GETFD)
         fcntl.fcntl(fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
-        #cmd += ' --status-fd /tmp/postcopy-pipe'
         cmd += ' --status-fd ' + str(fd)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
@@ -449,8 +449,8 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
         ret = os.read(status_fds[0], 1) 
         if ret == b'\0':
             print('Ready for lazy page transfer')
-            os.close(p_pipe[0])
-            os.close(p_pipe[1])
+            os.close(status_fds[0])
+            os.close(status_fds[1])
         ret = 0
     else:
         ret = p.wait()
@@ -519,20 +519,31 @@ def diskless_pre_dump(container_path, container, dest, i, dirtymap):
     if ret != 0:
         error()
 
-def iterate_predump(container_path, parent_path, max_iter, diskless, dest, dirtymap):
+def iterate_predump(cs, container_path, parent_path, max_iter, diskless, dest, dirtymap):
     last_iter = 0
     while last_iter < max_iter:
         last_path = parent_path[last_iter]
         if diskless:
+            #send the page server command,
+            #after the server's response, CRIU can directly transfer memory dump with network
+            pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '" } }'
+            cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+            inputready, outputready, exceptready = select.select(input, [], [], 4)
+            #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+            if inputready:
+                for s in inputready:
+                    answer = s.recv(1024)
+                    print(answer)
+                    error()
             diskless_pre_dump(container_path, container, dest, last_iter, dirtymap)
         else:
             pre_dump(container_path, container, last_iter, dirtymap)
-        xfer_pre_dump(last_path, dest, container_path, last_iter)        
+            xfer_pre_dump(last_path, dest, container_path, last_iter)        
 
         dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
         print('the total size of {} with pattern {} is {}{}'\
                 .format(last_path, 'pages', dir_size[0], dir_size[1]))
-        if getdirsize(last_path, 'pages') < 10485760:    #10MB
+        if getdirsize(last_path, 'pages') < max_xfer_size:    #10MB
             break
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
@@ -562,7 +573,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     prepare(base_path, image_path, parent_path)
 
     # 测量初始带宽和最大传输值
-    global mea_bandwidth
+    global mea_bandwidth, max_xfer_size
     mea_bandwidth = measure_bandwidth(dest)
     max_xfer_size = mea_bandwidth * time_constraint
     # print(f"current bandwidth is {mea_bandwidth}")
@@ -580,7 +591,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
         set_dirty_map_path(device_fd, dirtymap_path)
 
 
-    socket.setdefaulttimeout(10)
+    socket.setdefaulttimeout(6)
     cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     #Connect to the migration server running on the destination to send the commands
     cs.connect((dest, 18863))
@@ -609,8 +620,8 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
         })
 
     cs.send(bytes(prepare_cmd, encoding='utf-8'))
-    inputready, outputready, exceptready = select.select(input, [], [], 5)
-    #If after 5 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+    inputready, outputready, exceptready = select.select(input, [], [], 4)
+    #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
     if inputready:
         for s in inputready:
             answer = s.recv(1024)
@@ -647,17 +658,6 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
                 ret = os.system(mount_cmd)
                 if ret != 0:   
                     error()
-            #send the page server command,
-            #after the server's response, CRIU can directly transfer memory dump with network
-            pageserver_cmd = '{ "pageserver" : { "path" : "' + image_path + '" } }'
-            cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-            inputready, outputready, exceptready = select.select(input, [], [], 5)
-            #If after 5 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-            if inputready:
-                for s in inputready:
-                    answer = s.recv(1024)
-                    print(answer)
-                    error()
 
         if dirtymap:
             # 获取container进程树
@@ -667,7 +667,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
             # 更新dirty-map
             consolidate_dirty_maps_weighted(dirtymap_path)
         # iter pre-dump
-        last_iter = iterate_predump(base_path, parent_path, max_iter, diskless, dest, dirtymap)
+        last_iter = iterate_predump(cs, base_path, parent_path, max_iter, diskless, dest, dirtymap)
             # diskless_pre_dump(base_path, container, dest)
             # xfer_pre_dump(parent_path, dest, base_path)
         # else:
