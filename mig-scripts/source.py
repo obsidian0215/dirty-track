@@ -709,6 +709,11 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
         get_runc_container_pidtree(container)
         execute_dirty_track(device_fd)
         consolidate_dirty_maps_weighted(dirtymap_path)
+    if diskless:
+        mount_cmd = 'mount -t tmpfs none '+ image_path
+        ret = os.system(mount_cmd)
+        if ret != 0:   
+            error()
     # print(dirtymap)
     real_dump(cs, mig_base, pre, post, tty, netdump, last_iter, dirtymap, diskless)
 
@@ -759,6 +764,12 @@ def post_process(max_iter):
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:
             pass
+    
+    try:
+        umount_cmd = 'umount ' + mig_base + '/image'
+        subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+    except:
+        pass
     os.chdir(old_cwd)
 
 def touch(fname):
