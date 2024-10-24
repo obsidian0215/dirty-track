@@ -76,7 +76,7 @@ typedef struct dirty_track {
 
     bool soft_cleared;                      // 是否清除过soft-dirty位
     
-    unsigned long delay_timer;     // 页表项处理延时，单位为ns
+    unsigned long delay_timer;              // 页表项处理延时，单位为ns
     unsigned int delay_penalty;             // 延迟惩罚因子，初始为1
     
 } dirty_track_t;
@@ -341,6 +341,12 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
 	spinlock_t *ptl;
     bool need_clear = true;
 
+    // warning: wma->vm_mm != dti->mm
+    if (vma->vm_mm != dti->mm) {
+        printk(KERN_ALERT "mm mismatch: 0x%p, 0x%p\n", vma->vm_mm, dti->mm);
+        return -1;
+    }
+
     ptl = pmd_trans_huge_lock(pmd, vma);
     if (ptl) {
         // // 确保只有trans_Huge pmd进行soft-dirty
@@ -366,7 +372,7 @@ no_clear:
     if (pmd_trans_unstable(pmd))
 		return 0;
 
-    pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+    pte = pte_offset_map_lock(dti->mm, pmd, addr, &ptl);
     for (; addr != end; pte++, addr += PAGE_SIZE) {
         need_clear = true;
         // ptent = ptep_get(pte);
@@ -382,7 +388,7 @@ no_clear:
 }
 
 // 遍历vma内部所有页表项并清除其soft dirty标志位
-static int walk_clear_wp(dirty_track_t *dti, unsigned long addr, 
+static int __walk_clear_wp(dirty_track_t *dti, unsigned long addr, 
             unsigned long end, struct vm_area_struct *vma) {
     int err = 0;
     pgd_t *pgd;
@@ -390,11 +396,6 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long addr,
     pud_t *pud;
     pmd_t *pmd;
 	unsigned long next;
-
-    // if (dti->soft_cleared && !(vma->vm_flags & VM_WRITE)) {
-        // printk(KERN_INFO "unwriteable vma: %lx-%lx, flags: %lx", vma->vm_start, vma->vm_end, vma->vm_flags);
-    //     return 0;
-    // }
 
     pgd = pgd_offset(dti->mm, addr);
     do {
@@ -455,25 +456,155 @@ again_pmd:
     return err;
 }
 
-// // 将符合追踪条件的vma加入dti的追踪列表中s
-// static int add_vma_to_dti(dirty_track_t *dti, unsigned long start, 
-//             unsigned long end, struct vm_area_struct *vma) {
-//     struct vma_info *vma_entry;
-//     if (!vma || start >= end)
-//         return 0;
-    
-//     vma_entry = kmalloc(sizeof(struct vma_info), GFP_KERNEL);
-//     if (!vma_entry) {
-//         printk(KERN_ERR "Failed to allocate memory for vma_info\n");
-//         return -ENOMEM;
-//     }
-//     kfree(vma_entry);
-//     return 0;
-// }
+static int walk_clear_wp_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
+			  struct vm_area_struct *vma, dirty_track_t *dti)
+{
+	pmd_t *pmd;
+	unsigned long next;
+	int err = 0;
+
+	pmd = pmd_offset(pud, addr);
+	do {
+again:
+		next = pmd_addr_end(addr, end);
+		if (pmd_none(*pmd)) {
+			continue;
+		}
+
+		/*
+		 * This implies that each ->pmd_entry() handler
+		 * needs to know about pmd_trans_huge() pmds
+		 */
+		err = handle_pmd_range_wp(pmd, addr, next, vma, dti);
+		if (err)
+			break;
+
+		// /*
+		//  * Check this here so we only break down trans_huge
+		//  * pages when we _need_ to
+		//  */
+		// if ((!vma && (pmd_leaf(*pmd) || !pmd_present(*pmd))) ||
+		//     /!(ops->pte_entry))
+		// 	continue;
+
+		// if (vma) {
+		// 	split_huge_pmd(vma, pmd, addr);
+		// 	if (pmd_trans_unstable(pmd))
+		// 		goto again;
+		// }
+
+		// if (is_hugepd(__hugepd(pmd_val(*pmd))))
+		// 	err = 0;
+		// else
+		// 	err = walk_pte_range(pmd, addr, next, walk);
+		// if (err)
+		// 	break;
+	} while (pmd++, addr = next, addr != end);
+
+	return err;
+}
+
+static int walk_clear_wp_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
+			  struct vm_area_struct *vma, dirty_track_t *dti)
+{
+	pud_t *pud;
+	unsigned long next;
+	int err = 0;
+
+	pud = pud_offset(p4d, addr);
+	do {
+ again:
+		next = pud_addr_end(addr, end);
+		if (pud_none(*pud)) {
+			continue;
+		}
+
+		if (!vma && (pud_leaf(*pud) || !pud_present(*pud)))
+			continue;
+
+		if (vma)
+			split_huge_pud(vma, pud, addr);
+		if (pud_none(*pud))
+			goto again;
+
+		if (is_hugepd(__hugepd(pud_val(*pud))))
+			err = 0;
+		else
+			err = walk_clear_wp_pmd_range(pud, addr, next, vma, dti);
+		if (err)
+			break;
+	} while (pud++, addr = next, addr != end);
+
+	return err;
+}
+
+static int walk_clear_wp_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
+			  struct vm_area_struct *vma, dirty_track_t *dti)
+{
+	p4d_t *p4d;
+	unsigned long next;
+	int err = 0;
+
+	p4d = p4d_offset(pgd, addr);
+	do {
+		next = p4d_addr_end(addr, end);
+		if (p4d_none_or_clear_bad(p4d)) {
+			continue;
+		}
+
+		if (is_hugepd(__hugepd(p4d_val(*p4d))))
+			err = 0;
+		else
+			err = walk_clear_wp_pud_range(p4d, addr, next, vma, dti);
+		if (err)
+			break;
+	} while (p4d++, addr = next, addr != end);
+
+	return err;
+}
+
+static int walk_clear_wp_pgd_range(dirty_track_t *dti, unsigned long addr, unsigned long end,
+			struct vm_area_struct *vma)
+{
+	pgd_t *pgd;
+	unsigned long next;
+	int err = 0;
+
+	pgd = pgd_offset(dti->mm, addr);
+	do {
+		next = pgd_addr_end(addr, end);
+		if (pgd_none_or_clear_bad(pgd)) {
+			continue;
+		}
+
+		if (is_hugepd(__hugepd(pgd_val(*pgd))))
+			err = 0;
+		else
+			err = walk_clear_wp_p4d_range(pgd, addr, next, vma, dti);
+		if (err)
+			break;
+	} while (pgd++, addr = next, addr != end);
+
+	return err;
+}
+
+static int walk_clear_wp(dirty_track_t *dti, unsigned long start, unsigned long end,
+			struct vm_area_struct *vma)
+{
+	int err;
+
+	if (is_vm_hugetlb_page(vma) || 
+            (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
+        err = 0;
+	} else {
+		err = walk_clear_wp_pgd_range(dti, start, end, vma);
+    }
+
+	return err;
+}
 
 // 遍历进程的所有vma，并调用回调函数处理
-static int traverse_vmas(dirty_track_t *dti, int (*callback)(dirty_track_t *, 
-            unsigned long, unsigned long, struct vm_area_struct *)) {
+static int traverse_vmas(dirty_track_t *dti) {
     unsigned long start = 0, next, end = -1;
     struct vm_area_struct *vma, *walk_vma;
     int err = 0;
@@ -500,11 +631,9 @@ static int traverse_vmas(dirty_track_t *dti, int (*callback)(dirty_track_t *,
             vma = find_vma(dti->mm, vma->vm_end);
             // 忽略以下vma：PFN映射、不可写、hugetlb页
             if ((walk_vma->vm_flags & VM_PFNMAP) || 
-                    !(walk_vma->vm_flags & VM_WRITE) || 
                     is_vm_hugetlb_page(walk_vma))
                 continue;
-            if (callback)
-                err = callback(dti, start, next, walk_vma);
+            err = walk_clear_wp(dti, start, next, walk_vma);
         }
         if (err)
             break;
@@ -537,7 +666,7 @@ static int clear_soft_dirty_once(dirty_track_t *dti) {
 		mmu_notifier_range_init(&range, MMU_NOTIFY_SOFT_DIRTY,
 					0, NULL, mm, 0, -1UL);
 		mmu_notifier_invalidate_range_start(&range);
-        err = traverse_vmas(dti, walk_clear_wp);
+        err = traverse_vmas(dti);
         mmu_notifier_invalidate_range_end(&range);
 		flush_tlb_mm_range(mm, 0UL, -1UL, 0UL, true);
 		dec_tlb_flush_pending(mm);

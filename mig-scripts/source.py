@@ -13,6 +13,8 @@ import json
 from fcntl import ioctl
 import psutil
 import struct
+import threading
+import fcntl
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -211,10 +213,10 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
         for (timestamp, file_path), weight in zip(sorted_files, weight_factors):
             with open(file_path, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
-                    address, write_count, page_type = struct.unpack('<QQI', data)
+                    address, write_count, page_type = struct.unpack('<QIB', data)
                     if address in consolidated:
                         consolidated[address]['write_count'] += write_count * weight
                     else:
@@ -229,7 +231,7 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
             for address, info in consolidated.items():
                 # write_count为浮点数，需要转换为整数
                 write_count_weighted = int(info['write_count'])
-                packed = struct.pack('<QQI', address, write_count_weighted, info['page_type'])
+                packed = struct.pack('<QIB', address, write_count_weighted, info['page_type'])
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
 
@@ -254,10 +256,10 @@ def consolidate_dirty_maps(dirty_map_path):
         for file in sorted(files):
             with open(file, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
-                    address, write_count, page_type = struct.unpack('<QQI', data)
+                    address, write_count, page_type = struct.unpack('<QIB', data)
                     if address in consolidated:
                         consolidated[address]['write_count'] += write_count
                     else:
@@ -269,7 +271,7 @@ def consolidate_dirty_maps(dirty_map_path):
         newest_img_path = os.path.join(dirty_map_path, f'newest-{pid}.img')
         with open(newest_img_path, 'wb') as f:
             for address, info in consolidated.items():
-                packed = struct.pack('<QQI', address, info['write_count'], info['page_type'])
+                packed = struct.pack('<QIB', address, info['write_count'], info['page_type'])
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
 
@@ -280,6 +282,7 @@ def prepare(base_path, image_path, parent_path):
         shutil.rmtree(image_path)
     except:
         pass
+
     try:
         dir_list = os.listdir(base_path)
         for entry in dir_list:
@@ -292,10 +295,10 @@ def prepare(base_path, image_path, parent_path):
                 shutil.rmtree(entry_path)
     except:     
         pass
-    for i in parent_path:
-        os.mkdir(i)
+    if parent_path:
+        for i in parent_path:
+            os.mkdir(i)
     os.mkdir(image_path)
-
 
 # 功能函数：获取目录下特定模式文件的总大小
 # pattern: 文件名模式, e.g. "pages*.img"
@@ -355,6 +358,25 @@ def convert_byte(tsize):
             else:
                 return(round(MBX/1024,2),'GB')
 
+# 带宽测量（使用异步或多线程）
+def measure_bandwidth(dest_ip):
+    print(f"开始测量到{dest_ip}的带宽")
+    try:
+        # 使用 iperf3 进行短时间带宽测量
+        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '5', '-f', 'm', '-J'], 
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print("带宽测量失败:", result.stderr)
+            return 0
+        iperf_output = json.loads(result.stdout)
+        bandwidth = iperf_output['end']['sum_sent']['bits_per_second'] / 8  # 转换为Bytes/s
+        print(f"测得带宽: {bandwidth:.4f} Bytes/s")
+        return bandwidth
+    except Exception as e:
+        print("带宽测量异常:", e)
+        return 0
+
+
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
@@ -405,22 +427,30 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
     if postcopy:
         cmd += ' --lazy-pages'
         cmd += ' --page-server localhost:27'
-        p_pipe = os.pipe()
+        # try:
+        #     os.unlink('/tmp/postcopy-pipe')
+        # except:
+        #     pass
+        # os.mkfifo('/tmp/postcopy-pipe')
+        # p_pipe = os.open('/tmp/postcopy-pipe', os.O_WRONLY)
         #cmd += ' --status-fd /tmp/postcopy-pipe'
-        cmd += ' --status-fd ' + str(p_pipe[1])
+        status_fds = os.pipe()
+        fd = status_fds[1]
+        fdflags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        fcntl.fcntl(fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
+        cmd += ' --status-fd ' + str(fd)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
     cmd += ' ' + container
     start = time.perf_counter() * 1000
-    # print(cmd)
+    print(cmd)
     p = subprocess.Popen(cmd, shell=True)
     if postcopy:
-        #p_pipe = os.open('/tmp/postcopy-pipe', os.O_RDONLY)
-        ret = os.read(p_pipe[0], 1)
-        if ret == '\0':
+        ret = os.read(status_fds[0], 1) 
+        if ret == b'\0':
             print('Ready for lazy page transfer')
-            os.close(p_pipe[0])
-            os.close(p_pipe[1])
+            os.close(status_fds[0])
+            os.close(status_fds[1])
         ret = 0
     else:
         ret = p.wait()
@@ -489,20 +519,31 @@ def diskless_pre_dump(container_path, container, dest, i, dirtymap):
     if ret != 0:
         error()
 
-def iterate_predump(container_path, parent_path, max_iter, diskless, dest, dirtymap):
+def iterate_predump(cs, container_path, parent_path, max_iter, diskless, dest, dirtymap):
     last_iter = 0
     while last_iter < max_iter:
         last_path = parent_path[last_iter]
         if diskless:
+            #send the page server command,
+            #after the server's response, CRIU can directly transfer memory dump with network
+            pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '" } }'
+            cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+            inputready, outputready, exceptready = select.select(input, [], [], 4)
+            #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+            if inputready:
+                for s in inputready:
+                    answer = s.recv(1024)
+                    print(answer)
+                    error()
             diskless_pre_dump(container_path, container, dest, last_iter, dirtymap)
         else:
             pre_dump(container_path, container, last_iter, dirtymap)
-        xfer_pre_dump(last_path, dest, container_path, last_iter)        
+            xfer_pre_dump(last_path, dest, container_path, last_iter)        
 
         dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
         print('the total size of {} with pattern {} is {}{}'\
                 .format(last_path, 'pages', dir_size[0], dir_size[1]))
-        if getdirsize(last_path, 'pages') < 10485760:    #10MB
+        if getdirsize(last_path, 'pages') < max_xfer_size:    #10MB
             break
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
@@ -515,27 +556,72 @@ def iterate_predump(container_path, parent_path, max_iter, diskless, dest, dirty
             break
     return last_iter
 
-def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap, device_fd):
+def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
     global rst_time
     base_path = runc_base + container
     image_path = base_path + "/image"
-    parent_path = base_path + "/parent"
+    # parent_path = base_path + "/parent"
+    parent_path = []
     rootfs_path = base_path + "/rootfs"
     dirtymap_path = base_path + "/dirty_map"
 
-    prepare(image_path, parent_path)
+    if pre:
+        for i in range(0, max_iter):
+            pathname = base_path + "/parent{}".format(i)
+            parent_path.append(pathname)
 
-    socket.setdefaulttimeout(10)
+    prepare(base_path, image_path, parent_path)
+
+    # 测量初始带宽和最大传输值
+    global mea_bandwidth, max_xfer_size
+    mea_bandwidth = measure_bandwidth(dest)
+    max_xfer_size = mea_bandwidth * time_constraint
+    # print(f"current bandwidth is {mea_bandwidth}")
+
+
+    # 打开dirty-track设备
+    if dirtymap:
+        try:
+            device_fd = open(DEVICE_PATH, 'wb')
+        except FileNotFoundError:
+            print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
+            sys.exit(1)
+        
+        # 迁移开始前配置dirty-map目录
+        set_dirty_map_path(device_fd, dirtymap_path)
+
+
+    socket.setdefaulttimeout(6)
     cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     #Connect to the migration server running on the destination to send the commands
     cs.connect((dest, 18863))
 
     input = [cs,sys.stdin]
+    # if pre:
+    #     prepare_cmd = '{ "prepare" : { "path" : "' + base_path + '" , "image_path" : "' \
+    #         + image_path + '" , "parent_path" : "' + parent_path + '" } }'
+    # else:
+    #     prepare_cmd = '{ "prepare" : { "path" : "' + base_path + '" , "image_path" : "'+ image_path + '" } }'
+    if pre:
+        prepare_cmd = json.dumps({
+            "prepare": {
+                "path": base_path,
+                "image_path": image_path,
+                "parent_path": parent_path  # parent_path 为列表
+            }
+        })
+    else:
+        prepare_cmd = json.dumps({
+            "prepare": {
+                "path": base_path,
+                "image_path": image_path
+                # 不包含 parent_path
+            }
+        })
 
-    prepare_cmd = '{ "prepare" : { "path" : "' + base_path + '" , "image_path" : "'+ image_path + '" , "parent_path" : "' + parent_path + '" } }'
     cs.send(bytes(prepare_cmd, encoding='utf-8'))
-    inputready, outputready, exceptready = select.select(input, [], [], 5)
-    #If after 5 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+    inputready, outputready, exceptready = select.select(input, [], [], 4)
+    #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
     if inputready:
         for s in inputready:
             answer = s.recv(1024)
@@ -572,26 +658,16 @@ def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap
                 ret = os.system(mount_cmd)
                 if ret != 0:   
                     error()
-            #send the page server command,
-            #after the server's response, CRIU can directly transfer memory dump with network
-            pageserver_cmd = '{ "pageserver" : { "precopy_path" : "' + parent_path + '" } }'
-            cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-            inputready, outputready, exceptready = select.select(input, [], [], 5)
-            #If after 5 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-            if inputready:
-                for s in inputready:
-                    answer = s.recv(1024)
-                    print(answer)
-                    error()
 
-        # 获取container进程树
-        get_runc_container_pidtree(container)
-        # 执行一次dirty-track
-        execute_dirty_track(device_fd)
-        # 更新dirty-map
-        consolidate_dirty_maps_weighted(dirtymap_path)
+        if dirtymap:
+            # 获取container进程树
+            get_runc_container_pidtree(container)
+            # 执行一次dirty-track
+            execute_dirty_track(device_fd)
+            # 更新dirty-map
+            consolidate_dirty_maps_weighted(dirtymap_path)
         # iter pre-dump
-        last_iter = iterate_predump(base_path, parent_path, max_iter, diskless, dest, dirtymap)
+        last_iter = iterate_predump(cs, base_path, parent_path, max_iter, diskless, dest, dirtymap)
             # diskless_pre_dump(base_path, container, dest)
             # xfer_pre_dump(parent_path, dest, base_path)
         # else:
@@ -600,13 +676,12 @@ def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap
     else:
         last_iter = 0
 
-    # 获取container进程树
-    get_runc_container_pidtree(container)
-    # 执行一次dirty-track
-    execute_dirty_track(device_fd)
-    # 更新dirty-map
-    consolidate_dirty_maps_weighted(dirtymap_path)
-    real_dump(pre, lazy, tty, netdump, last_iter, dirtymap)
+    if dirtymap:
+        get_runc_container_pidtree(container)
+        execute_dirty_track(device_fd)
+        consolidate_dirty_maps_weighted(dirtymap_path)
+    # print(dirtymap)
+    real_dump(base_path, pre, post, tty, netdump, last_iter, dirtymap)
 
     # 最后传输容器剩余状态
     xfer_final(image_path, dest, base_path)
@@ -615,7 +690,7 @@ def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap
 
     #send the restore command
     restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
-    restore_cmd += '" , "lazy" : "' + str(lazy) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" } }'
+    restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
     while True:
@@ -644,6 +719,9 @@ def migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap
     if diskless:
         end_ps_cmd = '{ "pageserver" : "terminate" }'
         cs.send(bytes(end_ps_cmd, encoding='utf-8'))
+    
+    if dirtymap:
+        device_fd.close()
 
     return True
 
@@ -665,13 +743,14 @@ parser = argparse.ArgumentParser(description='manual to migration script for sou
 parser.add_argument('container', help="container's name(identical to bundle name)")
 parser.add_argument('dest', help="IP address of destination")
 parser.add_argument('-pre', '--pre-copy', dest='pre', action='store_true', help="enable per-copy migration")
-parser.add_argument('-post', '--post-copy', dest='lazy', action='store_true', help="enable post-copy migration")
+parser.add_argument('-post', '--post-copy', dest='post', action='store_true', help="enable post-copy migration")
 parser.add_argument('-d', '--disk-less', dest='diskless', action='store_true', help="enable disk-less migration(page-server, only effect pre-copy)")
 parser.add_argument('-t', '--tcp-established', dest='netdump', action='store_true', help="dump and restore the established connection")
 parser.add_argument('-s', '--shell-job', dest='tty', action='store_true', help="dump and restore the tty device(opened shell job)")
 parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="avoid the synchronization of rootfs")
 parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
+parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -679,18 +758,19 @@ if __name__ == '__main__':
     runc_base = "/runc/containers/"
     
     pre = False
-    lazy = False
+    post = False
     diskless = False
     tty = False
     netdump = False
     rootfs = True
     dirtymap = False
+    time_constraint = args.time_constraint
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
     
     if args.pre and not args.iter:
-        max_iter = 1
+        max_iter = 10
     else:
         max_iter = args.iter
 
@@ -706,12 +786,12 @@ if __name__ == '__main__':
     #Post-copy = False True
     #Hybrid = True True
     pre = args.pre
-    lazy = args.lazy
+    post = args.post
     dirtymap = args.dirtymap
 
     #use CRIU's page server to directly transfer memory dump
     diskless = args.diskless
-    if diskless and not (pre or lazy):
+    if diskless and not (pre or post):
         parser.error("Diskless only supported to used in pre/post-copy")
 
     #enable CRIU's --shell-job and --tcp-established flag to dump tty device and socket
@@ -723,9 +803,9 @@ if __name__ == '__main__':
         rootfs = False
 
     base_path = runc_base + container
-    image_path = base_path + "/image"
-    parent_path = base_path + "/parent"
-    dirtymap_path = base_path + "/dirty_map"
+    # image_path = base_path + "/image"
+    # parent_path = base_path + "/parent"
+    # dirtymap_path = base_path + "/dirty_map"
 
     #-h outputs numbers in human readable format
     #-a enables archive mode, which preserves permissions, ownership, and modification times, among other things
@@ -733,31 +813,19 @@ if __name__ == '__main__':
     #-P reserves files which are not completely transferred to speed-up the following re-transferring
     rsync_opts = "-haz"
 
-    # 打开dirty-track设备
-    try:
-        device_fd = open(DEVICE_PATH, 'wb')
-    except FileNotFoundError:
-        print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
-        sys.exit(1)
+    # 开始热迁移
+    migrate(container, dest, pre, post, tty, netdump, rootfs, 
+                    max_iter, dirtymap, time_constraint)
 
-    try:
-        # 迁移开始前配置dirty-map目录
-        set_dirty_map_path(device_fd, dirtymap_path)
-
-        # 开始热迁移
-        migrate(container, dest, pre, lazy, tty, netdump, rootfs, max_iter, dirtymap, device_fd)
-
-        if diskless:
-            print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))
-        else:
-            print('total checkpoint time is {:.3f}ms'.format(chk_time))
-            print('total transfer time is {:.3f}ms'.format(xfer_time))
-            chk_time += xfer_time
-        print('total restore time is {:.3f}ms'.format(rst_time))
-        mig_time = chk_time + rst_time
-        print('total migration time is {:.3f}ms'.format(mig_time))
-    finally:
-        device_fd.close()
+    if diskless:
+        print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))
+    else:
+        print('total checkpoint time is {:.3f}ms'.format(chk_time))
+        print('total transfer time is {:.3f}ms'.format(xfer_time))
+        chk_time += xfer_time
+    print('total restore time is {:.3f}ms'.format(rst_time))
+    mig_time = chk_time + rst_time
+    print('total migration time is {:.3f}ms'.format(mig_time))
 
     # 迁移完成后，执行后处理
     if diskless:

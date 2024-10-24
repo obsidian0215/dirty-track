@@ -168,8 +168,8 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
         for (timestamp, file_path), weight in zip(sorted_files, weight_factors):
             with open(file_path, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
                     address, write_count, page_type = struct.unpack('<QIB', data)
                     if address in consolidated:
