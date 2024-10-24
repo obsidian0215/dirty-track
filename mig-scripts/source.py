@@ -752,9 +752,9 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
 
 def post_process(max_iter):
     old_cwd = os.getcwd()
-    os.chdir(base_path)
+    os.chdir(mig_base)
     for i in range(0, max_iter):
-        umount_cmd = 'umount ' + base_path + '/parent{}'.format(i)
+        umount_cmd = 'umount ' + mig_base + '/parent{}'.format(i)
         try:
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:
@@ -828,6 +828,7 @@ if __name__ == '__main__':
         rootfs = False
 
     base_path = runc_base + container
+    mig_base = base_path + "/migrate"
     # image_path = base_path + "/image"
     # parent_path = base_path + "/parent"
     # dirtymap_path = base_path + "/dirty_map"
