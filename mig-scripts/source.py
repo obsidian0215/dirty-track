@@ -277,28 +277,40 @@ def consolidate_dirty_maps(dirty_map_path):
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
-def prepare(base_path, image_path, parent_path):
-    try:
-        shutil.rmtree(image_path)
-    except:
-        pass
+def prepare(base_path, image_path, parent_path, work_path):
+    if os.path.exists(base_path):
+        try:
+            umount_cmd = 'umount ' + image_path
+            subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+            shutil.rmtree(image_path)
+            shutil.rmtree(base_path + '/d_log')
+        except:
+            pass
 
-    try:
-        dir_list = os.listdir(base_path)
-        for entry in dir_list:
-            entry_path = os.path.join(base_path, entry)
-            # print(entry)
-            # print(entry_path)
-            if os.path.isdir(entry_path) and entry.startswith('parent'):
-                umount_cmd = 'umount ' + entry_path
-                subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
-                shutil.rmtree(entry_path)
-    except:     
-        pass
+        try:
+            dir_list = os.listdir(base_path)
+            for entry in dir_list:
+                entry_path = os.path.join(base_path, entry)
+                # print(entry)
+                # print(entry_path)
+                if os.path.isdir(entry_path) and entry.startswith('parent'):
+                    umount_cmd = 'umount ' + entry_path
+                    subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+                    shutil.rmtree(entry_path)
+                elif os.path.isdir(entry_path) and entry.startswith('pd_log'):
+                    shutil.rmtree(entry_path)
+        except:     
+            pass
+    else:
+        os.mkdir(base_path)
     if parent_path:
         for i in parent_path:
             os.mkdir(i)
+    if work_path:
+        for i in work_path:
+            os.mkdir(i)
     os.mkdir(image_path)
+    os.mkdir(base_path + '/d_log')
 
 # 功能函数：获取目录下特定模式文件的总大小
 # pattern: 文件名模式, e.g. "pages*.img"
@@ -380,11 +392,11 @@ def measure_bandwidth(dest_ip):
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
-def pre_dump(container_path, container, i, dirtymap):
+def pre_dump(mig_base, container, i, dirtymap):
     global chk_time
     old_cwd = os.getcwd()
-    os.chdir(container_path)
-    cmd = 'runc checkpoint --pre-dump --image-path parent{}'.format(i)
+    os.chdir(mig_base)
+    cmd = 'runc checkpoint --pre-dump -W pd_{} --image-path parent{}'.format(i, i)
     cmd += ' ' + container
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
@@ -410,13 +422,13 @@ def pre_dump(container_path, container, i, dirtymap):
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtymap):
+def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, diskless):
     global chk_time    
     old_cwd = os.getcwd()
-    os.chdir(container_path)
+    os.chdir(mig_base)
     
     #cmd = 'runc checkpoint --image-path image --leave-running'
-    cmd = 'runc checkpoint --image-path image'
+    cmd = 'runc checkpoint --image-path image -W d_log'
 
     if tty:
         cmd += ' --shell-job'
@@ -424,6 +436,19 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
         cmd += ' --tcp-established'
     if precopy:
         cmd += ' --parent-path ../parent{}'.format(last_iter)
+    if diskless:
+        #send the page server command,
+        #after the server's response, CRIU can directly transfer memory dump with network
+        pageserver_cmd = '{ "pageserver" : { "path" : "image" } }'
+        cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+        inputready, outputready, exceptready = select.select(input, [], [], 4)
+        #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+        if inputready:
+            for s in inputready:
+                answer = s.recv(1024)
+                print(answer)
+                error()
+        cmd += ' --page-server ' + dest + ':27'
     if postcopy:
         cmd += ' --lazy-pages'
         cmd += ' --page-server localhost:27'
@@ -434,23 +459,23 @@ def real_dump(container_path, precopy, postcopy, tty, netdump, last_iter, dirtym
         # os.mkfifo('/tmp/postcopy-pipe')
         # p_pipe = os.open('/tmp/postcopy-pipe', os.O_WRONLY)
         #cmd += ' --status-fd /tmp/postcopy-pipe'
-        status_fds = os.pipe()
-        fd = status_fds[1]
-        fdflags = fcntl.fcntl(fd, fcntl.F_GETFD)
-        fcntl.fcntl(fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
-        cmd += ' --status-fd ' + str(fd)
+        read_fd, write_fd = os.pipe()
+        fdflags = fcntl.fcntl(write_fd, fcntl.F_GETFD)
+        fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
+        cmd += ' --status-fd ' + str(write_fd)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
+
     cmd += ' ' + container
     start = time.perf_counter() * 1000
     print(cmd)
     p = subprocess.Popen(cmd, shell=True)
     if postcopy:
-        ret = os.read(status_fds[0], 1) 
+        ret = os.read(read_fd, 1) 
         if ret == b'\0':
             print('Ready for lazy page transfer')
-            os.close(status_fds[0])
-            os.close(status_fds[1])
+            os.close(read_fd)
+            os.close(write_fd)
         ret = 0
     else:
         ret = p.wait()
@@ -498,13 +523,13 @@ def xfer_final(image_path, dest, base_path):
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
-def diskless_pre_dump(container_path, container, dest, i, dirtymap):
+def diskless_pre_dump(mig_base, container, dest, i, dirtymap):
     global chk_time
     old_cwd = os.getcwd()
-    os.chdir(container_path)
+    os.chdir(mig_base)
     
-    cmd = 'runc checkpoint --pre-dump --page-server ' + dest + ':27 --image-path parent{}'.format(i)
-    cmd += ' ' + container
+    cmd = 'runc checkpoint --pre-dump --page-server ' + dest + ':27 --image-path parent_{}'.format(i)
+    cmd += ' -W pd_log_{} '.format(i) + container
     if i > 0:
         cmd += ' --parent-path ../parent{}'.format(i-1)
     if dirtymap:
@@ -519,14 +544,14 @@ def diskless_pre_dump(container_path, container, dest, i, dirtymap):
     if ret != 0:
         error()
 
-def iterate_predump(cs, container_path, parent_path, max_iter, diskless, dest, dirtymap):
+def iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtymap):
     last_iter = 0
     while last_iter < max_iter:
         last_path = parent_path[last_iter]
         if diskless:
             #send the page server command,
             #after the server's response, CRIU can directly transfer memory dump with network
-            pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '" } }'
+            pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
             cs.send(bytes(pageserver_cmd, encoding='utf-8'))
             inputready, outputready, exceptready = select.select(input, [], [], 4)
             #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
@@ -535,10 +560,10 @@ def iterate_predump(cs, container_path, parent_path, max_iter, diskless, dest, d
                     answer = s.recv(1024)
                     print(answer)
                     error()
-            diskless_pre_dump(container_path, container, dest, last_iter, dirtymap)
+            diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         else:
-            pre_dump(container_path, container, last_iter, dirtymap)
-            xfer_pre_dump(last_path, dest, container_path, last_iter)        
+            pre_dump(mig_base, container, last_iter, dirtymap)
+            xfer_pre_dump(last_path, dest, mig_base, last_iter)        
 
         dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
         print('the total size of {} with pattern {} is {}{}'\
@@ -559,18 +584,22 @@ def iterate_predump(cs, container_path, parent_path, max_iter, diskless, dest, d
 def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
     global rst_time
     base_path = runc_base + container
-    image_path = base_path + "/image"
+    rootfs_path = base_path + "/rootfs"
+    mig_base = base_path + "/migrate"
+    image_path = mig_base + "/image"
     # parent_path = base_path + "/parent"
     parent_path = []
-    rootfs_path = base_path + "/rootfs"
-    dirtymap_path = base_path + "/dirty_map"
+    work_path = []
+    dirtymap_path = mig_base + "/dirty_map"
 
     if pre:
         for i in range(0, max_iter):
-            pathname = base_path + "/parent{}".format(i)
+            pathname = mig_base + "/parent_{}".format(i)
             parent_path.append(pathname)
+            pathname = mig_base + "/pd_log_{}".format(i)
+            work_path.append(pathname)
 
-    prepare(base_path, image_path, parent_path)
+    prepare(mig_base, image_path, parent_path, work_path)
 
     # 测量初始带宽和最大传输值
     global mea_bandwidth, max_xfer_size
@@ -605,7 +634,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     if pre:
         prepare_cmd = json.dumps({
             "prepare": {
-                "path": base_path,
+                "path": mig_base,
                 "image_path": image_path,
                 "parent_path": parent_path  # parent_path 为列表
             }
@@ -613,7 +642,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     else:
         prepare_cmd = json.dumps({
             "prepare": {
-                "path": base_path,
+                "path": mig_base,
                 "image_path": image_path
                 # 不包含 parent_path
             }
@@ -667,7 +696,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
             # 更新dirty-map
             consolidate_dirty_maps_weighted(dirtymap_path)
         # iter pre-dump
-        last_iter = iterate_predump(cs, base_path, parent_path, max_iter, diskless, dest, dirtymap)
+        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtymap)
             # diskless_pre_dump(base_path, container, dest)
             # xfer_pre_dump(parent_path, dest, base_path)
         # else:
@@ -681,15 +710,15 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
         execute_dirty_track(device_fd)
         consolidate_dirty_maps_weighted(dirtymap_path)
     # print(dirtymap)
-    real_dump(base_path, pre, post, tty, netdump, last_iter, dirtymap)
+    real_dump(cs, mig_base, pre, post, tty, netdump, last_iter, dirtymap, diskless)
 
     # 最后传输容器剩余状态
-    xfer_final(image_path, dest, base_path)
+    xfer_final(image_path, dest, mig_base)
     dir_size = convert_byte(getdirsize(image_path))
     print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
     #send the restore command
-    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+    restore_cmd = '{ "restore" : { "path" : "' + mig_base + '", "name" : "' + container + '" , "image_path" : "' + image_path 
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
@@ -715,10 +744,6 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     if rootfs:
         p.terminate()
         f.close()
-    
-    if diskless:
-        end_ps_cmd = '{ "pageserver" : "terminate" }'
-        cs.send(bytes(end_ps_cmd, encoding='utf-8'))
     
     if dirtymap:
         device_fd.close()
@@ -770,7 +795,7 @@ if __name__ == '__main__':
         parser.error("Pre-copy is required when max_iter is provided.")
     
     if args.pre and not args.iter:
-        max_iter = 10
+        max_iter = 5
     else:
         max_iter = args.iter
 

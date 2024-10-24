@@ -10,31 +10,39 @@ import distutils.util
 import time
 import subprocess
 
+global mig_basepath
+
 def prepare(base_path, image_path, parent_path):
-    try:
-        shutil.rmtree(image_path)
-    except:
-        pass
+    if os.path.exists(base_path):
+        try:
+            umount_cmd = 'umount ' + image_path
+            subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+            shutil.rmtree(image_path)
+            shutil.rmtree(base_path + '/r_log')
+            shutil.rmtree(base_path + '/lp_log')
+        except:
+            pass
 
-    # 尝试清空之前存在的parent_{}目录
-    try:
-        dir_list = os.listdir(base_path)
-        for entry in dir_list:
-            entry_path = os.path.join(base_path, entry)
-            # print(entry)
-            # print(entry_path)
-            if os.path.isdir(entry_path) and entry.startswith('parent'):
-                umount_cmd = 'umount ' + entry_path
-                subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
-                shutil.rmtree(entry_path)
-    except:
-        pass
-
+        try:
+            dir_list = os.listdir(base_path)
+            for entry in dir_list:
+                entry_path = os.path.join(base_path, entry)
+                # print(entry)
+                # print(entry_path)
+                if os.path.isdir(entry_path) and entry.startswith('parent'):
+                    umount_cmd = 'umount ' + entry_path
+                    subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
+                    shutil.rmtree(entry_path)
+        except:     
+            pass
+    else:
+        os.mkdir(base_path)
     if parent_path:
         for i in parent_path:
             os.mkdir(i)
-
     os.mkdir(image_path)
+    os.mkdir(base_path + '/r_log')
+    os.mkdir(base_path + '/lp_log')
 
 def migrate_server():
     HOST = ''   # Symbolic name meaning all available interfaces
@@ -86,34 +94,29 @@ def migrate_server():
                         umount_cmd = 'umount ' + msg['pageserver']['path']
 
                         terminate = False
-                        if msg['pageserver'] == 'terminate':
-                            terminate = True
+                        if msg['pageserver']['iter']:
+                            i = msg['pageserver']['iter']
                         
-                        if terminate == True:
-                            #cmd = 'killall criu page-server'
-                            #print ("Killing page server: " + cmd)
-                            #os.system(cmd)
-                            print ("Killing page server")
-                            ps.terminate()
-                            os.system(umount_cmd)
-                            continue
-                        else:
-                            print("start page server")
-                            os.system(mount_cmd)
+                        print("start page server")
+                        os.system(mount_cmd)
 
-                            cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
-                            cmd += ' --port 27 --auto-dedup -v4 -o ' + old_cwd + '/logs/ps.log'
-                            print ("Running page server for pre-copy: " + cmd)
-                            ps = subprocess.Popen(cmd, shell=True)
-                            exitcode = ps.poll()
-                            print(exitcode)
-                            if exitcode is not None:
-                                reply = 'remote criu page-server failed'
-                            else:
-                                continue
+                        cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
+                        if i:
+                            cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps_{}.log'.format(i)
+                        else:
+                            cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps.log'
+                        print ("Running page server for pre-copy: " + cmd)
+                        ps = subprocess.Popen(cmd, shell=True)
+                        exitcode = ps.poll()
+                        print(exitcode)
+                        if exitcode is not None:
+                            reply = 'remote criu page-server failed'
+                        else:
+                            continue
                 
                     case {'prepare': prepare_info}:
                         path = prepare_info['path']
+                        mig_basepath = path
                         image_path = prepare_info['image_path']
 
                         if 'parent_path' in prepare_info:
@@ -144,7 +147,7 @@ def migrate_server():
                         #The following command is the restore command, which resotres execution of the container at destination
                         cmd = 'time -p runc restore --console-socket ' + msg['restore']['path']
                         cmd += '/console.sock -d --image-path ' + msg['restore']['image_path']
-                        cmd += ' --work-path ' + msg['restore']['image_path']
+                        cmd += ' --work-path ' + msg['restore']['path'] + "/r_log"
                         if tty:
                             cmd += ' --shell-job'
                         if netdump:
@@ -167,9 +170,8 @@ def migrate_server():
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
                             lazy_cmd += " --port 27 -v4 -D "
                             lazy_cmd += msg['restore']['image_path']
-                            lazy_cmd += " -W "
-                            lazy_cmd += msg['restore']['image_path']
-                            lazy_cmd += " -o logs/lp.log"
+                            lazy_cmd += " -W " + msg['restore']['path'] + "/lp_log"
+                            lazy_cmd += " -o z" + msg['restore']['path'] + "/logs/lp.log"
                             print ("Running lazy-pages server: " + lazy_cmd)
                             lp = subprocess.Popen(lazy_cmd, shell=True)
                         ret = p.wait()
