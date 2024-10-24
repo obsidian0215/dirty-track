@@ -396,12 +396,12 @@ def pre_dump(mig_base, container, i, dirtymap):
     global chk_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    cmd = 'runc checkpoint --pre-dump -W pd_{} --image-path parent{}'.format(i, i)
+    cmd = 'runc checkpoint --pre-dump -W pd_{} --image-path parent_{}'.format(i, i)
     cmd += ' ' + container
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
     if i > 0:
-        cmd += ' --parent-path ../parent{}'.format(i-1)
+        cmd += ' --parent-path ../parent_{}'.format(i-1)
     # print(cmd)
     start = time.perf_counter() * 1000
     ret = os.system(cmd)
@@ -435,7 +435,7 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
     if netdump:
         cmd += ' --tcp-established'
     if precopy:
-        cmd += ' --parent-path ../parent{}'.format(last_iter)
+        cmd += ' --parent-path ../parent_{}'.format(last_iter)
     if diskless:
         #send the page server command,
         #after the server's response, CRIU can directly transfer memory dump with network
@@ -448,7 +448,7 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
                 answer = s.recv(1024)
                 print(answer)
                 error()
-        cmd += ' --page-server ' + dest + ':27'
+        cmd += ' --page-server {}:27'.format(dest)
     if postcopy:
         cmd += ' --lazy-pages'
         cmd += ' --page-server localhost:27'
@@ -531,7 +531,7 @@ def diskless_pre_dump(mig_base, container, dest, i, dirtymap):
     cmd = 'runc checkpoint --pre-dump --page-server ' + dest + ':27 --image-path parent_{}'.format(i)
     cmd += ' -W pd_log_{} '.format(i) + container
     if i > 0:
-        cmd += ' --parent-path ../parent{}'.format(i-1)
+        cmd += ' --parent-path ../parent_{}'.format(i-1)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
     # print(cmd)
@@ -759,7 +759,7 @@ def post_process(max_iter):
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     for i in range(0, max_iter):
-        umount_cmd = 'umount ' + mig_base + '/parent{}'.format(i)
+        umount_cmd = 'umount ' + mig_base + '/parent_{}'.format(i)
         try:
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:

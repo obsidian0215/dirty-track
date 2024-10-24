@@ -10,7 +10,7 @@ import distutils.util
 import time
 import subprocess
 
-global mig_basepath
+global mig_base
 
 def prepare(base_path, image_path, parent_path):
     if os.path.exists(base_path):
@@ -93,7 +93,6 @@ def migrate_server():
                         mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
                         umount_cmd = 'umount ' + msg['pageserver']['path']
 
-                        terminate = False
                         if msg['pageserver']['iter']:
                             i = msg['pageserver']['iter']
                         
@@ -101,7 +100,7 @@ def migrate_server():
                         os.system(mount_cmd)
 
                         cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
-                        if i:
+                        if not i is None:
                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps_{}.log'.format(i)
                         else:
                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps.log'
@@ -116,7 +115,7 @@ def migrate_server():
                 
                     case {'prepare': prepare_info}:
                         path = prepare_info['path']
-                        mig_basepath = path
+                        mig_base = path
                         image_path = prepare_info['image_path']
 
                         if 'parent_path' in prepare_info:
@@ -125,7 +124,7 @@ def migrate_server():
                             parent_paths = []
 
                         path_exist = os.path.exists(path)
-                        if not path_exist:
+                        if not path_exist and not os.path.exists(path + '/..'):
                             reply = 'cannot find corresponding container bundle'
                         else:
                             prepare(path, image_path, parent_paths)
