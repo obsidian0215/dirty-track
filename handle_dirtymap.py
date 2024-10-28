@@ -5,12 +5,43 @@ from dataclasses import dataclass, field
 import statistics
 import math
 
+# 定义页面大小映射，根据 page_type 索引
+PAGE_SIZES = [1 << 12, 1 << 21]  # 0: 4KB PTE, 1: 2MB PMD
+
+"""
+struct __((packed))__ {
+    uint64_t address;
+    uint32_t write_count;
+
+    uint8_t page_type;
+}
+sizeof() = 26
+"""
 @dataclass
 class DirtyMapEntry:
     address: int
     write_count: float
     page_type: int
     heat_level: int = field(default=100)
+
+"""
+struct __((packed))__ {
+    uint64_t start;
+    uint64_t end;
+    uint64_t page_size;
+
+    uint8_t heat_level;
+    int8_t heat_trend;
+}
+sizeof() = 26
+"""
+@dataclass
+class DirtyHeatMapEntry:
+    start: int
+    end: int
+    page_size: int
+    heat_level: int
+    heat_trend: int
 
 def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
     """
@@ -59,10 +90,10 @@ def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
         try:
             with open(latest_file_path, 'rb') as f:
                 while True:
-                    data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                    if not data or len(data) < 20:
+                    data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
+                    if not data or len(data) < 13:
                         break
-                    address, write_count, page_type = struct.unpack('<QQI', data)
+                    address, write_count, page_type = struct.unpack('<QIB', data)
                     entry = DirtyMapEntry(
                         address=address,
                         write_count=float(write_count),
@@ -83,13 +114,14 @@ def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
             # 如果只有一个文件，复制为 old-<pid>.img 并添加到 consolidated_dirtymaps
             oldest_img_path = os.path.join(dirty_map_path, f'old-{pid}.img')
             try:
-                os.replace(latest_file_path, oldest_img_path)
+                # os.replace(latest_file_path, oldest_img_path)
                 print(f"PID：{pid} 只有一个脏页映射文件，直接复制为 old-{pid}.img")
                 # 将最新 dirtymap 作为整合后的 dirtymap
                 consolidated_dirtymaps.append({
                     'pid': pid,
                     'dirtymap': latest_dirtymap_entries,
-                    'source_files': [oldest_img_path]
+                    'source_files': [latest_file_path]
+                    # 'source_files': [oldest_img_path]
                 })
             except OSError as e:
                 print(f"无法重命名文件 {latest_file_path} 为 {oldest_img_path}，错误：{e}")
@@ -119,10 +151,10 @@ def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
             try:
                 with open(file_path, 'rb') as f:
                     while True:
-                        data = f.read(20)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
-                        if not data or len(data) < 20:
+                        data = f.read(13)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
+                        if not data or len(data) < 13:
                             break
-                        address, write_count, page_type = struct.unpack('<QQI', data)
+                        address, write_count, page_type = struct.unpack('<QIB', data)
                         if address in consolidated:
                             consolidated[address].write_count += write_count * weight
                             # 假设 page_type 取最新的类型
@@ -167,7 +199,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
         'consolidated_dirtymaps': consolidated_dirtymaps
     }
 
-def get_wc_threshold(dirtymap: List[DirtyMapEntry]) -> float:
+def detect_extreme_high_wc(write_counts: List[float]) -> float:
     """
     计算给定 dirtymap 中划分异常高 write_count 的阈值。
     
@@ -177,149 +209,105 @@ def get_wc_threshold(dirtymap: List[DirtyMapEntry]) -> float:
     Returns:
         float: dirtymap 中异常高 write_count 的阈值。
     """
-    if not dirtymap:
+    if not write_counts:
         return 0
     
-    write_counts = sorted(entry.write_count for entry in dirtymap)
+    # write_counts = sorted(entry.write_count for entry in dirtymap)
     n = len(write_counts)
-
-    # 使用四分位数方法检测异常值
-    q1 = statistics.quantiles(write_counts, n=4)[0]  # 第一四分位数
-    q3 = statistics.quantiles(write_counts, n=4)[2]  # 第三四分位数
-    iqr = q3 - q1
-    threshold = q3 + 1.5 * iqr  # 常用的异常高值检测阈值
-
-    if n <= 10000:
-        # 对于小规模数据，使用均值和标准差
+    if n == 0:
+        return 0  # 无数据
+    elif n < 4096:
+        # 小规模脏内存(<=16MB)：使用中位数和MAD
         try:
-            mean_wc = statistics.mean(write_counts)
-            stdev_wc = statistics.stdev(write_counts) if n > 1 else 0
-            high_threshold = mean_wc + 2 * stdev_wc
-            medium_threshold = mean_wc + stdev_wc
+            median_wc = statistics.median(write_counts)
+            mad = statistics.median([abs(wc - median_wc) for wc in write_counts])
+            threshold = median_wc + 3 * mad  # 任意选择3倍MAD作为阈值
         except statistics.StatisticsError:
-            mean_wc = statistics.mean(write_counts)
-            stdev_wc = 0
-            high_threshold = mean_wc
-            medium_threshold = mean_wc
+            median_wc = statistics.median(write_counts)
+            threshold = max(write_counts) * 0.9
+    elif n < 32768:
+        # 中等规模脏内存(<=128MB)：使用四分位数方法
+        try:
+            # 使用四分位数方法检测异常值
+            q1 = statistics.quantiles(write_counts, n=4)[0]  # 第一四分位数
+            q3 = statistics.quantiles(write_counts, n=4)[2]  # 第三四分位数
+            iqr = q3 - q1
+            threshold = q3 + 1.5 * iqr  # 常用的异常高值检测阈值
+        except statistics.StatisticsError:
+            threshold = max(write_counts) * 0.9
     else:
-        # 对于大规模数据，使用分位数
+        # 大规模脏内存：使用95百分位数
         try:
             percentile_95 = statistics.quantiles(write_counts, n=100)[94]  # 95th 百分位
-            percentile_75 = statistics.quantiles(write_counts, n=100)[74]  # 75th 百分位
-            high_threshold = percentile_95
-            medium_threshold = percentile_75
+            threshold = percentile_95
         except statistics.StatisticsError:
-            # 无法计算分位数时，使用最大值和中位数
-            high_threshold = max(write_counts)
-            medium_threshold = statistics.median(write_counts)
+            threshold = max(write_counts) * 0.9
 
     return threshold
 
-def find_exceptionally_high_write_counts(dirtymap: List[DirtyMapEntry], multiplier: float = 3.0) -> List[DirtyMapEntry]:
-    """
-    识别 dirtymap 中 write_count 异常高的条目。
-    异常高的定义为 write_count > mean + multiplier * std_dev。
-    
-    Args:
-        dirtymap (List[DirtyMapEntry]): DirtyMapEntry 实例的列表。
-        multiplier (float): 用于确定异常阈值的倍数。
-    
-    Returns:
-        List[DirtyMapEntry]: 异常高 write_count 的 DirtyMapEntry 列表。
-    """
-    threshold = get_wc_threshold(dirtymap)
-    if threshold == 0:
-        return []
-    
-    exceptional_entries = [entry for entry in dirtymap if entry.write_count > threshold]
-    
-    print(f"识别出 {len(exceptional_entries)} 个异常高的 write_count 条目（阈值 > {threshold:.2f}）")
-    
-    return exceptional_entries
 
-def assign_heat_level(dirtymap: List[DirtyMapEntry], num_intervals: int = 5) -> None:
+def convert_dirtymap_to_heatmap(dirtymap: List[DirtyMapEntry])-> List[DirtyHeatMapEntry]:
     """
-    根据 write_count 大小为 dirtymap 中的每个条目分配 heat_level。
-    将除去异常高 write_count 的条目分为 num_intervals 个区间，并根据区间赋值 heat_level。
-    
-    Args:
-        dirtymap (List[DirtyMapEntry]): DirtyMapEntry 实例的列表。
-        num_intervals (int): 将 write_count 分为的区间数（默认为5）。
-    
-    Returns:
-        None: 直接修改 dirtymap 中每个 DirtyMapEntry 的 heat_level 属性。
+    排除异常高write_count后将dirtymap转换为heatmap
+    :param dirtymap: dict, key=address, value=DirtyMapEntry
+    :return: list of HeatmapEntry
     """
     if not dirtymap:
-        return
+        return []
     
-    # 首先计算分布
-    distribution = get_wc_threshold(dirtymap)
-    mean = distribution.get('mean', 0)
-    std_dev = distribution.get('std_dev', 0)
-    threshold = mean + 3 * std_dev  # 使用3倍标准差作为异常高的阈值
+    write_counts = [entry.write_count for entry in dirtymap]
+    threshold = detect_extreme_high_wc(write_counts)
     
-    # 分为异常高和正常
-    normal_entries = [entry for entry in dirtymap if entry.write_count <= threshold]
-    exceptional_entries = [entry for entry in dirtymap if entry.write_count > threshold]
+    # 找出非异常高write_count的最大值，用于归一化
+    non_extreme_wcs = [wc for wc in write_counts if wc < threshold]
+    max_write_count = max(non_extreme_wcs) if non_extreme_wcs else 1  # 避免除零
     
-    if not normal_entries:
-        print("没有足够的正常 write_count 条目进行 heat_level 分配。")
-        return
+    # 排序地址
+    sorted_entries = sorted(dirtymap, key=lambda x: x.address)
     
-    # 获取正常条目的 write_count 范围
-    write_counts = sorted(entry.write_count for entry in normal_entries)
-    min_write = write_counts[0]
-    max_write = write_counts[-1]
+    heatmap_entries = []
+    current_start = None
+    current_end = None
+    current_size = None
+    current_heat_level = None
     
-    # 定义区间边界
-    interval_size = (max_write - min_write) / num_intervals if num_intervals > 0 else 1
-    if interval_size == 0:
-        interval_size = 1  # 防止除以零
+    for entry in sorted_entries:
+        address = entry.address
+        write_count = entry.write_count
+        page_type = entry.page_type
+        
+        # 判断是否为异常高write_count
+        if write_count >= threshold:
+            heat_level = 100  # 最大heat_level
+        else:
+            normalized_wc = write_count / max_write_count
+            # 归一化后均分为10级
+            heat_level = math.ceil(normalized_wc * 9) + 1  # 1到10
+            heat_level = min(max(heat_level, 1), 10)  # 确保在范围内
+        
+        # 判断是否可以与当前heatmap_entry合并
+        if (current_heat_level == heat_level and 
+            current_end == address):
+            # 合并范围
+            current_end = address + PAGE_SIZES[page_type]
+            current_size += PAGE_SIZES[page_type]
+        else:
+            # 保存当前heatmap_entry
+            if current_start is not None:
+                heatmap_entries.append(DirtyHeatMapEntry(start=current_start, end=current_end, 
+                        page_size=current_size, heat_level=current_heat_level, heat_trend=0))
+            # 开始新的heatmap_entry
+            current_start = address
+            current_end = address + PAGE_SIZES[page_type]
+            current_heat_level = heat_level
+            current_size = PAGE_SIZES[page_type]
     
-    # 创建区间边界列表
-    boundaries = [min_write + i * interval_size for i in range(1, num_intervals)]
+    # 添加最后一个heatmap_entry
+    if current_start is not None:
+        heatmap_entries.append(DirtyHeatMapEntry(start=current_start, end=current_end, 
+                heat_level=current_heat_level, page_size=current_size, heat_trend=0))
     
-    # 辅助函数：根据 write_count 找到所属区间
-    def find_interval(write_count: float) -> int:
-        for i, boundary in enumerate(boundaries):
-            if write_count <= boundary:
-                return i
-        return num_intervals - 1  # 最后一个区间
-    
-    # 分配 heat_level
-    for entry in normal_entries:
-        interval = find_interval(entry.write_count)
-        # 定义 heat_level 的分配策略，例如：较高的区间对应较高的 heat_level
-        # 这里假设 heat_level 低于100，根据区间增加
-        entry.heat_level = 50 + int((interval + 1) * (50 / num_intervals))
-    
-    # 对于异常高的条目，可以赋予最高的 heat_level或特殊标记
-    for entry in exceptional_entries:
-        entry.heat_level = 100  # 保持初始化值，或根据需要调整
-    
-    print(f"为 {len(normal_entries)} 个正常条目分配了 heat_level，{len(exceptional_entries)} 个异常条目已标记为最高 heat_level。")
-
-def process_dirtymap_entries(dirtymap: List[DirtyMapEntry], num_intervals: int = 5) -> None:
-    """
-    对整个 dirtymap 的 DirtyMapEntry 列表进行统计、异常检测和 heat_level 分配。
-    
-    Args:
-        dirtymap (List[DirtyMapEntry]): DirtyMapEntry 实例的列表。
-        num_intervals (int): heat_level 分配的区间数（默认为5）。
-    
-    Returns:
-        None: 直接修改每个 DirtyMapEntry 的 heat_level 属性。
-    """
-    distribution = get_wc_threshold(dirtymap)
-    print(f"DirtyMap 统计信息: {distribution}")
-    
-    exceptional_entries = find_exceptionally_high_write_counts(dirtymap, multiplier=3.0)
-    
-    assign_heat_level(dirtymap, num_intervals=num_intervals)
-    
-    # 如果需要单独处理异常高的条目，可以在这里进行
-    # 例如，将异常高的条目记录到日志或进行特殊处理
-    # 在当前实现中，异常高的条目已被赋予最高的 heat_level
+    return heatmap_entries
 
 # 示例调用
 if __name__ == "__main__":
@@ -329,9 +317,15 @@ if __name__ == "__main__":
     # 打印部分结果以验证
     for latest in result['latest_dirtymaps']:
         print(f"最新 dirtymap - PID: {latest['pid']}, Timestamp: {latest['timestamp']}, 条目数: {len(latest['dirtymap'])}")
-        print(latest['dirtymap'][0])
+        # print(f"latest{latest['pid']}异常高值阈值: {detect_extreme_high_wc(latest['dirtymap'])}")
+        latest['dirtymap'] = convert_dirtymap_to_heatmap(latest['dirtymap'])
+        print(latest['dirtymap'])
+        print(f"最新 heatmap 大小{len(latest['dirtymap'])}")
     
     for consolidated in result['consolidated_dirtymaps']:
         print(f"整合后的旧 dirtymap - PID: {consolidated['pid']}, 来源文件数: {len(consolidated['source_files'])}, 条目数: {len(consolidated['dirtymap'])}")
-        print(consolidated['dirtymap'][0])
+        # print(f"consolidated{consolidated['pid']}异常高值阈值: {detect_extreme_high_wc(consolidated['dirtymap'])}")
+        consolidated['dirtymap'] = convert_dirtymap_to_heatmap(consolidated['dirtymap'])
+        print(consolidated['dirtymap'])
+        print(f"整合 heatmap 大小{len(consolidated['dirtymap'])}")
     

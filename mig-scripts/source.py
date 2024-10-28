@@ -15,6 +15,10 @@ import psutil
 import struct
 import threading
 import fcntl
+from typing import List, Dict, Tuple
+from dataclasses import dataclass, field
+import statistics
+import math
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -57,6 +61,42 @@ IOCTL_START_PID = _IOW(DIRTY_TRACK_MAGIC, 2, 4)
 IOCTL_STOP_PID = _IOW(DIRTY_TRACK_MAGIC, 3, 4)
 IOCTL_STOP_ALL = _IO(DIRTY_TRACK_MAGIC, 4)
 IOCTL_GET_DIRTY_MAP_PATH = _IOR(DIRTY_TRACK_MAGIC, 5, 256)
+
+# 定义页面大小映射，根据 page_type 索引
+PAGE_SIZES = [1 << 12, 1 << 21]  # 0: 4KB PTE, 1: 2MB PMD
+
+# 定义dirtymap的每个条目的成员
+"""
+struct __((packed))__ {
+    uint64_t address;
+    uint32_t write_count;
+    uint8_t page_type;
+}   // size=26
+"""
+@dataclass
+class DirtyMapEntry:
+    address: int
+    write_count: float
+    page_type: int
+    heat_level: int = field(default=100)
+
+"""
+struct __((packed))__ {
+    uint64_t start;
+    uint64_t end;
+    uint64_t page_size;
+
+    uint8_t heat_level;
+    int8_t heat_trend;
+}   // size=26
+"""
+@dataclass
+class DirtyHeatMapEntry:
+    start: int
+    end: int
+    page_size: int
+    heat_level: int
+    heat_trend: int
 
 # 定义容器进程树的 pid 列表
 container_pids = []
@@ -169,7 +209,7 @@ def execute_dirty_track(device_fd):
 
     return dirty_map_path
 
- # 整合同一PID的dirty-map文件为newest-<pid>.img，添加时间相关的权重
+# 整合同一PID的dirty-map文件为newest-<pid>.img，添加时间相关的权重
 def consolidate_dirty_maps_weighted(dirty_map_path):
     pid_files = {}
     # 遍历dirty_map_path目录下的所有文件，排除以newest-开头的img文件
@@ -235,45 +275,252 @@ def consolidate_dirty_maps_weighted(dirty_map_path):
                 f.write(packed)
         print(f"已生成整合后的脏页映射文件: {newest_img_path}")
 
-# 整合同一PID的dirty-img为newest-<pid>.img
-def consolidate_dirty_maps(dirty_map_path):
-    pid_files = {}
-    # 遍历dirty_map_path目录下的所有文件,排除以newest-开头的img文件
-    for filename in os.listdir(dirty_map_path) and not filename.startswith('newest-'):
-        if filename.endswith('.img'):
+# 将dirty_map_path中的所有dirtymap预处理，返回每个PID的最新dirtymap和整合后的旧dirtymap
+# 返回形式为Dict[str, List[Dict]]：包含'latest_dirtymaps'和'consolidated_dirtymaps'两个列表的字典
+# 'xxx_dirtymaps'中的每个元素为一个字典，包含'pid'、'dirtymap'、'source_file'三个键
+def prehandle_dirtymap(dirty_map_path: str) -> Dict[str, List[Dict]]:
+    pid_files: Dict[int, List[Tuple[int, str]]] = {}
+    latest_dirtymaps: List[Dict] = []
+    consolidated_dirtymaps: List[Dict] = []
+
+    # 遍历 dirty_map_path 目录下的所有文件，排除以 newest- 开头的 img 文件
+    for filename in os.listdir(dirty_map_path):
+        if filename.endswith('.img') and not filename.startswith('newest-') and not filename.startswith('consolidated-'):
             parts = filename.split('-')
             if len(parts) < 2:
                 continue
-            pid = parts[0]
-            timestamp = parts[1].split('.')[0]
+            pid_str, timestamp_str = parts[0], parts[1].split('.')[0]
+            try:
+                pid = int(pid_str)
+                timestamp = int(timestamp_str)
+            except ValueError:
+                print(f"{filename} 的 PID 或时间戳无效，跳过")
+                continue
             if pid not in pid_files:
                 pid_files[pid] = []
-            pid_files[pid].append(os.path.join(dirty_map_path, filename))
-    
+            pid_files[pid].append((timestamp, os.path.join(dirty_map_path, filename)))
+
     # 对每个 PID 的文件进行整合
     for pid, files in pid_files.items():
-        consolidated = {}
-        for file in sorted(files):
-            with open(file, 'rb') as f:
+        if not files:
+            continue
+        # 按时间戳排序（升序）
+        sorted_files = sorted(files, key=lambda x: x[0])
+
+        # 分离最新的 dirtymap
+        latest_timestamp, latest_file_path = sorted_files[-1]
+        older_files = sorted_files[:-1]
+
+        # 读取最新 dirtymap
+        latest_dirtymap_entries = []
+        try:
+            with open(latest_file_path, 'rb') as f:
                 while True:
                     data = f.read(13)  # sizeof(dirty_page) = 8 + 4 + 1 = 13 bytes
                     if not data or len(data) < 13:
                         break
                     address, write_count, page_type = struct.unpack('<QIB', data)
-                    if address in consolidated:
-                        consolidated[address]['write_count'] += write_count
-                    else:
-                        consolidated[address] = {
-                            'write_count': write_count,
-                            'page_type': page_type
-                        }
-        # 写入 consolidated 自然有序的新 img 文件
-        newest_img_path = os.path.join(dirty_map_path, f'newest-{pid}.img')
-        with open(newest_img_path, 'wb') as f:
-            for address, info in consolidated.items():
-                packed = struct.pack('<QIB', address, info['write_count'], info['page_type'])
-                f.write(packed)
-        print(f"已生成整合后的脏页映射文件: {newest_img_path}")
+                    entry = DirtyMapEntry(
+                        address=address,
+                        write_count=float(write_count),
+                        page_type=page_type
+                    )
+                    latest_dirtymap_entries.append(entry)
+        except IOError as e:
+            print(f"无法读取最新文件 {latest_file_path}，错误：{e}")
+            continue
+
+        latest_dirtymaps.append({
+            'pid': pid,
+            'timestamp': latest_timestamp,
+            'dirtymap': latest_dirtymap_entries
+        })
+
+        if not older_files:
+            # 如果只有一个文件，复制为 old-<pid>.img 并添加到 consolidated_dirtymaps
+            oldest_img_path = os.path.join(dirty_map_path, f'old-{pid}.img')
+            try:
+                # os.replace(latest_file_path, oldest_img_path)
+                print(f"PID：{pid} 只有一个脏页映射文件，直接复制为 old-{pid}.img")
+                # 将最新 dirtymap 作为整合后的 dirtymap
+                consolidated_dirtymaps.append({
+                    'pid': pid,
+                    'dirtymap': latest_dirtymap_entries,
+                    'source_files': [latest_file_path]
+                    # 'source_files': [oldest_img_path]
+                })
+            except OSError as e:
+                print(f"无法重命名文件 {latest_file_path} 为 {oldest_img_path}，错误：{e}")
+            continue
+
+        N = len(older_files)
+        timestamps = [ts for ts, _ in older_files]
+        min_ts = min(timestamps)
+        max_ts = max(timestamps)
+
+        # 防止分母为零
+        if max_ts == min_ts:
+            weight_factors = [1.0 for _ in older_files]
+        else:
+            weight_factors = [(ts - min_ts) / (max_ts - min_ts) for ts in timestamps]
+            # 确保最大权重不超过1，并根据文件顺序调整权重
+            weight_factors = [
+                min(0.3 * w + 0.7 / (2 ** (N - i - 1)), 1.0) 
+                for i, w in enumerate(weight_factors)
+            ]
+
+        # 整合旧的 dirtymap
+        consolidated = {}
+        global_max_write_count = 0.0
+
+        for (timestamp, file_path), weight in zip(older_files, weight_factors):
+            try:
+                with open(file_path, 'rb') as f:
+                    while True:
+                        data = f.read(13)  # sizeof(dirty_page) = 8 + 8 + 4 = 20 bytes
+                        if not data or len(data) < 13:
+                            break
+                        address, write_count, page_type = struct.unpack('<QIB', data)
+                        if address in consolidated:
+                            consolidated[address].write_count += write_count * weight
+                            # 假设 page_type 取最新的类型
+                            consolidated[address].page_type = page_type
+                        else:
+                            consolidated[address] = DirtyMapEntry(
+                                address=address,
+                                write_count=write_count * weight,
+                                page_type=page_type
+                            )
+                        # 更新全局最大 write_count
+                        if consolidated[address].write_count > global_max_write_count:
+                            global_max_write_count = consolidated[address].write_count
+            except IOError as e:
+                print(f"无法读取文件 {file_path}，错误：{e}")
+                continue
+
+        if global_max_write_count == 0:
+            print(f"PID：{pid} 所有地址的 dirty-track 无效，跳过")
+            continue
+
+        # 转换 consolidated 字典为 DirtyMapEntry 列表，并设置 heat_level
+        consolidated_dirtymap_entries = [
+            DirtyMapEntry(
+                address=addr,
+                write_count=entry.write_count,
+                page_type=entry.page_type,
+                heat_level=100  # 初始化为100
+            )
+            for addr, entry in consolidated.items()
+        ]
+
+        consolidated_dirtymaps.append({
+            'pid': pid,
+            'dirtymap': consolidated_dirtymap_entries,
+            'source_files': [fp for _, fp in older_files]
+        })
+        print(f"PID：{pid} 的旧 dirtymap 已整合，包含 {len(consolidated_dirtymap_entries)} 个条目")
+
+    return {
+        'latest_dirtymaps': latest_dirtymaps,
+        'consolidated_dirtymaps': consolidated_dirtymaps
+    }
+
+# 计算给定dirtymap中异常高write_count的阈值
+def detect_extreme_high_wc(write_counts: List[float]) -> float:
+    if not write_counts:
+        return 0
+    
+    # write_counts = sorted(entry.write_count for entry in dirtymap)
+    n = len(write_counts)
+    if n == 0:
+        return 0  # 无数据
+    elif n < 4096:
+        # 小规模脏内存(<=16MB)：使用中位数和MAD
+        try:
+            median_wc = statistics.median(write_counts)
+            mad = statistics.median([abs(wc - median_wc) for wc in write_counts])
+            threshold = median_wc + 3 * mad  # 任意选择3倍MAD作为阈值
+        except statistics.StatisticsError:
+            median_wc = statistics.median(write_counts)
+            threshold = max(write_counts) * 0.9
+    elif n < 32768:
+        # 中等规模脏内存(<=128MB)：使用四分位数方法
+        try:
+            # 使用四分位数方法检测异常值
+            q1 = statistics.quantiles(write_counts, n=4)[0]  # 第一四分位数
+            q3 = statistics.quantiles(write_counts, n=4)[2]  # 第三四分位数
+            iqr = q3 - q1
+            threshold = q3 + 1.5 * iqr  # 常用的异常高值检测阈值
+        except statistics.StatisticsError:
+            threshold = max(write_counts) * 0.9
+    else:
+        # 大规模脏内存：使用95百分位数
+        try:
+            percentile_95 = statistics.quantiles(write_counts, n=100)[94]  # 95th 百分位
+            threshold = percentile_95
+        except statistics.StatisticsError:
+            threshold = max(write_counts) * 0.9
+
+    return threshold
+
+# 排除异常高write_count后将dirtymap转换为heatmap
+def convert_dirtymap_to_heatmap(dirtymap: List[DirtyMapEntry], max_heat_level: int = 10) -> List[DirtyHeatMapEntry]:
+    if not dirtymap:
+        return []
+    
+    write_counts = [entry.write_count for entry in dirtymap]
+    threshold = detect_extreme_high_wc(write_counts)
+    
+    # 找出非异常高write_count的最大值，用于归一化
+    non_extreme_wcs = [wc for wc in write_counts if wc < threshold]
+    max_write_count = max(non_extreme_wcs) if non_extreme_wcs else 1  # 避免除零
+    
+    # 排序地址
+    sorted_entries = sorted(dirtymap, key=lambda x: x.address)
+    
+    heatmap_entries = []
+    current_start = None
+    current_end = None
+    current_size = None
+    current_heat_level = None
+    
+    for entry in sorted_entries:
+        address = entry.address
+        write_count = entry.write_count
+        page_type = entry.page_type
+        
+        # 判断是否为异常高write_count
+        if write_count >= threshold:
+            heat_level = 100  # 最大heat_level
+        else:
+            normalized_wc = write_count / max_write_count
+            # 归一化后均分为max_heat_level级
+            heat_level = math.ceil(normalized_wc * (max_heat_level - 1)) + 1  # 1到10
+            heat_level = min(max(heat_level, 1), max_heat_level)  # 确保在范围内
+        
+        # 判断是否可以与当前heatmap_entry合并
+        if (current_heat_level == heat_level and 
+            current_end == address):
+            # 合并范围
+            current_end = address + PAGE_SIZES[page_type]
+            current_size += PAGE_SIZES[page_type]
+        else:
+            # 保存当前heatmap_entry
+            if current_start is not None:
+                heatmap_entries.append(DirtyHeatMapEntry(start=current_start, end=current_end, 
+                        page_size=current_size, heat_level=current_heat_level, heat_trend=0))
+            # 开始新的heatmap_entry
+            current_start = address
+            current_end = address + PAGE_SIZES[page_type]
+            current_heat_level = heat_level
+            current_size = PAGE_SIZES[page_type]
+    
+    # 添加最后一个heatmap_entry
+    if current_start is not None:
+        heatmap_entries.append(DirtyHeatMapEntry(start=current_start, end=current_end, 
+                heat_level=current_heat_level, page_size=current_size, heat_trend=0))
+    
+    return heatmap_entries
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
@@ -360,11 +607,11 @@ def convert_byte(tsize):
     if tsize < 1024:
         return(round(tsize,2),'Byte')
     else:
-        KBX = tsize/1024
+        KBX = tsize / 1024
         if KBX < 1024:
             return(round(KBX,2),'KB')
         else:
-            MBX = KBX /1024
+            MBX = KBX / 1024
             if MBX < 1024:
                 return(round(MBX,2),'MB')
             else:
@@ -436,29 +683,22 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
         cmd += ' --tcp-established'
     if precopy:
         cmd += ' --parent-path ../parent_{}'.format(last_iter)
-    if diskless:
-        #send the page server command,
-        #after the server's response, CRIU can directly transfer memory dump with network
-        pageserver_cmd = '{ "pageserver" : { "path" : "image" } }'
-        cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-        inputready, outputready, exceptready = select.select(input, [], [], 4)
-        #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-        if inputready:
-            for s in inputready:
-                answer = s.recv(1024)
-                print(answer)
-                error()
-        cmd += ' --page-server {}:27'.format(dest)
+    # if diskless:
+    #     #send the page server command,
+    #     #after the server's response, CRIU can directly transfer memory dump with network
+    #     pageserver_cmd = '{ "pageserver" : { "path" : "image" } }'
+    #     cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+    #     inputready, outputready, exceptready = select.select(input, [], [], 4)
+    #     #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+    #     if inputready:
+    #         for s in inputready:
+    #             answer = s.recv(1024)
+    #             print(answer)
+    #             error()
+    #     cmd += ' --page-server {}:27'.format(dest)
     if postcopy:
         cmd += ' --lazy-pages'
         cmd += ' --page-server localhost:27'
-        # try:
-        #     os.unlink('/tmp/postcopy-pipe')
-        # except:
-        #     pass
-        # os.mkfifo('/tmp/postcopy-pipe')
-        # p_pipe = os.open('/tmp/postcopy-pipe', os.O_WRONLY)
-        #cmd += ' --status-fd /tmp/postcopy-pipe'
         read_fd, write_fd = os.pipe()
         fdflags = fcntl.fcntl(write_fd, fcntl.F_GETFD)
         fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
@@ -548,22 +788,22 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtyma
     last_iter = 0
     while last_iter < max_iter:
         last_path = parent_path[last_iter]
-        if diskless:
-            #send the page server command,
-            #after the server's response, CRIU can directly transfer memory dump with network
-            pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
-            cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-            inputready, outputready, exceptready = select.select(input, [], [], 4)
-            #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-            if inputready:
-                for s in inputready:
-                    answer = s.recv(1024)
-                    print(answer)
-                    error()
-            diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
-        else:
-            pre_dump(mig_base, container, last_iter, dirtymap)
-            xfer_pre_dump(last_path, dest, mig_base, last_iter)        
+        # if diskless:
+            # #send the page server command,
+            # #after the server's response, CRIU can directly transfer memory dump with network
+            # pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
+            # cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+            # inputready, outputready, exceptready = select.select(input, [], [], 4)
+            # #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+            # if inputready:
+            #     for s in inputready:
+            #         answer = s.recv(1024)
+            #         print(answer)
+            #         error()
+            # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
+        # else:
+        pre_dump(mig_base, container, last_iter, dirtymap)
+        xfer_pre_dump(last_path, dest, mig_base, last_iter)        
 
         dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
         print('the total size of {} with pattern {} is {}{}'\
@@ -573,7 +813,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtyma
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
             if abs(getdirsize(last_path, 'pages') \
-                    - getdirsize(less_last_path, 'pages')) < 1024000:     #1000KB
+                    - getdirsize(less_last_path, 'pages')) < 102400:     #100KB
                 break
         last_iter += 1
         if last_iter >= max_iter:
@@ -636,7 +876,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
             "prepare": {
                 "path": mig_base,
                 "image_path": image_path,
-                "parent_path": parent_path  # parent_path 为列表
+                "parent_path": parent_path  # parent_path为列表
             }
         })
     else:
