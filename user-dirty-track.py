@@ -279,7 +279,7 @@ if __name__ == '__main__':
                     #     ret = struct.unpack('I', buffer)[0]
                     print(f"停止对容器 {args.container} (PID: {pid}) 的脏页跟踪")
                 
-                consolidate_dirty_maps_weighted(path)
+                # consolidate_dirty_maps_weighted(path)
             else:
                 print(f"无效的操作: {args.action}")
                 raise ValueError("对容器的action取值仅接受：start/stop")
