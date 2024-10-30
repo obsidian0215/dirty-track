@@ -10,8 +10,6 @@ import distutils.util
 import time
 import subprocess
 
-global mig_base
-
 def prepare(base_path, image_path, parent_path):
     if os.path.exists(base_path):
         try:
@@ -115,7 +113,6 @@ def migrate_server():
                 
                     case {'prepare': prepare_info}:
                         path = prepare_info['path']
-                        mig_base = path
                         image_path = prepare_info['image_path']
 
                         if 'parent_path' in prepare_info:
@@ -146,7 +143,7 @@ def migrate_server():
                         #The following command is the restore command, which resotres execution of the container at destination
                         cmd = 'time -p runc restore --console-socket ' + msg['restore']['path']
                         cmd += '/console.sock -d --image-path ' + msg['restore']['image_path']
-                        cmd += ' --work-path ' + msg['restore']['path'] + "/r_log"
+                        cmd += ' --work-path ' + msg['restore']['path'] + "/migrate/r_log"
                         if tty:
                             cmd += ' --shell-job'
                         if netdump:
@@ -169,8 +166,8 @@ def migrate_server():
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
                             lazy_cmd += " --port 27 -v4 -D "
                             lazy_cmd += msg['restore']['image_path']
-                            lazy_cmd += " -W " + msg['restore']['path'] + "/lp_log"
-                            lazy_cmd += " -o z" + msg['restore']['path'] + "/logs/lp.log"
+                            lazy_cmd += " -W " + msg['restore']['path'] + "/migrate/lp_log"
+                            lazy_cmd += " -o z" + msg['restore']['path'] + "/migrate/logs/lp.log"
                             print ("Running lazy-pages server: " + lazy_cmd)
                             lp = subprocess.Popen(lazy_cmd, shell=True)
                         ret = p.wait()

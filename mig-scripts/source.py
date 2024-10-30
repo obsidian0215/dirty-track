@@ -963,7 +963,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
     #send the restore command
-    restore_cmd = '{ "restore" : { "path" : "' + mig_base + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
