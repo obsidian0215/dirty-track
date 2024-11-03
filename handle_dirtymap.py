@@ -73,10 +73,10 @@ class DirtyHeatMapEntry:
 
 def write_heatmap_to_file(heatmap: List[DirtyHeatMapEntry], output_file: str):
     """
-    将热图数据写入到文件中。
+    写入heatmap文件
 
     Args:
-        heatmap (List[DirtyHeatMapEntry]): 热图列表
+        heatmap (List[DirtyHeatMapEntry]): 假定地址已升序的heatmap
         output_file (str): 输出文件路径
     """
     
@@ -106,10 +106,10 @@ def write_heatmap_to_file(heatmap: List[DirtyHeatMapEntry], output_file: str):
 
 def write_dirty_map_to_file(dirty_map: List[DirtyMapEntry], output_file: str):
     """
-    将脏页映射数据写入到文件中。
+    写入dirtymap文件
 
     Args:
-        dirty_map (List[DirtyMapEntry]): 脏页映射列表
+        dirty_map (List[DirtyMapEntry]): dirtymap
         output_file (str): 输出文件路径
     """
     with open(output_file, 'wb') as f:
@@ -176,14 +176,15 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
     dirtymap_pids: List[Dict] = []
     pid_files: Dict[int, List[Tuple[int, str]]] = {}
 
-    # 遍历 dirty_map_path 目录下的所有文件，排除以 newest- 开头的 img 文件
+    # 遍历dirty_map_path目录下的所有.dirtymap和.heatmap文件
     for filename in os.listdir(dirty_map_path):
-        if not filename.endswith('.img'):
+        if not filename.endswith('.dirtymap') and not filename.endswith('.heatmap'):
+            print(f"{filename} 不是 dirtymap 或 heatmap 文件，跳过")
             continue
         filepath = os.path.join(dirty_map_path, filename)
-        # pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
-        if filename.startswith('latest-'):
-            # 处理最新的 dirtymap 文件，格式：latest-<pid>.img
+
+        if filename.startswith('latest-') and filename.endswith('.heatmap'):
+            # 处理最新的heatmap文件，格式：latest-<pid>.heatmap
             parts = filename.split('-')
             if len(parts) < 2:
                 continue
@@ -195,20 +196,23 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['latest'] = filepath
-        elif filename.startswith('old-'):
-            # 处理 old 文件，格式：old-<pid>.img
+        elif filename.startswith('old-') and filename.endswith('.dirtymap'):
+            # 处理old dirtymap，格式：old-<pid>.dirtymap
             parts = filename.split('-')
             if len(parts) < 2:
                 continue
             try:
                 pid = int(parts[1].split('.')[0])
             except ValueError:
-                print(f"{filename} 的 PID 无效，跳过")
+                print(f"{filename}的PID无效，跳过")
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['old'] = filepath
         else:
-            # 处理其他 timestamp 文件，格式：<pid>-<timestamp>.img
+            # 处理其他timestamp文件，格式：<pid>-<timestamp>.dirtymap
+            if not filename.endswith('.dirtymap'):
+                print(f"{filename} 不是有效的 dirtymap 文件，跳过")
+                continue
             parts = filename.split('-')
             if len(parts) < 2:
                 continue
@@ -216,25 +220,10 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                 pid = int(parts[0])
                 timestamp = int(parts[1].split('.')[0])
             except ValueError:
-                print(f"{filename} 的 PID 或时间戳无效，跳过")
+                print(f"{filename} 的PID或时间戳无效，跳过")
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['dirtymaps'].append((timestamp, filepath))
-        
-        # if filename.endswith('.img') and not filename.startswith('latest-') and not filename.startswith('old-'):
-        #     parts = filename.split('-')
-        #     if len(parts) < 2:
-        #         continue
-        #     pid_str, timestamp_str = parts[0], parts[1].split('.')[0]
-        #     try:
-        #         pid = int(pid_str)
-        #         timestamp = int(timestamp_str)
-        #     except ValueError:
-        #         print(f"{filename} 的 PID 或时间戳无效，跳过")
-        #         continue
-        #     if pid not in pid_files:
-        #         pid_files[pid] = []
-        #     pid_files[pid].append((timestamp, os.path.join(dirty_map_path, filename)))
 
    # 对每个 PID 的文件进行整合
     for pid, files in pid_files.items():
@@ -249,7 +238,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
         latest_timestamp, latest_file_path = sorted_dirtymaps[-1]
         older_files = sorted_dirtymaps[:-1]
 
-        # 读取最新 dirtymap
+        # 读取最新dirtymap
         latest_dirtymap = []
         try:
             with open(latest_file_path, 'rb') as f:
@@ -269,15 +258,16 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                         latest_dirtymap.append(new_entry)
                         address += 1 << 12
         except IOError as e:
-            print(f"无法读取最新文件 {latest_file_path}，错误：{e}")
+            print(f"无法读取最新dirtymap {latest_file_path}，错误：{e}")
             continue
 
         if not older_files and not files['old']:
-            print(f"PID：{pid} 只有一个 dirtymap 文件")
+            print(f"PID：{pid} 只有一个dirtymap文件")
             dirtymap_pids.append({
                 'pid': pid,
                 'latest_dirtymap': latest_dirtymap,
-                'old_dirtymap': None
+                'old_dirtymap': None,
+                'transfered': None
             })
             continue
 
@@ -303,11 +293,11 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                             insert_entry_to_consolidated(consolidated_dirtymap, new_entry)
                             address += 1 << 12
             except IOError as e:
-                print(f"无法读取 old 文件 {files['old']}，错误：{e}")
+                print(f"无法读取old dirtymap {files['old']}，错误：{e}")
                 consolidated_dirtymap = []
 
             if older_files:
-                # 取最新的第 n-1 个 dirtymap 文件（即 sorted_dirtymaps[-2]）
+                # 获取次最新的dirtymap（即 sorted_dirtymaps[-2]）
                 latest_old_timestamp, latest_old_file_path = sorted_dirtymaps[-2]
                 new_dirtymap = []
                 try:
@@ -331,20 +321,20 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                     print(f"无法读取文件 {latest_old_file_path}，错误：{e}")
                     new_dirtymap = []
 
-                # 将 existing old 与最新的第 n-1 个 dirtymap 相加
+                # 将已有的old dirtymap与次最新的dirtymap相加
                 for entry in new_dirtymap:
                     insert_entry_to_consolidated(consolidated_dirtymap, entry)
 
             print(f"PID：{pid} 的旧 dirtymap 已整合，包含 {len(consolidated_dirtymap)} 个条目")
 
-            # 保存更新后的 old dirtymap
+            # 保存更新后的old dirtymap
             dirtymap_pid = {
                 'pid': pid,
                 'latest_dirtymap': latest_dirtymap,
                 'old_dirtymap': consolidated_dirtymap
             }
         else:
-            # 没有 existing old 文件，按权重合并 n-1 个 dirtymap 文件
+            # 没有old dirtymap，加权合并除最新以外的所有dirtymap
             consolidated_dirtymap = []
             for i, (timestamp, file_path) in enumerate(older_files):
                 weight = 1 / (2 ** (n - 1 - i))
@@ -363,19 +353,21 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                             )
                             insert_entry_to_consolidated(consolidated_dirtymap, new_entry)
                 except IOError as e:
-                    print(f"无法读取文件 {file_path}，错误：{e}")
+                    print(f"无法读取dirtymap {file_path}，错误：{e}")
                     continue
 
-            print(f"PID：{pid} 的旧 dirtymap 已整合，包含 {len(consolidated_dirtymap)} 个条目")
+            print(f"PID：{pid} 的旧dirtymap已整合，包含{len(consolidated_dirtymap)}个条目")
 
-            # 保存新的 old dirtymap
+            # 保存新的old dirtymap
             dirtymap_pid = {
                 'pid': pid,
                 'latest_dirtymap': latest_dirtymap,
-                'old_dirtymap': consolidated_dirtymap
+                'old_dirtymap': consolidated_dirtymap,
+                'transfered': None
             }
         
-        if files['latest']:
+        # 获取各页的被转储情况
+        if files['latest']:   
             transfered = []
             try:
                 with open(files['latest'], 'rb') as f:
@@ -450,7 +442,7 @@ def convert_dirtymap_to_heatmap(dirtymap: List[DirtyMapEntry]) -> List[DirtyHeat
         return []
 
     threshold = detect_extreme_high_wc(dirtymap)
-    print(f"阈值为: {threshold}")
+    # print(f"阈值为: {threshold}")
 
     # 找出非异常高 write_count 的最大值，用于归一化
     non_extreme_wcs = [wc.write_count for wc in dirtymap if wc.write_count < threshold]
@@ -480,21 +472,22 @@ def convert_dirtymap_to_heatmap(dirtymap: List[DirtyMapEntry]) -> List[DirtyHeat
             selected=0
         )
         heatmap_entries.append(heatmap_entry)
+    return heatmap_entries
 
 def merge_sub_heat(
     A: List[DirtyMapEntry],
     B: List[DirtyHeatMapEntry]
 ) -> List[DirtyHeatMapEntry]:
     """
-    将 DirtyMapEntry 列表 A 和 DirtyHeatMapEntry 列表 B 取并集，
-    并根据 B 中各地址范围的 heat_level 与 A 中相同地址范围的 heat_level 的差值更新 heat_trend。
+    将DirtyMapEntry列表 A和DirtyHeatMapEntry列表 B取并集
+    并根据B中各地址范围的heat_level与A中相同地址范围的heat_level的差值更新heat_trend
 
     Args:
-        A (List[DirtyMapEntry]): 基准 DirtyMap 列表。
-        B (List[DirtyHeatMapEntry]): 目标 HeatMap 列表。
+        A (List[DirtyMapEntry]): 基准DirtyMap
+        B (List[DirtyHeatMapEntry]): 目标HeatMap
 
     Returns:
-        List[DirtyHeatMapEntry]: 合并并更新了 heat_trend 的 HeatMap 列表。
+        List[DirtyHeatMapEntry]: 合并并更新了heat_trend的HeatMap
     """
     PAGE_SIZE = 1 << 12  # 4KB
 
@@ -543,10 +536,10 @@ def merge_sub_heat(
 
         # 合并逻辑：仅在地址连续且 heat_trend 相同时进行合并
         if result and (result[-1].address + result[-1].size == addr) and (result[-1].heat_trend == heat_trend):
-            print("合并与前一个条目")
+            # print("合并与前一个条目")
             result[-1].size += PAGE_SIZE
         else:
-            print("添加新的条目到结果")
+            # print("添加新的条目到结果")
             new_entry = DirtyHeatMapEntry(
                 address=addr,
                 size=PAGE_SIZE,
@@ -556,10 +549,10 @@ def merge_sub_heat(
             )
             result.append(new_entry)
 
-    # 打印最终结果
-    print("最终结果列表:")
-    for entry in result:
-        print(entry)
+    # # 打印最终结果
+    # print("最终结果列表:")
+    # for entry in result:
+    #     print(entry)
 
     return result
 
@@ -584,32 +577,35 @@ def merge_update_selected(
         else:
             print(f"警告: transfered 中的地址 {hex(addr)} 未在 heatmap 中找到")
 
-if __name__ == "__main__":
-    dirty_map_path = os.path.abspath('./dirty_map')
+def generate_heatmap(dirty_map_path: str) -> None:
+    # 确保输出目录存在
+    os.makedirs(dirty_map_path, exist_ok=True)
     dirtymap_pids = prehandle_dirtymap(dirty_map_path)
-    
-    # 打印部分结果以验证
-    for pid_dirtymap in dirtymap_pids:
-        print(f"dirtymaps - PID: {pid_dirtymap['pid']}")
-        pid = pid_dirtymap['pid']
-        print(f"-- 最新dirtymap条目数: {len(pid_dirtymap['latest_dirtymap'])}")
-        # print(f"latest{latest['pid']}异常高值阈值: {detect_extreme_high_wc(latest['dirtymap'])}")
-        latest_heatmap = convert_dirtymap_to_heatmap(pid_dirtymap['latest_dirtymap'])
-        print(f"-- 最新heatmap条目数: {len(latest_heatmap)}")
 
-        # 确保输出目录存在
-        os.makedirs(dirty_map_path, exist_ok=True)
+    for pid_dirtymap in dirtymap_pids:
+        # print(f"dirtymaps - PID: {pid_dirtymap['pid']}")
+        pid = pid_dirtymap['pid']
+        # print(f"-- 最新dirtymap条目数: {len(pid_dirtymap['latest_dirtymap'])}")
+        latest_heatmap = convert_dirtymap_to_heatmap(pid_dirtymap['latest_dirtymap'])
         
-        # 定义输出文件路径
-        dirtymap_old_file = os.path.join(dirty_map_path, f'old-{pid}.img')
+        # 使用old dirtymap计算最新heatmap的热度变化
         old_dirtymap = pid_dirtymap['old_dirtymap']
         if old_dirtymap is not None:
-            write_dirty_map_to_file(old_dirtymap, dirtymap_old_file)
-
-        heatmap_latest_file = os.path.join(dirty_map_path, f'latest-{pid}.img')
-
-        # old_heatmap = convert_dirtymap_to_heatmap(old_dirtymap)
-        # print(f"-- 整合旧heatmap条目数: {len(old_heatmap)}")
-        if old_dirtymap:
+            dirtymap_old_file = os.path.join(dirty_map_path, f'old-{pid}.dirtymap')
+            write_dirty_map_to_file(old_dirtymap, dirtymap_old_file)    # 保存新的old dirtymap
             latest_heatmap = merge_sub_heat(old_dirtymap, latest_heatmap)
+        
+        # 将脏页的转储情况更新到heatmap中
+        selected = pid_dirtymap['transfered']
+        if selected is not None:
+            merge_update_selected(latest_heatmap, selected)
+        
+        # 保存更新的heatmap
+        heatmap_latest_file = os.path.join(dirty_map_path, f'latest-{pid}.heatmap')
         write_heatmap_to_file(latest_heatmap, heatmap_latest_file)
+
+if __name__ == "__main__":
+    dirty_map_path = os.path.abspath('./dirty_map')
+    # print(dirty_map_path)
+
+    generate_heatmap(dirty_map_path)

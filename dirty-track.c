@@ -892,7 +892,7 @@ static int start_dirty_track(pid_t pid) {
     snprintf(timestamp, sizeof(timestamp), "%lld", (long long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000));
 
     // 初始化tmpfs文件路径名和dirty-map
-    snprintf(dti->dirty_map_path, sizeof(dti->dirty_map_path), "%s/%d-%s.img", tmpfs_dir, pid, timestamp);
+    snprintf(dti->dirty_map_path, sizeof(dti->dirty_map_path), "%s/%d-%s.dritymap", tmpfs_dir, pid, timestamp);
     xa_init(&dti->dirty_xarray);
 
     dti->track_worker = kthread_run(wp_fault_track, dti, "track_worker_%d", pid);
