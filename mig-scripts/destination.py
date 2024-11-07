@@ -10,6 +10,111 @@ import distutils.util
 import time
 import subprocess
 import re
+import iptc
+from collections import deque
+
+VIP = "192.168.2.100"
+
+
+def configure_iptables_forward():
+    """
+    配置iptables规则，缓存并转发请求包至source
+    """
+    table = iptc.Table(iptc.Table.FILTER)
+    table.autocommit = False
+
+    # PREROUTING链中添加TEE转发规则
+    chain = iptc.Chain(table, "PREROUTING")
+
+    # 创建一个新的规则
+    rule = iptc.Rule()
+    rule.protocol = "tcp"
+    rule.dst = VIP
+    rule.dport = "80"
+
+    # 添加 TEE 目标，将流量复制到Source
+    target = iptc.Target(rule, "TEE")
+    target.extra = False
+    rule.target = "TEE"
+    rule.add_target(target)
+    rule.parameters = {"gateway": SOURCE_IP}
+
+    # 添加 DNAT 规则，将复制的流量目标IP改为Source的实际IP
+    nat_table = iptc.Table(iptc.Table.NAT)
+    nat_table.autocommit = False
+    nat_chain = iptc.Chain(nat_table, "PREROUTING")
+
+    nat_rule = iptc.Rule()
+    nat_rule.protocol = "tcp"
+    nat_rule.dst = SOURCE_IP
+    nat_rule.dport = "80"
+    nat_rule.target = "DNAT"
+    nat_rule.parameters = {"to_destination": "192.168.1.101:80"}
+    nat_chain.insert_rule(nat_rule)
+
+    # 允许转发到Source的流量
+    forward_table = iptc.Table(iptc.Table.FORWARD)
+    forward_table.autocommit = False
+    forward_chain = iptc.Chain(forward_table, "FORWARD")
+
+    forward_rule = iptc.Rule()
+    forward_rule.protocol = "tcp"
+    forward_rule.dst = "192.168.1.101"
+    forward_rule.dport = "80"
+    forward_rule.target = "ACCEPT"
+    forward_chain.insert_rule(forward_rule)
+
+    # 提交更改
+    table.commit()
+    nat_table.commit()
+    forward_table.commit()
+
+    print("已配置iptables规则，开始缓存并转发请求包至source。")
+
+def remove_iptables_forward():
+    """
+    移除iptables转发规则，允许destination直接响应客户端
+    """
+    # 移除 PREROUTING 链中的 TEE 规则
+    table = iptc.Table(iptc.Table.FILTER)
+    table.autocommit = False
+    chain = iptc.Chain(table, "PREROUTING")
+
+    for rule in chain.rules:
+        if rule.dst == VIP and rule.protocol == "tcp" and rule.dport == "80":
+            for target in rule.targets:
+                if target.name == "TEE" and target.parameters.get("gateway") == SOURCE_IP:
+                    rule.delete_rule(target)
+                    print("已移除iptables的TEE转发规则。")
+
+    # 移除 NAT 表中的 DNAT 规则
+    nat_table = iptc.Table(iptc.Table.NAT)
+    nat_table.autocommit = False
+    nat_chain = iptc.Chain(nat_table, "PREROUTING")
+
+    for rule in nat_chain.rules:
+        if rule.protocol == "tcp" and rule.dst == SOURCE_IP and rule.dport == "80":
+            if rule.target == "DNAT" and rule.parameters.get("to_destination") == "192.168.1.101:80":
+                nat_chain.delete_rule(rule)
+                print("已移除iptables的DNAT转发规则。")
+
+    # 移除 FORWARD 表中的 ACCEPT 规则
+    forward_table = iptc.Table(iptc.Table.FORWARD)
+    forward_table.autocommit = False
+    forward_chain = iptc.Chain(forward_table, "FORWARD")
+
+    for rule in forward_chain.rules:
+        if rule.protocol == "tcp" and rule.dst == "192.168.1.101" and rule.dport == "80":
+            if rule.target == "ACCEPT":
+                forward_chain.delete_rule(rule)
+                print("已移除iptables的FORWARD ACCEPT规则。")
+
+    # 提交更改
+    table.commit()
+    nat_table.commit()
+    forward_table.commit()
+
+    print("已移除iptables规则，允许destination直接响应客户端。")
 
 def prepare(base_path, image_path, parent_path):
     if os.path.exists(base_path):
@@ -268,6 +373,8 @@ def migrate_server():
         #wait to accept a connection - blocking call
         conn, addr = s.accept()
         print('Connected with ' + addr[0] + ':' + str(addr[1]))
+        global source_ip 
+        source_ip = addr[0]
 
         #start new thread takes 1st argument as a function name to be run, second is the tuple of arguments to the function.
         start_new_thread(clientthread,(conn, str(addr[0]),))
