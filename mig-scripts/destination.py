@@ -9,6 +9,7 @@ import shutil
 import distutils.util
 import time
 import subprocess
+import re
 
 def prepare(base_path, image_path, parent_path):
     if os.path.exists(base_path):
@@ -41,6 +42,72 @@ def prepare(base_path, image_path, parent_path):
     os.mkdir(image_path)
     os.mkdir(base_path + '/r_log')
     # os.mkdir(base_path + '/lp_log')
+
+def transfer_vip():
+    """
+    降低源节点的优先级并触发 VIP 迁移到目标节点。
+    """
+    try:
+        # 定义 Keepalived 配置文件路径和备份路径
+        config_path = '/etc/keepalived/keepalived.conf'
+        backup_path = '/etc/keepalived/keepalived.conf.bak'
+        
+        # 备份原始配置文件
+        shutil.copy(config_path, backup_path)
+        print(f"已备份原始Keepalived配置文件到 {backup_path}")
+        
+        # 读取原始配置文件内容
+        with open(config_path, 'r') as f:
+            config = f.read()
+        
+        # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
+        pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
+        
+        # 定义替换函数，将 priority 设置为较低的值（例如：50）
+        def repl(match):
+            original_priority = match.group(2)
+            new_priority = '100'  # 设置新的优先级
+            print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
+            return f"{match.group(1)}{new_priority}{match.group(3)}"
+        
+        # 使用正则表达式替换 priority
+        new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
+        
+        if count == 0:
+            print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
+            sys.exit(1)
+        
+        # 将修改后的配置写回配置文件
+        with open(config_path, 'w') as f:
+            f.write(new_config)
+        print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
+        
+        # 重新加载 Keepalived 服务以应用更改
+        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'], 
+                                stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE, 
+                                text=True)
+        
+        if result.returncode != 0:
+            print(f"重新加载 Keepalived 服务失败：{result.stderr}")
+            # 如果重新加载失败，可以选择恢复备份配置
+            shutil.copy(backup_path, config_path)
+            subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'])
+            print("已恢复原始 Keepalived 配置文件并重新加载服务。")
+            return 1
+        else:
+            print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
+            return 0
+    
+    except PermissionError:
+        print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
+        return 1
+    except FileNotFoundError:
+        print(f"配置文件 {config_path} 未找到，请确保 Keepalived 已正确安装。")
+        return 1
+    except Exception as e:
+        print(f"发生错误：{e}")
+        return 1
 
 def migrate_server():
     HOST = ''   # Symbolic name meaning all available interfaces
@@ -86,6 +153,13 @@ def migrate_server():
                 old_cwd = os.getcwd()
 
                 match msg:
+                    case {'transfer_vip':_}:
+                        ret = transfer_vip()
+                        if ret == 0:
+                            reply = 'OK'
+                        else:
+                            reply = 'Error'
+
                     case {'pageserver':_}:
                         #os.system('criu -V')
                         mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']

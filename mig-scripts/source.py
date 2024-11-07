@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import statistics
 import math
 import bisect
+import re
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -220,16 +221,17 @@ def set_dirty_map_path(device_fd, path):
     print(f"设置脏页跟踪的目录路径为: {os.path.abspath(path)}")
     ioctl_set_dirty_map_path(device_fd, path)
 
-# 在 pre-dump 之间执行 dirty-track 并获取 dirty-map
+# 在pre-dump之间执行dirty-track并获取dirty-map
 def execute_dirty_track(device_fd):
     """启动并停止脏页跟踪，获取dirty-map"""
     # 启动所有容器进程的脏页跟踪
-    for pid in container_pids:
-        ioctl_start_pid(device_fd, pid)
-        print(f"启动对PID {pid}的脏页跟踪")
+    # 启动暂时放入criu中
+    # for pid in container_pids:
+    #     ioctl_start_pid(device_fd, pid)
+    #     print(f"启动对PID {pid}的脏页跟踪")
 
     # 等待一段时间以收集脏页数据
-    time.sleep(2)  # 根据实际情况调整等待时间
+    time.sleep(1)  # 根据实际情况调整等待时间
 
     # 停止所有容器进程的脏页跟踪
     for pid in container_pids:
@@ -237,10 +239,10 @@ def execute_dirty_track(device_fd):
         print(f"停止对PID {pid}的脏页跟踪")
 
     # 获取 dirty-map 路径
-    dirty_map_path = ioctl_get_dirty_map_path(device_fd)
-    print(f"脏页跟踪目录路径: {dirty_map_path}")
+    # dirty_map_path = ioctl_get_dirty_map_path(device_fd)
+    # print(f"脏页跟踪目录路径: {dirty_map_path}")
 
-    return dirty_map_path
+    # return dirty_map_path
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
@@ -342,14 +344,14 @@ def measure_bandwidth(dest_ip):
     print(f"开始测量到{dest_ip}的带宽")
     try:
         # 使用 iperf3 进行短时间带宽测量
-        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '5', '-f', 'm', '-J'], 
+        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'], 
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             print("带宽测量失败:", result.stderr)
             return 0
         iperf_output = json.loads(result.stdout)
         bandwidth = iperf_output['end']['sum_sent']['bits_per_second'] / 8  # 转换为Bytes/s
-        print(f"测得带宽: {bandwidth:.4f} Bytes/s")
+        print(f"测得带宽: {bandwidth:.2f} Bytes/s")
         return bandwidth
     except Exception as e:
         print("带宽测量异常:", e)
@@ -892,6 +894,92 @@ def generate_heatmap(dirty_map_path: str) -> None:
         heatmap_latest_file = os.path.join(dirty_map_path, f'latest-{pid}.heatmap')
         write_heatmap_to_file(latest_heatmap, heatmap_latest_file)
 
+# 流量控制函数
+def transfer_vip():
+    """
+    降低源节点的优先级并触发 VIP 迁移到目标节点。
+    """
+    try:
+        # 定义 Keepalived 配置文件路径和备份路径
+        config_path = '/etc/keepalived/keepalived.conf'
+        backup_path = '/etc/keepalived/keepalived.conf.bak'
+        
+        # 备份原始配置文件
+        shutil.copy(config_path, backup_path)
+        print(f"已备份原始 Keepalived 配置文件到 {backup_path}")
+        
+        # 读取原始配置文件内容
+        with open(config_path, 'r') as f:
+            config = f.read()
+        
+        # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
+        pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
+        
+        # 定义替换函数，将 priority 设置为较低的值（例如：50）
+        def repl(match):
+            original_priority = match.group(2)
+            new_priority = '50'  # 设置新的优先级
+            print(f"将 VIP 的优先级从 {original_priority} 降低到 {new_priority}")
+            return f"{match.group(1)}{new_priority}{match.group(3)}"
+        
+        # 使用正则表达式替换 priority
+        new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
+        
+        if count == 0:
+            print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
+            return 1
+        
+        # 将修改后的配置写回配置文件
+        with open(config_path, 'w') as f:
+            f.write(new_config)
+        print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
+        
+        # 重新加载 Keepalived 服务以应用更改
+        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'], 
+                                stdout=subprocess.PIPE, 
+                                stderr=subprocess.PIPE, 
+                                text=True)
+        
+        if result.returncode != 0:
+            print(f"重新加载 Keepalived 服务失败：{result.stderr}")
+            # 如果重新加载失败，可以选择恢复备份配置
+            shutil.copy(backup_path, config_path)
+            subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'])
+            print("已恢复原始 Keepalived 配置文件并重新加载服务。")
+            return 1
+        else:
+            print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
+            return 0
+    
+    except PermissionError:
+        print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
+        return 1
+    except FileNotFoundError:
+        print(f"配置文件 {config_path} 未找到，请确保 Keepalived 已正确安装。")
+        return 1
+    except Exception as e:
+        print(f"发生错误：{e}")
+        return 1
+    
+# 向dest发送提升优先级的通知
+def notify_transfer_vip(cs):
+    vip_cmd = '{"transfer_vip"}'
+    cs.send(bytes(vip_cmd, encoding='utf-8'))
+    inputready, outputready, exceptready = select.select(input, [], [], 3)
+
+    if inputready:
+        for s in inputready:
+            answer = s.recv(1024)
+            print(answer)
+            if answer == 'OK':
+                return 0
+            else:
+                return 1     
+    else:
+        print("can't confirm the VIP has been transfered")
+        return 1
+
+
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
@@ -925,7 +1013,7 @@ def pre_dump(mig_base, container, i, dirtymap):
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, diskless):
+def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay):
     global chk_time    
     old_cwd = os.getcwd()
     os.chdir(mig_base)
@@ -961,13 +1049,15 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
         cmd += ' --status-fd ' + str(write_fd)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
+    if replay:
+        cmd += ' --leave-running'
 
     cmd += ' ' + container
     start = time.perf_counter() * 1000
     print(cmd)
     if postcopy:
         p = subprocess.Popen(cmd, pass_fds=(write_fd,), shell=True)
-        ret = os.read(read_fd, 1) 
+        ret = os.read(read_fd, 1)
         if ret == b'\0':
             print('Ready for lazy page transfer')
             os.close(read_fd)
@@ -1041,7 +1131,7 @@ def diskless_pre_dump(mig_base, container, dest, i, dirtymap):
     if ret != 0:
         error()
 
-def iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtymap):
+def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
     last_iter = 0
     while last_iter < max_iter:
         last_path = parent_path[last_iter]
@@ -1078,7 +1168,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtyma
             break
     return last_iter
 
-def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
+def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
     global rst_time
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
@@ -1101,7 +1191,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     # 测量初始带宽和最大传输值
     global mea_bandwidth, max_xfer_size
     mea_bandwidth = measure_bandwidth(dest)
-    max_xfer_size = mea_bandwidth * time_constraint
+    max_xfer_size = mea_bandwidth * time_constraint / 1000
     # print(f"current bandwidth is {mea_bandwidth}")
 
 
@@ -1123,11 +1213,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
     cs.connect((dest, 18863))
 
     input = [cs,sys.stdin]
-    # if pre:
-    #     prepare_cmd = '{ "prepare" : { "path" : "' + base_path + '" , "image_path" : "' \
-    #         + image_path + '" , "parent_path" : "' + parent_path + '" } }'
-    # else:
-    #     prepare_cmd = '{ "prepare" : { "path" : "' + base_path + '" , "image_path" : "'+ image_path + '" } }'
+
     if pre:
         prepare_cmd = json.dumps({
             "prepare": {
@@ -1193,7 +1279,7 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
             # 更新dirty-map
             generate_heatmap(dirtymap_path)
         # iter pre-dump
-        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, diskless, dest, dirtymap)
+        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
             # diskless_pre_dump(base_path, container, dest)
             # xfer_pre_dump(parent_path, dest, base_path)
         # else:
@@ -1212,35 +1298,43 @@ def migrate(container, dest, pre, post, tty, netdump, rootfs, max_iter, dirtymap
         if ret != 0:   
             error()
     # print(dirtymap)
-    real_dump(cs, mig_base, pre, post, tty, netdump, last_iter, dirtymap, diskless)
+    real_dump(cs, mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
+    if replay:
+        ret = transfer_vip()
+        if ret == 0:
+            ret = notify_transfer_vip(cs)
+        # 确认VIP漂移后再恢复
+        if ret == 0:
+            # todo: 创建转发路由
+            
+            # 最后传输容器剩余状态
+            xfer_final(image_path, dest, mig_base)
+            dir_size = convert_byte(getdirsize(image_path))
+            print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
-    # 最后传输容器剩余状态
-    xfer_final(image_path, dest, mig_base)
-    dir_size = convert_byte(getdirsize(image_path))
-    print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
+            #send the restore command
+            restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+            restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
+            cs.send(bytes(restore_cmd, encoding='utf-8'))
 
-    #send the restore command
-    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
-    restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
-    cs.send(bytes(restore_cmd, encoding='utf-8'))
+            while True:
+                #select.select calls the Unix select() system call
+                #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
+                #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
+                inputready, outputready, exceptready = select.select(input, [], [], 5)
 
-    while True:
-        #select.select calls the Unix select() system call
-        #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
-        #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
-        inputready, outputready, exceptready = select.select(input, [], [], 5)
+                #If after 5 seconds there is nothing to read, then exit
+                if not inputready:
+                    break
 
-        #If after 5 seconds there is nothing to read, then exit
-        if not inputready:
-            break
-
-        #If there is something in input to read (e.g., from the socket), then print it
-        for s in inputready:
-            answer = s.recv(1024).decode("utf-8")
-            print(answer)
-            answer_list = answer.split()
-            rst_time = float(answer_list[-2])
-
+                #If there is something in input to read (e.g., from the socket), then print it
+                for s in inputready:
+                    answer = s.recv(1024).decode("utf-8")
+                    print(answer)
+                    answer_list = answer.split()
+                    rst_time = float(answer_list[-2])
+        else:
+            print("can't confirm VIP has been transfered, can't restore on destination")
     
     #after migration, rootfs sync process and opened files will be closed
     if rootfs:
@@ -1284,6 +1378,7 @@ parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="a
 parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
+parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -1295,13 +1390,20 @@ if __name__ == '__main__':
     diskless = False
     tty = False
     netdump = False
+    replay = False
     rootfs = True
     dirtymap = False
-    time_constraint = args.time_constraint
+    if args.time_constraint:
+        time_constraint = args.time_constraint
+    else:
+        time_constraint = 2000
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
     
+    if args.replay and args.post:
+        parser.error("Post-copy conflicted with replay.")
+
     if args.pre and not args.iter:
         max_iter = 5
     else:
@@ -1320,6 +1422,7 @@ if __name__ == '__main__':
     #Hybrid = True True
     pre = args.pre
     post = args.post
+    replay = args.replay
     dirtymap = args.dirtymap
 
     #use CRIU's page server to directly transfer memory dump
@@ -1348,7 +1451,7 @@ if __name__ == '__main__':
     rsync_opts = "-haz"
 
     # 开始热迁移
-    migrate(container, dest, pre, post, tty, netdump, rootfs, 
+    migrate(container, dest, pre, post, replay, tty, netdump, rootfs, 
                     max_iter, dirtymap, time_constraint)
 
     if diskless:
