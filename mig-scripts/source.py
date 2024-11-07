@@ -966,7 +966,7 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
     start = time.perf_counter() * 1000
     print(cmd)
     if postcopy:
-        p = subprocess.Popen(cmd, pass_fds=(write_fd,))
+        p = subprocess.Popen(cmd, pass_fds=(write_fd,), shell=True)
         ret = os.read(read_fd, 1) 
         if ret == b'\0':
             print('Ready for lazy page transfer')
@@ -974,7 +974,7 @@ def real_dump(cs, mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap
             os.close(write_fd)
         ret = 0
     else:
-        p = subprocess.Popen(cmd)
+        p = subprocess.Popen(cmd, shell=True)
         ret = p.wait()
 
     end = time.perf_counter() * 1000
