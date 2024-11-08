@@ -987,7 +987,7 @@ def pre_dump(mig_base, container, i, dirtymap):
     global chk_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    cmd = 'runc checkpoint --pre-dump -W pd_{} --image-path parent_{}'.format(i, i)
+    cmd = 'runc checkpoint --pre-dump --work-path pd_{} --image-path parent_{}'.format(i, i)
     cmd += ' ' + container
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
@@ -1116,7 +1116,7 @@ def diskless_pre_dump(mig_base, container, dest, i, dirtymap):
     os.chdir(mig_base)
     
     cmd = 'runc checkpoint --pre-dump --page-server ' + dest + ':27 --image-path parent_{}'.format(i)
-    cmd += ' -W pd_log_{} '.format(i) + container
+    cmd += ' --work-path pd_log_{} '.format(i) + container
     if i > 0:
         cmd += ' --parent-path ../parent_{}'.format(i-1)
     if dirtymap:
