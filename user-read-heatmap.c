@@ -50,8 +50,8 @@ int main(int argc, char *argv[]) {
         // 读取结构体数据,打印出索引和结构体内容
         // 验证 page_type 是否有效
         
-        printf("Address: 0x%lx, Size: %u, Heat Level: %d, Heat Trend: %d\n", 
-                   dirty_page.address, dirty_page.size, dirty_page.heat_level, dirty_page.heat_trend);
+        printf("Address: 0x%lx, Size: %u, Heat Level: %d, Heat Trend: %d, Selected: %d\n", 
+                   dirty_page.address, dirty_page.size, dirty_page.heat_level, dirty_page.heat_trend, dirty_page.selected);
 
         index++;
     }
