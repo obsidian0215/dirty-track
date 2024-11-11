@@ -477,10 +477,9 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
             if len(parts) < 2:
                 continue
             try:
-                pid = int(parts[0])
-                timestamp = int(parts[1].split('.')[0])
+                pid = int(parts[1].split('.')[0])
             except ValueError:
-                print(f"{filename} 的 PID 或时间戳无效，跳过")
+                print(f"{filename} 的 PID 无效，跳过")
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['latest'] = filepath
@@ -492,7 +491,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
             try:
                 pid = int(parts[1].split('.')[0])
             except ValueError:
-                print(f"{filename}的PID无效，跳过")
+                print(f"{filename}的 PID 无效，跳过")
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['old'] = filepath
@@ -508,7 +507,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
                 pid = int(parts[0])
                 timestamp = int(parts[1].split('.')[0])
             except ValueError:
-                print(f"{filename} 的PID或时间戳无效，跳过")
+                print(f"{filename} 的 PID 或时间戳无效，跳过")
                 continue
             pid_files.setdefault(pid, {'old': None, 'latest': None, 'dirtymaps': []})
             pid_files[pid]['dirtymaps'].append((timestamp, filepath))
