@@ -15,7 +15,7 @@ TARGET_DIR="/runc/containers/$CONTAINER_NAME/migrate"
 for i in {0..N} # 将N替换为实际的最大值
 do
   # 处理pd_i/pagemap-*.img
-  for img_file in "$SCRIPT_DIR/parent_$i/pagemap-*.img"; do
+  for img_file in "$TARGET_DIR/parent_$i/pagemap-*.img"; do
     [ -f "$img_file" ] || continue
     base_name=$(basename "$img_file")
     crit show "$img_file" > "$TARGET_DIR/pd_log_$i/$base_name"
@@ -23,7 +23,7 @@ do
 done
 
 # 处理image/pagemap-*.img
-for img_file in "$SCRIPT_DIR/image/pagemap-*.img"; do
+for img_file in "$TARGET_DIR/image/pagemap-*.img"; do
   [ -f "$img_file" ] || continue
   base_name=$(basename "$img_file")
   crit show "$img_file" > "$TARGET_DIR/d_log/$base_name"
