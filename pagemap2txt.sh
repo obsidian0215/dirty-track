@@ -12,12 +12,12 @@ N=$1
 for i in {0..N} # 将N替换为实际的最大值
 do
   # 处理pd_i/pagemap-8.img
-  if [ -f "pd_$i/pagemap-8.img" ]; then
+  if [ -f "parent_$i/pagemap-8.img" ]; then
     crit show "pd_$i/pagemap-8.img" > "pd_log_$i/pagemap-8"
   fi
 
   # 处理pd_i/pagemap-9.img
-  if [ -f "pd_$i/pagemap-9.img" ]; then
+  if [ -f "parent_$i/pagemap-9.img" ]; then
     crit show "pd_$i/pagemap-9.img" > "pd_log_$i/pagemap-9"
   fi
 done
