@@ -989,7 +989,7 @@ def pre_dump(mig_base, container, i, dirtymap):
     global chk_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    cmd = 'runc checkpoint --pre-dump --work-path pd_{} --image-path parent_{}'.format(i, i)
+    cmd = 'runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}'.format(i, i)
     cmd += ' ' + container
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
