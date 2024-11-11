@@ -7,7 +7,7 @@ if [ $# -ne 2 ]; then
 fi
 
 N=$1
-CONTAINER_NAME = $2
+CONTAINER_NAME=$2
 
 TARGET_DIR="/runc/containers/$CONTAINER_NAME/migrate"
 
