@@ -14,7 +14,7 @@ from fcntl import ioctl
 import psutil
 import struct
 import fcntl
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import statistics
 import math
@@ -604,7 +604,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
             'dirtymap_file': iter_files
         }
 
-        dirtymap_pids[pid] = dirtymap_pid_info
+        dirtymap_pids.append(dirtymap_pid_info)
 
     return dirtymap_pids
 
@@ -1243,7 +1243,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     if dirtymap:
         get_runc_container_pidtree(container)
         execute_dirty_track(device_fd, False)
-        
+
         # 收集此次迭代生成的 dirtymap 文件
         current_dirtymaps = []
         for filename in os.listdir(dirtymap_path):

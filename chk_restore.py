@@ -20,7 +20,6 @@ import statistics
 import math
 import bisect
 import re
-from collections import defaultdict
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -605,7 +604,7 @@ def prehandle_dirtymap(dirty_map_path: str) -> List[Dict]:
             'dirtymap_file': iter_files
         }
 
-        dirtymap_pids[pid] = dirtymap_pid_info
+        dirtymap_pids.append(dirtymap_pid_info)
 
     return dirtymap_pids
 
