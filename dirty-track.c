@@ -149,7 +149,6 @@ static inline void dirty_map_to_file(struct xarray *xarray, struct file *file, l
 
         // 再写入脏页统计数据
         kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), &file->f_pos);
-        kernel_write(file, (char *)&entry->page_type, sizeof(entry->page_type), &file->f_pos);
     }
 }
 
