@@ -235,7 +235,7 @@ def execute_dirty_track(device_fd, first):
             print(f"启动对PID {pid}的脏页跟踪")
 
     # 等待一段时间以收集脏页数据
-    time.sleep(1)  # 根据实际情况调整等待时间
+    time.sleep(0.3)  # 根据实际情况调整等待时间
 
     # 停止所有容器进程的脏页跟踪
     for pid in container_pids:
@@ -621,8 +621,11 @@ def detect_extreme_high_wc(dirtymap: List[DirtyMapEntry]) -> float:
     n = len(dirtymap)
     write_counts = [entry.write_count for entry in dirtymap]
     max_write_count = max(write_counts)
-    if max_write_count <= 10:
+    if max_write_count <= 20:
         return max_write_count
+    else:
+        return 20
+    
     if n == 0:
         return 0  # 无数据
     elif n < 4096:
@@ -679,12 +682,19 @@ def convert_dirtymap_to_heatmap(dirtymap: List[DirtyMapEntry]) -> List[DirtyHeat
         write_count = entry.write_count
         # 判断是否为异常高 write_count
         if write_count >= threshold:
-            heat_level = 10  # 最大 heat_level
+            heat_level = 3  # 最大 heat_level
         else:
-            normalized_wc = write_count / max_write_count
-            # 归一化后均分为10级
-            heat_level = math.ceil(normalized_wc * 9) + 1  # 1到10
-            heat_level = min(max(heat_level, 1), 10)  # 确保在范围内
+            # normalized_wc = write_count / max_write_count
+            # # 归一化后均分为10级
+            # heat_level = math.ceil(normalized_wc * 9) + 1  # 1到10
+            # heat_level = min(max(heat_level, 1), 10)  # 确保在范围内
+            # 分为3级
+            if write_count > 0 and write_count < 0.3 * max_write_count:
+                heat_level = 1
+            elif write_count >= 0.3 * max_write_count and write_count < 0.6 * max_write_count:
+                heat_level = 2
+            else:
+                heat_level = 3
 
         # 创建 HeatMapEntry 实例
         heatmap_entry = DirtyHeatMapEntry(
@@ -741,13 +751,17 @@ def merge_sub_heat(
             threshold = detect_extreme_high_wc([a_entry])  # 单个条目列表
             write_count = a_entry.write_count
             if write_count >= threshold:
-                a_heat_level = 10
+                a_heat_level = 3
             else:
                 non_extreme_wcs = [wc.write_count for wc in [a_entry] if wc.write_count < threshold]
                 max_write_count = max(non_extreme_wcs) if non_extreme_wcs else 1
-                normalized_wc = write_count / max_write_count
-                a_heat_level = math.ceil(normalized_wc * 9) + 1
-                a_heat_level = min(max(a_heat_level, 1), 10)
+                if write_count > 0 and write_count < 0.3 * max_write_count:
+                    a_heat_level = 1
+                elif write_count >= 0.3 * max_write_count and write_count < 0.6 * max_write_count:
+                    a_heat_level = 2
+                else:
+                    a_heat_level = 3
+
         else:
             a_heat_level = 0  # 没有对应的 A 条目
 
