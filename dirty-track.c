@@ -45,8 +45,8 @@ static struct cdev dirty_track_cdev;
 #define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
-// 页表项复位的初始延时，单位为ns --> 3ms
-#define INIT_DELAY 3000000
+// 页表项复位的初始延时，单位为ns --> 4ms
+#define INIT_DELAY 4000000
 // 页表项复位的最大延时，单位为ns --> 1s
 #define MAX_DELAY 1000000000
 // 最大可跟踪进程数
@@ -54,10 +54,10 @@ static struct cdev dirty_track_cdev;
 
 static atomic_t tracked_processes = ATOMIC_INIT(0); // 当前跟踪的进程数
 
-// 页面类型
-#define PAGE_PTE 0                  // 4KB
-#define PAGE_PMD 1                  // 2MB
-#define PAGE_PUD 2                  // 1GB(当前设计下不会被使用)
+// // 页面类型
+// #define PAGE_PTE 0                  // 4KB
+// #define PAGE_PMD 1                  // 2MB
+// #define PAGE_PUD 2                  // 1GB(当前设计下不会被使用)
 
 static char tmpfs_dir[256];
 
@@ -219,36 +219,40 @@ static inline bool pte_is_pinned(struct vm_area_struct *vma, unsigned long addr,
 static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp, 
             unsigned long addr, struct vm_area_struct *vma) {
     pmd_t pmd = *pmdp;
+    unsigned long pmd_start = addr;
+    unsigned long pmd_end = addr + PMD_SIZE; // PMD_SIZE通常为2MB
+    unsigned long page_addr;
     dirty_address_t *addr_dirty;
+    bool updated = false;
 
     if ((pmd_present(pmd) && pmd_soft_dirty(pmd)) || (is_swap_pmd(pmd) && pmd_swp_soft_dirty(pmd))) {
-        // 标记dirty-map被更新
-        if (!dti->dirty_map_updated)
-            dti->dirty_map_updated = true;
+        for (page_addr = pmd_start; page_addr < pmd_end; page_addr += PAGE_SIZE) {
+            dirty_address_t *addr_dirty;
 
-        // 从pid对应的xarray中查找该地址对应页的写错误次数
-        addr_dirty = xa_load(&dti->dirty_xarray, addr);
-        if (addr_dirty) {
-            // 此次页错误为soft-dirty，则写错误次数+1
-            addr_dirty->write_count++;
-            addr_dirty->page_type = PAGE_PMD;
-        } else {
-            // 初始化新的页记录并加入dirty-map
-            addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
-            if (!addr_dirty) {
-                printk(KERN_ERR "No memory for new entry of dirty-map.\n");
-                return true;
+            // 从xarray中加载对应4K页面的记录
+            addr_dirty = xa_load(&dti->dirty_xarray, page_addr);
+            if (addr_dirty) {
+                // 写入错误次数加1
+                addr_dirty->write_count++;
+            } else {
+                // 初始化新的4K页记录并加入xarray
+                addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
+                if (!addr_dirty) {
+                    printk(KERN_ERR "No memory for new entry of dirty-map.\n");
+                    return true;
+                }
+                addr_dirty->write_count = 1;
+                xa_store(&dti->dirty_xarray, page_addr, addr_dirty, GFP_KERNEL);
             }
-            addr_dirty->write_count = 1;
-            addr_dirty->page_type = PAGE_PMD;
 
-            xa_store(&dti->dirty_xarray, addr, addr_dirty, GFP_KERNEL);
+            updated = true;
         }
-
-        return true;
-    } else {
-        return false;
     }
+
+    if (updated && !dti->dirty_map_updated)
+        dti->dirty_map_updated = true;
+
+    return updated;
 }
 
 // 检查pte的soft dirty标志位是否设置
@@ -269,7 +273,6 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
         if (addr_dirty) {
             // 此次页错误为soft-dirty，则写错误次数+1
             addr_dirty->write_count++;
-            addr_dirty->page_type = PAGE_PTE;
         } else {
             // 初始化新的页记录并加入dirty-map
             addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
@@ -278,8 +281,6 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
                 return true;
             }
             addr_dirty->write_count = 1;
-            addr_dirty->page_type = PAGE_PTE;
-
             xa_store(&dti->dirty_xarray, addr, addr_dirty, GFP_KERNEL);
         }
         return true;
