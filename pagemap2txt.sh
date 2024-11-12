@@ -88,32 +88,14 @@ fi
 # 处理dirty_map的.dirtymap和.heatmap文件
 DIRTY_MAP_DIR="$TARGET_DIR/dirty_map"
 
-# 检查dirty_map目录是否存在
-if [ ! -d "$DIRTY_MAP_DIR" ]; then
-  echo "Warning: Dirty map directory '$DIRTY_MAP_DIR' does not exist. Skipping dirty_map processing."
-else
-  shopt -s nullglob
-  dirtymap_files=("$DIRTY_MAP_DIR"/*.dirtymap)
-  heatmap_files=("$DIRTY_MAP_DIR"/*.heatmap)
-  shopt -u nullglob
+for file in "$DIRTY_MAP_DIR"/*.dirtymap
+do
+  [ -e "$file" ] || continue
+  ./read_dirtymap "$file" > "${file%.dirtymap}.txt"
+done
 
-  for file in "${dirtymap_files[@]}"
-  do
-    if [ -f "$file" ]; then
-      ./read_dirtymap "$file" > "${file%.dirtymap}.txt"
-      if [ $? -ne 0 ]; then
-        echo "Error: 'read_dirtymap' failed for '$file'."
-      fi
-    fi
-  done
-
-  for file in "${heatmap_files[@]}"
-  do
-    if [ -f "$file" ]; then
-      ./read_heatmap "$file" > "${file%.heatmap}.txt"
-      if [ $? -ne 0 ]; then
-        echo "Error: 'read_heatmap' failed for '$file'."
-      fi
-    fi
-  done
-fi
+for file in "$DIRTY_MAP_DIR"/*.heatmap
+do
+  [ -e "$file" ] || continue
+  ./read_heatmap "$file" > "${file%.heatmap}.txt"
+done
