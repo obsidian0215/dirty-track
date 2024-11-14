@@ -645,7 +645,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     else:
         last_iter = 0
 
-    if dirtymap:
+    if dirtymap and not pre:
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
                 
