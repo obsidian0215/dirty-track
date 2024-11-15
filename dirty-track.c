@@ -39,11 +39,12 @@
 dev_t dev;
 static struct class* dirty_track_class = NULL;
 static struct cdev dirty_track_cdev;
+static atomic_t tracked_processes = ATOMIC_INIT(0); // 当前跟踪的进程数
 
 struct pid_check {
     pid_t pid;
     bool is_tracked;
-}
+};
 
 #define IOCTL_SET_DIRTY_MAP_PATH _IOW(DIRTY_TRACK_MAGIC, 1, char[256])
 #define IOCTL_START_PID _IOW(DIRTY_TRACK_MAGIC, 2, pid_t)
@@ -57,8 +58,6 @@ struct pid_check {
 #define MAX_DELAY 1000000000
 // 最大可跟踪进程数
 #define MAX_TRACKED_PROCESSES 24
-
-static atomic_t tracked_processes = ATOMIC_INIT(0); // 当前跟踪的进程数
 
 // // 页面类型
 // #define PAGE_PTE 0                  // 4KB
