@@ -1032,7 +1032,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         case IOCTL_CHECK_PID:
             if (copy_from_user(&pid_check, (pid_t __user *)arg, sizeof(pid_check)))
                 return -EFAULT;
-            pid_check.is_tracked = check_dirty_track(pid_check.pid);
+            pid_check.is_tracked = check_dirty_track_for_pid(pid_check.pid);
             if (copy_to_user((pid_t __user *)arg, &pid_check, sizeof(pid_check))) {
                 return -EFAULT;
             }
