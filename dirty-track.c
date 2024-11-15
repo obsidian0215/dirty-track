@@ -40,9 +40,15 @@ dev_t dev;
 static struct class* dirty_track_class = NULL;
 static struct cdev dirty_track_cdev;
 
+struct pid_check {
+    pid_t pid;
+    bool is_tracked;
+}
+
 #define IOCTL_SET_DIRTY_MAP_PATH _IOW(DIRTY_TRACK_MAGIC, 1, char[256])
 #define IOCTL_START_PID _IOW(DIRTY_TRACK_MAGIC, 2, pid_t)
 #define IOCTL_STOP_PID _IOW(DIRTY_TRACK_MAGIC, 3, pid_t)
+#define IOCTL_CHECK_PID _IOWR(DIRTY_TRACK_MAGIC, 4, struct pid_check)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
 // 页表项复位的初始延时，单位为ns --> 4ms
@@ -847,7 +853,7 @@ static int start_dirty_track(pid_t pid) {
     list_for_each_entry(dti, &dirty_track_list, list) {
         if (dti->pid == pid) {
             read_unlock(&dirty_track_rwlock);
-            printk(KERN_ALERT "PID %d is already being tracked.\n", pid);
+            printk(KERN_INFO "PID %d is already being tracked.\n", pid);
             return -EEXIST;
         }
     }
@@ -917,6 +923,20 @@ static int start_dirty_track(pid_t pid) {
     return 0;
 }
 
+// 检查指定PID的进程是否正在被追踪
+bool check_dirty_track_for_pid(pid_t pid) {
+    dirty_track_t *dti;
+    read_lock(&dirty_track_rwlock);
+    list_for_each_entry(dti, &dirty_track_list, list) {
+        if (dti->pid == pid) {
+            read_unlock(&dirty_track_rwlock);
+            return true;
+        }
+    }
+    read_unlock(&dirty_track_rwlock);
+    return false;
+}
+
 // 停止并清理对指定PID进程的脏页追踪(内核缓存)
 static int stop_dirty_track(pid_t pid) {
     dirty_track_t *dti, *tmp;
@@ -977,6 +997,7 @@ static int stop_dirty_track(pid_t pid) {
 // ioctl 处理函数
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     pid_t pid;
+    struct pid_check pid_check;
     char user_path[256];
 
     // 权限检查：仅允许有CAP_SYS_ADMIN权限的进程操作
@@ -1009,6 +1030,14 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
             return stop_dirty_track(pid);
+        case IOCTL_CHECK_PID:
+            if (copy_from_user(&pid_check, (pid_t __user *)arg, sizeof(pid_check)))
+                return -EFAULT;
+            pid_check.is_tracked = check_dirty_track(pid_check.pid);
+            if (copy_to_user((pid_t __user *)arg, &pid_check, sizeof(pid_check))) {
+                return -EFAULT;
+            }
+            break;
         case IOCTL_GET_DIRTY_MAP_PATH:
             if (strnlen(tmpfs_dir, sizeof(tmpfs_dir)) >= sizeof(user_path)) {
                 return -EINVAL;
