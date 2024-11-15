@@ -119,17 +119,47 @@ process_dirty_map() {
     }
   done
 
-  # 使用 find 查找 .heatmap 文件
-  find "$dirty_map_dir" -type f -name "*.heatmap" | while IFS= read -r file; do
+  # # 使用 find 查找 .heatmap 文件
+  # find "$dirty_map_dir" -type f -name "*.heatmap" | while IFS= read -r file; do
+  #   echo "Processing file: $file"
+  #   # 确认 read_heatmap 脚本存在且可执行
+  #   if [ ! -x "./read_heatmap" ]; then
+  #     echo "Error: Script './read_heatmap' does not exist or is not executable."
+  #     continue
+  #   fi
+
+  #   ./read_heatmap "$file" > "${file%.heatmap}.txt" || {
+  #     echo "Error: 'read_heatmap' failed for '$file'."
+  #     # 继续处理下一个文件
+  #   }
+  # done
+}
+
+# 函数：处理 timestamp_list.pid 文件
+process_timestamp_list() {
+  local dirty_map_dir="$1"
+
+  echo "Processing timestamp_list.pid files in '$dirty_map_dir'..."
+
+  # 检查 dirty_map 目录是否存在
+  if [ ! -d "$dirty_map_dir" ]; then
+    echo "Warning: Dirty map directory '$dirty_map_dir' does not exist. Skipping dirty_map processing."
+    return
+  fi
+
+  echo "开始处理 dirty_map 目录中的文件..."
+
+  # 使用 find 查找 .dirtymap 文件
+  find "$dirty_map_dir" -type f -name "timestamp_list.*" | while IFS= read -r file; do
     echo "Processing file: $file"
-    # 确认 read_heatmap 脚本存在且可执行
-    if [ ! -x "./read_heatmap" ]; then
-      echo "Error: Script './read_heatmap' does not exist or is not executable."
+    # 确认 read_timestamp 脚本存在且可执行
+    if [ ! -x "./read_timestamp" ]; then
+      echo "Error: Script './read_timestamp' does not exist or is not executable."
       continue
     fi
 
-    ./read_heatmap "$file" > "${file%.heatmap}.txt" || {
-      echo "Error: 'read_heatmap' failed for '$file'."
+    ./read_timestamp "$file" > "${file}.txt" || {
+      echo "Error: 'read_timestamp' failed for '$file'."
       # 继续处理下一个文件
     }
   done
@@ -152,3 +182,4 @@ process_image_pagemap "$IMAGE_DIR" "$D_LOG_DIR"
 # 最后处理 dirty_map 文件
 DIRTY_MAP_DIR="$TARGET_DIR/dirty_map"
 process_dirty_map "$DIRTY_MAP_DIR"
+process_timestamp_list "$DIRTY_MAP_DIR"
