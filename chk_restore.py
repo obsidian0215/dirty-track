@@ -405,7 +405,7 @@ def pre_dump(mig_base, container, i, dirtymap):
     cmd = 'runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}'.format(i, i)
     cmd += ' ' + container
     if dirtymap:
-        cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
+        cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
     if i > 0:
         cmd += ' --parent-path ../parent_{}'.format(i-1)
     # print(cmd)
@@ -463,9 +463,8 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
         fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
         cmd += ' --status-fd ' + str(write_fd)
     if dirtymap:
-        cmd += ' --use-dirty-map --dirty-map-dir dirty_map'
-    if replay:
-        cmd += ' --leave-running'
+        cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
+        # cmd += ' --leave-running'
 
     cmd += ' ' + container
     start = time.perf_counter() * 1000
