@@ -63,69 +63,6 @@ IOCTL_STOP_PID = _IOW(DIRTY_TRACK_MAGIC, 3, 4)
 IOCTL_CHECK_PID = _IOWR(DIRTY_TRACK_MAGIC, 4, 5)
 IOCTL_GET_DIRTY_MAP_PATH = _IOR(DIRTY_TRACK_MAGIC, 5, 256)
 
-"""
-struct __((packed))__ {
-    uint64_t address;
-    uint32_t write_count;
-    // uint8_t page_type;   //size = 13
-    uint32_t size;  // size = 16
-}
-"""
-@dataclass
-class DirtyMapEntry:
-    address: int
-    write_count: float
-    size: int
-
-    @property
-    def start(self) -> int:
-        """
-        返回页的起始地址
-        """
-        return self.address
-
-    @property
-    def end(self) -> int:
-        """
-        返回页的结束地址
-        """
-        return self.address + self.size
-
-"""
-struct __((packed))__ {
-    uint64_t address;
-    // uint32_t write_count;
-    uint32_t size;
-
-    // added field
-    uint8_t heat_level;
-    int8_t heat_trend;
-    uint8_t selected;   //size = 15
-}
-"""
-@dataclass
-class DirtyHeatMapEntry:
-    address: int
-    # write_count: float
-    size: int
-    heat_level: int = field(default=10)
-    heat_trend: int = field(default=0)
-    selected: int = field(default=0)
-
-    @property
-    def start(self) -> int:
-        """
-        返回页的起始地址
-        """
-        return self.address
-
-    @property
-    def end(self) -> int:
-        """
-        返回页的结束地址
-        """
-        return self.address + self.size
-
 # 定义容器进程树的 pid 列表
 container_pids = []
 
@@ -133,8 +70,6 @@ mig_time = 0.0
 chk_time = 0.0
 rst_time = 0.0
 
-# 表示pre-copy需要提前停止的标志
-precopy_limit = False
 
 # 初始化迭代和处理过的dirtymap文件
 iter_dirtymaps = []
@@ -159,10 +94,6 @@ def ioctl_stop_pid(device_fd, pid):
     buf = bytearray(struct.pack('I', pid))
     ioctl(device_fd, IOCTL_STOP_PID, buf)
     # ret = struct.unpack_from('I', buf)[0]
-
-# 通过ioctl停止所有进程的脏页跟踪
-def ioctl_stop_all(device_fd):
-    ioctl(device_fd, IOCTL_STOP_ALL, None)
 
 # 通过ioctl获取脏页跟踪的目录路径
 def ioctl_get_dirty_map_path(device_fd):
@@ -464,7 +395,8 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
         cmd += ' --status-fd ' + str(write_fd)
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
-        # cmd += ' --leave-running'
+    if replay:
+        cmd += ' --leave-running'
 
     cmd += ' ' + container
     start = time.perf_counter() * 1000
@@ -518,8 +450,8 @@ def iterate_predump(mig_base, parent_path, max_iter, dirtymap):
         #     break
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
-            if precopy_limit or abs(getdirsize(last_path, 'pages') \
-                    - getdirsize(less_last_path, 'pages')) < 102400:     #100KB
+            if abs(getdirsize(last_path, 'pages') - getdirsize(less_last_path, 'pages')) < 102400 \
+                    or (getdirsize(last_path, 'pages') < 102400):     #100KB
                 break
         last_iter += 1
         if last_iter >= max_iter:
@@ -644,7 +576,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     if dirtymap and not pre:
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
-                
+
     if diskless:
         mount_cmd = 'mount -t tmpfs none '+ image_path
         ret = os.system(mount_cmd)
