@@ -516,7 +516,6 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
     while last_iter < max_iter:
-
         last_path = parent_path[last_iter]
         # if diskless:
             # #send the page server command,
@@ -666,15 +665,15 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     else:
         last_iter = 0
 
-    if dirtymap and not pre:
-        get_runc_container_pidtree(container)
-        start_dirty_track(device_fd)
-
     if diskless:
         mount_cmd = 'mount -t tmpfs none '+ image_path
         ret = os.system(mount_cmd)
         if ret != 0:   
             error()
+
+    if dirtymap and not pre:
+        get_runc_container_pidtree(container)
+        start_dirty_track(device_fd)
     # print(dirtymap)
     real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
     if replay:
