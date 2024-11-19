@@ -229,7 +229,6 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
     unsigned long pmd_start = addr;
     unsigned long pmd_end = addr + PMD_SIZE; // PMD_SIZE通常为2MB
     unsigned long page_addr;
-    dirty_address_t *addr_dirty;
     bool updated = false;
 
     if ((pmd_present(pmd) && pmd_soft_dirty(pmd)) || (is_swap_pmd(pmd) && pmd_swp_soft_dirty(pmd))) {
