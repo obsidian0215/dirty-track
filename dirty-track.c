@@ -738,7 +738,6 @@ static int wp_fault_track(void *data) {
     while (!kthread_should_stop()) {
         // 检查是否由ioctl请求停止
         if (dti->stop_requested) {
-            printk(KERN_INFO "[PID %d] Received STOP_PID ioctl, write dirty_ma to file\n", pid);
             // write dirty_map to file
             if (!xa_empty(&dti->dirty_xarray)) {
                 struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
@@ -968,13 +967,9 @@ static int stop_dirty_track(pid_t pid) {
     ktime_t start_time, end_time;
     s64 delta_ns;
 
-    start_time = ktime_get();  // 获取开始时间
     // 不存在进程的脏页追踪
     if (atomic_read(&tracked_processes) == 0 || list_empty(&dirty_track_list)) {
         printk(KERN_ERR "No active dirty-tracking\n");
-        end_time = ktime_get();  // 获取结束时间
-        delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-        printk(KERN_INFO "stop_dirty_track executed in %lld ns with failed\n", delta_ns);
         return -ENOENT;
     }
 
@@ -985,8 +980,13 @@ static int stop_dirty_track(pid_t pid) {
             write_unlock(&dirty_track_rwlock);
 
             // 优先停止clear-soft-dirty循环并将dirty-map写入文件
+            
+            start_time = ktime_get();  // 获取开始时间
             dti->stop_requested = true;
             wait_for_completion(&dti->stop_completed);
+            end_time = ktime_get();  // 获取结束时间
+            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+            printk(KERN_INFO "wait_for_completion executed in %lld ns\n", delta_ns);
 
             // 剩余的清理任务委托给异步工作队列
             sw = kzalloc(sizeof(*sw), GFP_KERNEL);
@@ -995,15 +995,16 @@ static int stop_dirty_track(pid_t pid) {
             }
             sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
             sw->dti = dti;
+            start_time = ktime_get();  // 获取开始时间
             INIT_WORK(&sw->work, nbstop_kthread_fn);
             queue_work(nbstop_kthread_wq, &sw->work);
+            end_time = ktime_get();  // 获取结束时间
+            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+            printk(KERN_INFO "queue_work executed in %lld ns\n", delta_ns);
 
             // 减少跟踪进程计数
             atomic_dec(&tracked_processes);
             // printk(KERN_INFO "[3]Successfully stopped monitoring PID %d\n", pid);
-            end_time = ktime_get();  // 获取结束时间
-            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-            printk(KERN_INFO "stop_dirty_track executed in %lld ns\n", delta_ns);
             break;
         }
     }
