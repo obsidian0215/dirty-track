@@ -70,20 +70,23 @@ static char tmpfs_dir[256];
 typedef struct dirty_track {
     pid_t pid;                              // 目标进程的pid
     struct mm_struct *mm;                   // 目标进程的地址空间
+    struct list_head list;                  // 脏页追踪实例的链表节点
 
     struct task_struct *track_worker;       // 脏页追踪内核线程
 
+    /* dirty-map相关字段 */
     char dirty_map_path[256];               // 定位保存dirty-map的共享内存(tmpfs文件)
     struct xarray dirty_xarray;             // 记录进程页写入次数的dirty-map(Xarray)    
     bool dirty_map_updated;                 // 是否更新过dirty-map
-
-    struct list_head list;                  // 脏页追踪实例的链表节点
-
-    bool soft_cleared;                      // 是否清除过soft-dirty位
     
+    /* clear-soft-dirty循环相关字段 */
+    bool soft_cleared;                      // 是否清除过soft-dirty位
     unsigned long delay_timer;              // 页表项处理延时，单位为ns
     unsigned int delay_penalty;             // 延迟惩罚因子，初始为1
     
+    /* 优先停止任务的相关字段 */
+    bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
+    struct completion stop_completed;       // dirty-map写入完成信号，用于通知ioctl
 } dirty_track_t;
 
 // 保存单个页的修改历史
@@ -742,11 +745,31 @@ static int wp_fault_track(void *data) {
     }
 
     while (!kthread_should_stop()) {
+        // 检查是否由ioctl请求停止
+        if (dti->stop_requested) {
+            printk(KERN_INFO "[PID %d] Received STOP_PID ioctl, write dirty_ma to file\n", pid);
+            // write dirty_map to file
+            if (!xa_empty(&dti->dirty_xarray)) {
+                struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
+                if (!IS_ERR(file)) {
+                    loff_t pos = 0;
+                    dirty_map_to_file(&dti->dirty_xarray, file, &pos);
+                    filp_close(file, NULL);
+                } else {
+                    printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
+                }
+            } else
+                printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
+
+            // 通知停止已完成
+            complete(&dti->stop_completed);
+            break;
+        }
+
         if (mm_struct_can_be_freed(dti->mm)) {
             printk(KERN_INFO "[PID %d]Trackee mm_struct can be freed, we should stop dirty-tracking\n", pid);
             break;
-        }
-        else {
+        } else {
             dti->dirty_map_updated = false;
             start = ktime_get();
             ret = clear_soft_dirty_once(dti);
@@ -790,8 +813,7 @@ static int wp_fault_track(void *data) {
             }
         }
     }
-
-    printk(KERN_INFO "[1]Stopped dirty-tracking PID %d\n", pid);
+    // printk(KERN_INFO "[1]Stopped dirty-tracking PID %d\n", pid);
     return ret;
 }
 
@@ -801,7 +823,6 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     dirty_track_t *dti = sw->dti;
     wqtask_completion_t *wqtc = sw->wq_comp;
     ktime_t start_time, end_time;
-    ktime_t kth_start_time, kth_end_time;
     s64 delta_ns;
 
     start_time = ktime_get();  // 获取开始时间
@@ -816,15 +837,11 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     }
 
     // 停止内核线程
-    kth_start_time = ktime_get();  // 获取开始时间
     if (!kthread_stop(dti->track_worker)) {
-        printk(KERN_INFO "[2]Successfully stopped tracker for PID %d\n", dti->pid);
+        // printk(KERN_INFO "[2]Successfully stopped tracker for PID %d\n", dti->pid);
     } else {
         printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
     }
-    kth_end_time = ktime_get();  // 获取结束时间
-    delta_ns = ktime_to_ns(ktime_sub(kth_end_time, kth_start_time));
-    printk(KERN_INFO "kthread_stop executed in %lld ns\n", delta_ns);
 
     // 写入dirty_map文件
     if (!xa_empty(&dti->dirty_xarray)) {
@@ -895,6 +912,10 @@ static int start_dirty_track(pid_t pid) {
     dti->dirty_map_updated = false;
     dti->delay_timer = INIT_DELAY;
     dti->delay_penalty = 1;
+
+    // 初始化优先停止任务的相关字段
+    dti->stop_requested = false;
+    init_completion(&dti->stop_completed);
 
     // 初始化pid以及mm_struct字段
     dti->pid = pid;
@@ -980,35 +1001,24 @@ static int stop_dirty_track(pid_t pid) {
         if (dti->pid == pid) {
             list_del(&dti->list);
             write_unlock(&dirty_track_rwlock);
-        
-            // 分配完成通知结构体
-            wqtc = kzalloc(sizeof(*wqtc), GFP_KERNEL);
-            if (!wqtc)
-                return -ENOMEM;
-            init_completion(&wqtc->wq_comp);
 
-            // 分配队列工作项结构体
+            // 优先停止clear-soft-dirty循环并将dirty-map写入文件
+            dti->stop_requested = true;
+            wait_for_completion(&dti->stop_completed);
+
+            // 剩余的清理任务委托给异步工作队列
             sw = kzalloc(sizeof(*sw), GFP_KERNEL);
             if (!sw) {
-                kfree(wqtc);
                 return -ENOMEM;
             }
-            sw->wq_comp = wqtc;
+            sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
             sw->dti = dti;
             INIT_WORK(&sw->work, nbstop_kthread_fn);
-            list_add_tail(&wqtc->list, &wqtask_completion_list);
-
             queue_work(nbstop_kthread_wq, &sw->work);
-            // 等待工作队列任务完成
-            wait_for_completion(&wqtc->wq_comp);
-
-            // 停止内核线程工作完成后的清理工作
-            list_del(&wqtc->list);
-            kfree(wqtc);
 
             // 减少跟踪进程计数
             atomic_dec(&tracked_processes);
-            printk(KERN_INFO "[3]Successfully stopped monitoring PID %d\n", pid);
+            // printk(KERN_INFO "[3]Successfully stopped monitoring PID %d\n", pid);
             end_time = ktime_get();  // 获取结束时间
             delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
             printk(KERN_INFO "stop_dirty_track executed in %lld ns\n", delta_ns);
