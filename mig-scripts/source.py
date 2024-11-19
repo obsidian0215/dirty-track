@@ -644,7 +644,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
             error()
         
         #infinite sync loop
-        f = open("logs/rootfs_sync_progress.logs", 'w')
+        f = open(mig_base + "/d_log/rootfs_sync_progress.logs", 'w')
         sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
         p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
     
