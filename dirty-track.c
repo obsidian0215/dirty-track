@@ -801,6 +801,7 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     dirty_track_t *dti = sw->dti;
     wqtask_completion_t *wqtc = sw->wq_comp;
     ktime_t start_time, end_time;
+    ktime_t kth_start_time, kth_end_time;
     s64 delta_ns;
 
     start_time = ktime_get();  // 获取开始时间
@@ -815,11 +816,15 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     }
 
     // 停止内核线程
+    kth_start_time = ktime_get();  // 获取开始时间
     if (!kthread_stop(dti->track_worker)) {
         printk(KERN_INFO "[2]Successfully stopped tracker for PID %d\n", dti->pid);
     } else {
         printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
     }
+    kth_end_time = ktime_get();  // 获取结束时间
+    delta_ns = ktime_to_ns(ktime_sub(kth_end_time, kth_start_time));
+    printk(KERN_INFO "kthread_stop executed in %lld ns\n", delta_ns);
 
     // 写入dirty_map文件
     if (!xa_empty(&dti->dirty_xarray)) {
