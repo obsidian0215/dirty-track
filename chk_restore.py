@@ -297,7 +297,7 @@ def measure_bandwidth(dest_ip):
     
 
 
-def restore(container_path, tty, netdump):
+def restore(container_path, tty, netdump, post):
     global rst_time
     old_cwd = os.getcwd()
     os.chdir(container_path)
@@ -312,6 +312,8 @@ def restore(container_path, tty, netdump):
         cmd += ' --shell-job'
     if netdump:
         cmd += ' --tcp-established'
+    if post:
+        cmd += ' --lazy-pages'
     #In case of a post-copy phase in the migration technique, the restore command restores the process without filling out the entire memory contents.
     #When the --lazy-pages option is used, restore registers the lazy virtual memory areas (VMAs) with the userfaultfd mechanism. The lazy pages are completely handled by dedicated lazy-pages daemon.
     #The daemon receives userfault file descriptors from restore via UNIX socket.
@@ -319,6 +321,14 @@ def restore(container_path, tty, netdump):
     # print("Running " +  cmd)
     start = time.perf_counter() * 1000
     p = subprocess.Popen(cmd, shell=True)
+    if post:
+        lazy_cmd = "criu lazy-pages --page-server --address 127.0.0.1"
+        lazy_cmd += " --port 27 -v4 -D "
+        lazy_cmd += base_path + "/migrate/image"
+        lazy_cmd += " -W " + base_path + "/migrate/r_log"
+        lazy_cmd += " -o " + base_path + "/migrate/logs/lp.log"
+        print ("Running lazy-pages server: " + lazy_cmd)
+        lp = subprocess.Popen(lazy_cmd, shell=True)
     ret = p.wait()
     end = time.perf_counter() * 1000
     print("%s finished after %.3fms with %d" % (cmd, end - start, ret))
@@ -620,7 +630,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     #                 rst_time = float(answer_list[-2])
     #     else:
     #         print("can't confirm VIP has been transfered, can't restore on destination")
-    restore(base_path, tty, netdump)
+    restore(base_path, tty, netdump, post)
     #after migration, rootfs sync process and opened files will be closed
     # if rootfs:
     #     p.terminate()

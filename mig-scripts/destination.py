@@ -346,7 +346,7 @@ def migrate_server():
                             lazy_cmd += " --port 27 -v4 -D "
                             lazy_cmd += msg['restore']['image_path']
                             lazy_cmd += " -W " + msg['restore']['path'] + "/migrate/r_log"
-                            lazy_cmd += " -o z" + msg['restore']['path'] + "/migrate/logs/lp.log"
+                            lazy_cmd += " -o " + msg['restore']['path'] + "/migrate/logs/lp.log"
                             print ("Running lazy-pages server: " + lazy_cmd)
                             lp = subprocess.Popen(lazy_cmd, shell=True)
                         ret = p.wait()
