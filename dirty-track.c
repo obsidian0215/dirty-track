@@ -969,8 +969,8 @@ bool check_dirty_track_for_pid(pid_t pid) {
 static int stop_dirty_track(pid_t pid) {
     dirty_track_t *dti, *tmp;
     nbstop_kthread_t *sw;
-    ktime_t start_time, end_time;
-    s64 delta_ns;
+    // ktime_t start_time, end_time;
+    // s64 delta_ns;
 
     // 不存在进程的脏页追踪
     if (atomic_read(&tracked_processes) == 0 || list_empty(&dirty_track_list)) {
@@ -986,13 +986,13 @@ static int stop_dirty_track(pid_t pid) {
 
             // 优先停止clear-soft-dirty循环并将dirty-map写入文件
             
-            start_time = ktime_get();  // 获取开始时间
+            // start_time = ktime_get();  // 获取开始时间
             dti->stop_requested = true;
             wake_up_interruptible(&dti->stop_wq); // 唤醒内核线程
             wait_for_completion(&dti->stop_completed);
-            end_time = ktime_get();  // 获取结束时间
-            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-            printk(KERN_INFO "wait_for_completion executed in %lld ns\n", delta_ns);
+            // end_time = ktime_get();  // 获取结束时间
+            // delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+            // printk(KERN_INFO "wait_for_completion executed in %lld ns\n", delta_ns);
 
             // 剩余的清理任务委托给异步工作队列
             sw = kzalloc(sizeof(*sw), GFP_KERNEL);
@@ -1001,12 +1001,12 @@ static int stop_dirty_track(pid_t pid) {
             }
             sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
             sw->dti = dti;
-            start_time = ktime_get();  // 获取开始时间
+            // start_time = ktime_get();  // 获取开始时间
             INIT_WORK(&sw->work, nbstop_kthread_fn);
             queue_work(nbstop_kthread_wq, &sw->work);
-            end_time = ktime_get();  // 获取结束时间
-            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-            printk(KERN_INFO "queue_work executed in %lld ns\n", delta_ns);
+            // end_time = ktime_get();  // 获取结束时间
+            // delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+            // printk(KERN_INFO "queue_work executed in %lld ns\n", delta_ns);
 
             // 减少跟踪进程计数
             atomic_dec(&tracked_processes);
