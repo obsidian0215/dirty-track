@@ -146,8 +146,11 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
 static inline void dirty_map_to_file(struct xarray *xarray, struct file *file, loff_t *pos) {
     unsigned long address;
     dirty_address_t *entry;
-
+    ktime_t start_time, end_time;
+    s64 delta_ns;
     // 遍历xarray，输出索引（页地址）和脏页统计数据
+
+    start_time = ktime_get();  // 获取开始时间
     xa_for_each(xarray, address, entry) {
         // 先写入页地址（索引）
         kernel_write(file, (char *)&address, sizeof(address), &file->f_pos);
@@ -155,6 +158,9 @@ static inline void dirty_map_to_file(struct xarray *xarray, struct file *file, l
         // 再写入脏页统计数据
         kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), &file->f_pos);
     }
+    end_time = ktime_get();  // 获取结束时间
+    delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+    printk(KERN_INFO "write_dirty_map executed in %lld ns\n", delta_ns);
 }
 
 // 将xarray中指定的索引项删除
@@ -794,11 +800,17 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     nbstop_kthread_t *sw = container_of(work, nbstop_kthread_t, work);
     dirty_track_t *dti = sw->dti;
     wqtask_completion_t *wqtc = sw->wq_comp;
+    ktime_t start_time, end_time;
+    s64 delta_ns;
 
+    start_time = ktime_get();  // 获取开始时间
     if (!dti) {
         printk(KERN_ERR "No dirty_track instance provided to stop\n");
         complete(&wqtc->wq_comp);
         kfree(sw);
+        end_time = ktime_get();  // 获取结束时间
+        delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+        printk(KERN_INFO "nbstop_kthread_fn executed in %lld ns with failed\n", delta_ns);
         return;
     }
 
@@ -837,6 +849,10 @@ static void nbstop_kthread_fn(struct work_struct *work) {
 
     complete(&wqtc->wq_comp);   // 通知内核线程已停止
     kfree(sw);
+
+    end_time = ktime_get();  // 获取结束时间
+    delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+    printk(KERN_INFO "nbstop_kthread_fn executed in %lld ns\n", delta_ns);
 }
 
 // 创建并启动新的脏页追踪
@@ -941,10 +957,16 @@ static int stop_dirty_track(pid_t pid) {
     dirty_track_t *dti, *tmp;
     wqtask_completion_t *wqtc;
     nbstop_kthread_t *sw;
+    ktime_t start_time, end_time;
+    s64 delta_ns;
 
+    start_time = ktime_get();  // 获取开始时间
     // 不存在进程的脏页追踪
     if (atomic_read(&tracked_processes) == 0 || list_empty(&dirty_track_list)) {
         printk(KERN_ERR "No active dirty-tracking\n");
+        end_time = ktime_get();  // 获取结束时间
+        delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+        printk(KERN_INFO "stop_dirty_track executed in %lld ns with failed\n", delta_ns);
         return -ENOENT;
     }
 
@@ -982,6 +1004,9 @@ static int stop_dirty_track(pid_t pid) {
             // 减少跟踪进程计数
             atomic_dec(&tracked_processes);
             printk(KERN_INFO "[3]Successfully stopped monitoring PID %d\n", pid);
+            end_time = ktime_get();  // 获取结束时间
+            delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+            printk(KERN_INFO "stop_dirty_track executed in %lld ns\n", delta_ns);
             break;
         }
     }
