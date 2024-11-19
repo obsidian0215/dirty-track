@@ -326,7 +326,7 @@ def restore(container_path, tty, netdump, post):
         lazy_cmd += " --port 27 -v4 -D "
         lazy_cmd += base_path + "/migrate/image"
         lazy_cmd += " -W " + base_path + "/migrate/r_log"
-        lazy_cmd += " -o " + base_path + "/migrate/logs/lp.log"
+        lazy_cmd += " -o " + base_path + "/migrate/r_log/lp.log"
         print ("Running lazy-pages server: " + lazy_cmd)
         lp = subprocess.Popen(lazy_cmd, shell=True)
     ret = p.wait()
