@@ -87,6 +87,7 @@ typedef struct dirty_track {
     /* 优先停止任务的相关字段 */
     bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
     struct completion stop_completed;       // dirty-map写入完成信号，用于通知ioctl
+    wait_queue_head_t stop_wq;              // 等待队列，用于唤醒线程
 } dirty_track_t;
 
 // 保存单个页的修改历史
@@ -711,10 +712,10 @@ static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
     pid_t pid = dti->pid;
     int ret = 0;
-    // 测量时间
+    long timeout;
+    unsigned long default_delay = INIT_DELAY;
     ktime_t start, end;
     s64 delta_ns;
-    unsigned long default_delay = INIT_DELAY;
     
     start = ktime_get();
     ret = clear_soft_dirty_once(dti);
@@ -731,7 +732,9 @@ static int wp_fault_track(void *data) {
     }
     // 应对内存空间较大的情况
     if (delta_ns >= default_delay / 2) {
-        msleep(default_delay / NSEC_PER_MSEC);
+        // msleep(default_delay / NSEC_PER_MSEC);
+        timeout = msecs_to_jiffies(default_delay / NSEC_PER_MSEC);
+        wait_event_interruptible_timeout(dti->stop_wq, dti->stop_requested, timeout);
         default_delay = delta_ns;
     }
 
@@ -786,7 +789,6 @@ static int wp_fault_track(void *data) {
                     if (dti->delay_timer > MAX_DELAY) {
                         dti->delay_timer = MAX_DELAY;
                     }
-                    msleep(dti->delay_timer / NSEC_PER_MSEC);
                 } else {
                     // 根据delta_ns调整delay_timer
                     dti->delay_penalty = 1;
@@ -797,8 +799,10 @@ static int wp_fault_track(void *data) {
                     } else {
                         dti->delay_timer = 2 * delta_ns;
                     }
-                    msleep(dti->delay_timer / NSEC_PER_MSEC);
-                }           
+                }
+                // 设置等待超时
+                timeout = msecs_to_jiffies(dti->delay_timer / NSEC_PER_MSEC);
+                wait_event_interruptible_timeout(dti->stop_wq, dti->stop_requested, timeout);
                 // printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
             }
         }
@@ -898,6 +902,7 @@ static int start_dirty_track(pid_t pid) {
     // 初始化优先停止任务的相关字段
     dti->stop_requested = false;
     init_completion(&dti->stop_completed);
+    init_waitqueue_head(&dti->stop_wq);
 
     // 初始化pid以及mm_struct字段
     dti->pid = pid;
@@ -983,6 +988,7 @@ static int stop_dirty_track(pid_t pid) {
             
             start_time = ktime_get();  // 获取开始时间
             dti->stop_requested = true;
+            wake_up_interruptible(&dti->stop_wq); // 唤醒内核线程
             wait_for_completion(&dti->stop_completed);
             end_time = ktime_get();  // 获取结束时间
             delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
