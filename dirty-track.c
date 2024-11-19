@@ -710,8 +710,6 @@ static int write_clear_refs_pid(pid_t pid) {
 // 脏页追踪线程的主函数
 static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
-    struct vm_area_struct *vma;
-    struct vma_info *vma_entry;
     pid_t pid = dti->pid;
     int ret = 0;
     // 测量时间
@@ -967,7 +965,6 @@ bool check_dirty_track_for_pid(pid_t pid) {
 // 停止并清理对指定PID进程的脏页追踪(内核缓存)
 static int stop_dirty_track(pid_t pid) {
     dirty_track_t *dti, *tmp;
-    wqtask_completion_t *wqtc;
     nbstop_kthread_t *sw;
     ktime_t start_time, end_time;
     s64 delta_ns;
@@ -1097,7 +1094,7 @@ static struct file_operations fops = {
 
 // 模块初始化
 static int __init lkm_init(void) {
-    int ret, err;
+    int ret;
 
     // 初始化全局锁
     rwlock_init(&dirty_track_rwlock);
