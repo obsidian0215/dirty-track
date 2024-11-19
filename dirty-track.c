@@ -807,7 +807,6 @@ static int wp_fault_track(void *data) {
             }
         }
     }
-    // printk(KERN_INFO "[1]Stopped dirty-tracking PID %d\n", pid);
     return ret;
 }
 
@@ -827,24 +826,25 @@ static void nbstop_kthread_fn(struct work_struct *work) {
 
     // 停止内核线程
     if (!kthread_stop(dti->track_worker)) {
-        // printk(KERN_INFO "[2]Successfully stopped tracker for PID %d\n", dti->pid);
+        printk(KERN_INFO "Successfully stopped tracker for PID %d\n", dti->pid);
     } else {
         printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
     }
 
-    // 写入dirty_map文件
-    if (!xa_empty(&dti->dirty_xarray)) {
-        struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
-        if (!IS_ERR(file)) {
-            loff_t pos = 0;
-            dirty_map_to_file(&dti->dirty_xarray, file, &pos);
-            filp_close(file, NULL);
-        } else {
-            printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
-        }
-    } else
-        printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
-
+    // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
+    if (!dti->stop_requested) {
+        if (!xa_empty(&dti->dirty_xarray)) {
+            struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
+            if (!IS_ERR(file)) {
+                loff_t pos = 0;
+                dirty_map_to_file(&dti->dirty_xarray, file, &pos);
+                filp_close(file, NULL);
+            } else {
+                printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
+            }
+        } else
+            printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
+    }
 
     // 清理dirty_xarray
     unsigned long addr;
@@ -861,6 +861,7 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     if (wqtc)
         complete(&wqtc->wq_comp);   // 通知内核线程已停止
     kfree(sw);
+    printk(KERN_INFO "PID %d's dirty_track is clear\n", dti->pid);
 }
 
 // 创建并启动新的脏页追踪
@@ -1010,7 +1011,7 @@ static int stop_dirty_track(pid_t pid) {
 
             // 减少跟踪进程计数
             atomic_dec(&tracked_processes);
-            // printk(KERN_INFO "[3]Successfully stopped monitoring PID %d\n", pid);
+            printk(KERN_INFO "PID %d's dirty_track is stopped\n", pid);
             break;
         }
     }
