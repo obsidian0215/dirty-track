@@ -149,11 +149,8 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
 static inline void dirty_map_to_file(struct xarray *xarray, struct file *file, loff_t *pos) {
     unsigned long address;
     dirty_address_t *entry;
-    ktime_t start_time, end_time;
-    s64 delta_ns;
-    // 遍历xarray，输出索引（页地址）和脏页统计数据
 
-    start_time = ktime_get();  // 获取开始时间
+    // 遍历xarray，输出索引（页地址）和脏页统计数据
     xa_for_each(xarray, address, entry) {
         // 先写入页地址（索引）
         kernel_write(file, (char *)&address, sizeof(address), &file->f_pos);
@@ -161,9 +158,6 @@ static inline void dirty_map_to_file(struct xarray *xarray, struct file *file, l
         // 再写入脏页统计数据
         kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), &file->f_pos);
     }
-    end_time = ktime_get();  // 获取结束时间
-    delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-    printk(KERN_INFO "write_dirty_map executed in %lld ns\n", delta_ns);
 }
 
 // 将xarray中指定的索引项删除
@@ -822,17 +816,12 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     nbstop_kthread_t *sw = container_of(work, nbstop_kthread_t, work);
     dirty_track_t *dti = sw->dti;
     wqtask_completion_t *wqtc = sw->wq_comp;
-    ktime_t start_time, end_time;
-    s64 delta_ns;
 
-    start_time = ktime_get();  // 获取开始时间
     if (!dti) {
         printk(KERN_ERR "No dirty_track instance provided to stop\n");
-        complete(&wqtc->wq_comp);
+        if (wqtc)
+            complete(&wqtc->wq_comp);
         kfree(sw);
-        end_time = ktime_get();  // 获取结束时间
-        delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-        printk(KERN_INFO "nbstop_kthread_fn executed in %lld ns with failed\n", delta_ns);
         return;
     }
 
@@ -869,12 +858,9 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     mmput(dti->mm);
     kfree(dti);
 
-    complete(&wqtc->wq_comp);   // 通知内核线程已停止
+    if (wqtc)
+        complete(&wqtc->wq_comp);   // 通知内核线程已停止
     kfree(sw);
-
-    end_time = ktime_get();  // 获取结束时间
-    delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-    printk(KERN_INFO "nbstop_kthread_fn executed in %lld ns\n", delta_ns);
 }
 
 // 创建并启动新的脏页追踪
