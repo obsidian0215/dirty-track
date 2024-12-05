@@ -729,7 +729,6 @@ static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
     pid_t pid = dti->pid;
     int ret = 0;
-    long timeout;
     unsigned long default_delay;
     ktime_t start, end, kt;
     s64 delta_ns;
