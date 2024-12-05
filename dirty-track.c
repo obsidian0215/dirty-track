@@ -52,8 +52,8 @@ struct pid_check {
 #define IOCTL_CHECK_PID _IOWR(DIRTY_TRACK_MAGIC, 4, struct pid_check)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
-// 页表项复位的初始延时，单位为ns --> 4ms
-#define INIT_DELAY 4000000
+// 页表项复位的初始延时，单位为ns --> 1ms
+#define INIT_DELAY 1000000
 // 页表项复位的最大延时，单位为ns --> 1s
 #define MAX_DELAY 1000000000
 // 最大可跟踪进程数
@@ -83,6 +83,9 @@ typedef struct dirty_track {
     bool soft_cleared;                      // 是否清除过soft-dirty位
     unsigned long delay_timer;              // 页表项处理延时，单位为ns
     unsigned int delay_penalty;             // 延迟惩罚因子，初始为1
+    struct hrtimer timer;                   // 脏页追踪内核线程的高精度定时器
+    bool timer_fired;                       // 定时器是否触发
+    spinlock_t timer_lock;                  // 保护timer_fired的自旋锁
     
     /* 优先停止任务的相关字段 */
     bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
@@ -685,27 +688,41 @@ out:
     return err;
 }
 
-// 向指定pid进程的clear_refs写入4以启用soft-dirty tracking
-static int write_clear_refs_pid(pid_t pid) {
-    char *argv[] = {"/bin/bash", "-c", NULL, NULL};
-    char cmd[256];
-    char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-    int ret;
+// // 向指定pid进程的clear_refs写入4以启用soft-dirty tracking
+// static int write_clear_refs_pid(pid_t pid) {
+//     char *argv[] = {"/bin/bash", "-c", NULL, NULL};
+//     char cmd[256];
+//     char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
+//     int ret;
 
-    // 设置目标PID并构建shell命令
-    snprintf(cmd, sizeof(cmd), "echo 4 > /proc/%d/clear_refs", pid);
+//     // 设置目标PID并构建shell命令
+//     snprintf(cmd, sizeof(cmd), "echo 4 > /proc/%d/clear_refs", pid);
 
-    argv[2] = cmd;
+//     argv[2] = cmd;
 
-    // 执行shell命令
-    ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-    if (ret != 0) {
-        printk(KERN_ERR "Enabling soft-dirty tracking failed: %d\n", ret);
-    } else {
-        printk(KERN_INFO "Soft-dirty tracking of process %d enabled\n", pid);
-    }
-    return ret;
+//     // 执行shell命令
+//     ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+//     if (ret != 0) {
+//         printk(KERN_ERR "Enabling soft-dirty tracking failed: %d\n", ret);
+//     } else {
+//         printk(KERN_INFO "Soft-dirty tracking of process %d enabled\n", pid);
+//     }
+//     return ret;
+// }
+static enum hrtimer_restart wp_timer_callback(struct hrtimer *timer)
+{
+    dirty_track_t *dti = container_of(timer, dirty_track_t, timer);
+
+    // 设置timer触发标志
+    spin_lock(&dti->timer_lock);
+    dti->timer_fired = true;
+    spin_unlock(&dti->timer_lock);
+
+    // 唤醒等待队列，通知线程定时器已超时
+    wake_up_interruptible(&dti->stop_wq); 
+    return HRTIMER_NORESTART;   // 不自动重启定时器
 }
+
 
 // 脏页追踪线程的主函数
 static int wp_fault_track(void *data) {
@@ -713,10 +730,14 @@ static int wp_fault_track(void *data) {
     pid_t pid = dti->pid;
     int ret = 0;
     long timeout;
-    unsigned long default_delay = INIT_DELAY;
-    ktime_t start, end;
+    unsigned long default_delay;
+    ktime_t start, end, kt;
     s64 delta_ns;
     
+    // 初始化定时器
+    hrtimer_init(&dti->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    dti->timer.function = wp_timer_callback;
+
     start = ktime_get();
     ret = clear_soft_dirty_once(dti);
     // ret = write_clear_refs_pid(pid);
@@ -725,20 +746,27 @@ static int wp_fault_track(void *data) {
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         dti->soft_cleared = true;
+        if (delta_ns < INIT_DELAY / 10) {
+            default_delay = 9 * delta_ns;
+        } else if (delta_ns >= INIT_DELAY / 3) {
+            default_delay = delta_ns + INIT_DELAY;
+        } else {
+            default_delay = INIT_DELAY;
+        }
+        dti->delay_timer = default_delay;
+        // 设置初始定时器超时
+        kt = ktime_set(0, default_delay);
+        hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
     }
     else {
         printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);       
         return -EFAULT;
     }
-    // 应对内存空间较大的情况
-    if (delta_ns >= default_delay / 2) {
-        // msleep(default_delay / NSEC_PER_MSEC);
-        timeout = msecs_to_jiffies(default_delay / NSEC_PER_MSEC);
-        wait_event_interruptible_timeout(dti->stop_wq, dti->stop_requested, timeout);
-        default_delay = delta_ns;
-    }
 
     while (!kthread_should_stop()) {
+        // 等待定时器回调或停止请求
+        ret = wait_event_interruptible(dti->stop_wq, dti->stop_requested || dti->timer_fired);
+
         // 检查是否由ioctl请求停止
         if (dti->stop_requested) {
             // write dirty_map to file
@@ -763,47 +791,46 @@ static int wp_fault_track(void *data) {
             printk(KERN_INFO "[PID %d]Trackee mm_struct can be freed, we should stop dirty-tracking\n", pid);
             break;
         } else {
-            dti->dirty_map_updated = false;
-            start = ktime_get();
-            ret = clear_soft_dirty_once(dti);
-            end = ktime_get();
-            delta_ns = ktime_to_ns(ktime_sub(end, start));
+            spin_lock(&dti->timer_lock);
+            if (dti->timer_fired) {
+                dti->timer_fired = false;  // 清除标志
+                spin_unlock(&dti->timer_lock);
 
-            if (ret) {
-                printk(KERN_ERR "[PID %d]clear_soft_dirty_once has encountered an error %d\n", pid, ret);
-                break;
-            }
-            else {
-                // 检查dirty_map是否有更新或xarray是否为空
-                bool need_wait = false;
-                if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
-                    need_wait = true;
+                // 执行定时器到期后的任务
+                dti->dirty_map_updated = false;
+                ktime_t start = ktime_get();
+                int ret = clear_soft_dirty_once(dti);
+                ktime_t end = ktime_get();
+                s64 delta_ns = ktime_to_ns(ktime_sub(end, start));
+
+                if (ret) {
+                    printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
+                    break;
                 }
 
-                // 满足上述条件则逐步增加执行周期
-                if (need_wait) {
-                    // printk(KERN_INFO "[PID %d]No write detected, waiting for %lu ms\n", pid, dti->delay_timer / NSEC_PER_MSEC);
+                // 动态调整定时器超时时间
+                if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
                     dti->delay_penalty *= 2;
-                    dti->delay_timer = default_delay * dti->delay_penalty;
-                    // 避免delay_timer过大
+                    dti->delay_timer = dti->delay_timer * dti->delay_penalty;
                     if (dti->delay_timer > MAX_DELAY) {
                         dti->delay_timer = MAX_DELAY;
                     }
                 } else {
-                    // 根据delta_ns调整delay_timer
                     dti->delay_penalty = 1;
-                    if (delta_ns > dti->delay_timer) {
-                        dti->delay_timer = delta_ns + default_delay;
-                    } else if (dti->delay_timer > 2 * delta_ns) {
-                        dti->delay_timer = default_delay;
-                    } else {
-                        dti->delay_timer = 2 * delta_ns;
+                    if (delta_ns < dti->delay_timer / 10) {
+                        dti->delay_timer = 9 * delta_ns;
+                    } else if (delta_ns >= dti->delay_timer / 3) {
+                        dti->delay_timer += delta_ns;
                     }
                 }
-                // 设置等待超时
-                timeout = msecs_to_jiffies(dti->delay_timer / NSEC_PER_MSEC);
-                wait_event_interruptible_timeout(dti->stop_wq, dti->stop_requested, timeout);
-                // printk(KERN_INFO "[PID %d]clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
+
+                // 启动新的定时器
+                ktime_t kt = ktime_set(0, dti->delay_timer);
+                hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
+
+                // printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, delta_ns);
+            } else {
+                spin_unlock(&dti->timer_lock);
             }
         }
     }
@@ -830,6 +857,10 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     } else {
         printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
     }
+
+    // 取消定时器
+    hrtimer_cancel(&dti->timer);
+    printk(KERN_INFO "Cancelled hrtimer for PID %d\n", dti->pid);
 
     // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
     if (!dti->stop_requested) {

@@ -15,106 +15,105 @@ from collections import deque
 
 VIP = "192.168.2.100"
 
+# def configure_iptables_forward():
+#     """
+#     配置iptables规则，缓存并转发请求包至source
+#     """
+#     table = iptc.Table(iptc.Table.FILTER)
+#     table.autocommit = False
 
-def configure_iptables_forward():
-    """
-    配置iptables规则，缓存并转发请求包至source
-    """
-    table = iptc.Table(iptc.Table.FILTER)
-    table.autocommit = False
+#     # PREROUTING链中添加TEE转发规则
+#     chain = iptc.Chain(table, "PREROUTING")
 
-    # PREROUTING链中添加TEE转发规则
-    chain = iptc.Chain(table, "PREROUTING")
+#     # 创建一个新的规则
+#     rule = iptc.Rule()
+#     rule.protocol = "tcp"
+#     rule.dst = VIP
+#     rule.dport = "80"
 
-    # 创建一个新的规则
-    rule = iptc.Rule()
-    rule.protocol = "tcp"
-    rule.dst = VIP
-    rule.dport = "80"
+#     # 添加 TEE 目标，将流量复制到Source
+#     target = iptc.Target(rule, "TEE")
+#     target.extra = False
+#     rule.target = "TEE"
+#     rule.add_target(target)
+#     rule.parameters = {"gateway": SOURCE_IP}
 
-    # 添加 TEE 目标，将流量复制到Source
-    target = iptc.Target(rule, "TEE")
-    target.extra = False
-    rule.target = "TEE"
-    rule.add_target(target)
-    rule.parameters = {"gateway": SOURCE_IP}
+#     # 添加 DNAT 规则，将复制的流量目标IP改为Source的实际IP
+#     nat_table = iptc.Table(iptc.Table.NAT)
+#     nat_table.autocommit = False
+#     nat_chain = iptc.Chain(nat_table, "PREROUTING")
 
-    # 添加 DNAT 规则，将复制的流量目标IP改为Source的实际IP
-    nat_table = iptc.Table(iptc.Table.NAT)
-    nat_table.autocommit = False
-    nat_chain = iptc.Chain(nat_table, "PREROUTING")
+#     nat_rule = iptc.Rule()
+#     nat_rule.protocol = "tcp"
+#     nat_rule.dst = SOURCE_IP
+#     nat_rule.dport = "80"
+#     nat_rule.target = "DNAT"
+#     nat_rule.parameters = {"to_destination": "192.168.1.101:80"}
+#     nat_chain.insert_rule(nat_rule)
 
-    nat_rule = iptc.Rule()
-    nat_rule.protocol = "tcp"
-    nat_rule.dst = SOURCE_IP
-    nat_rule.dport = "80"
-    nat_rule.target = "DNAT"
-    nat_rule.parameters = {"to_destination": "192.168.1.101:80"}
-    nat_chain.insert_rule(nat_rule)
+#     # 允许转发到Source的流量
+#     forward_table = iptc.Table(iptc.Table.FORWARD)
+#     forward_table.autocommit = False
+#     forward_chain = iptc.Chain(forward_table, "FORWARD")
 
-    # 允许转发到Source的流量
-    forward_table = iptc.Table(iptc.Table.FORWARD)
-    forward_table.autocommit = False
-    forward_chain = iptc.Chain(forward_table, "FORWARD")
+#     forward_rule = iptc.Rule()
+#     forward_rule.protocol = "tcp"
+#     forward_rule.dst = "192.168.1.101"
+#     forward_rule.dport = "80"
+#     forward_rule.target = "ACCEPT"
+#     forward_chain.insert_rule(forward_rule)
 
-    forward_rule = iptc.Rule()
-    forward_rule.protocol = "tcp"
-    forward_rule.dst = "192.168.1.101"
-    forward_rule.dport = "80"
-    forward_rule.target = "ACCEPT"
-    forward_chain.insert_rule(forward_rule)
+#     # 提交更改
+#     table.commit()
+#     nat_table.commit()
+#     forward_table.commit()
 
-    # 提交更改
-    table.commit()
-    nat_table.commit()
-    forward_table.commit()
+#     print("已配置iptables规则，开始缓存并转发请求包至source。")
 
-    print("已配置iptables规则，开始缓存并转发请求包至source。")
+# def remove_iptables_forward():
+#     """
+#     移除iptables转发规则，允许destination直接响应客户端
+#     """
+#     # 移除 PREROUTING 链中的 TEE 规则
+#     table = iptc.Table(iptc.Table.FILTER)
+#     table.autocommit = False
+#     chain = iptc.Chain(table, "PREROUTING")
 
-def remove_iptables_forward():
-    """
-    移除iptables转发规则，允许destination直接响应客户端
-    """
-    # 移除 PREROUTING 链中的 TEE 规则
-    table = iptc.Table(iptc.Table.FILTER)
-    table.autocommit = False
-    chain = iptc.Chain(table, "PREROUTING")
+#     for rule in chain.rules:
+#         if rule.dst == VIP and rule.protocol == "tcp" and rule.dport == "80":
+#             for target in rule.targets:
+#                 if target.name == "TEE" and target.parameters.get("gateway") == SOURCE_IP:
+#                     rule.delete_rule(target)
+#                     print("已移除iptables的TEE转发规则。")
 
-    for rule in chain.rules:
-        if rule.dst == VIP and rule.protocol == "tcp" and rule.dport == "80":
-            for target in rule.targets:
-                if target.name == "TEE" and target.parameters.get("gateway") == SOURCE_IP:
-                    rule.delete_rule(target)
-                    print("已移除iptables的TEE转发规则。")
+#     # 移除 NAT 表中的 DNAT 规则
+#     nat_table = iptc.Table(iptc.Table.NAT)
+#     nat_table.autocommit = False
+#     nat_chain = iptc.Chain(nat_table, "PREROUTING")
 
-    # 移除 NAT 表中的 DNAT 规则
-    nat_table = iptc.Table(iptc.Table.NAT)
-    nat_table.autocommit = False
-    nat_chain = iptc.Chain(nat_table, "PREROUTING")
+#     for rule in nat_chain.rules:
+#         if rule.protocol == "tcp" and rule.dst == SOURCE_IP and rule.dport == "80":
+#             if rule.target == "DNAT" and rule.parameters.get("to_destination") == "192.168.1.101:80":
+#                 nat_chain.delete_rule(rule)
+#                 print("已移除iptables的DNAT转发规则。")
 
-    for rule in nat_chain.rules:
-        if rule.protocol == "tcp" and rule.dst == SOURCE_IP and rule.dport == "80":
-            if rule.target == "DNAT" and rule.parameters.get("to_destination") == "192.168.1.101:80":
-                nat_chain.delete_rule(rule)
-                print("已移除iptables的DNAT转发规则。")
+#     # 移除 FORWARD 表中的 ACCEPT 规则
+#     forward_table = iptc.Table(iptc.Table.FORWARD)
+#     forward_table.autocommit = False
+#     forward_chain = iptc.Chain(forward_table, "FORWARD")
 
-    # 移除 FORWARD 表中的 ACCEPT 规则
-    forward_table = iptc.Table(iptc.Table.FORWARD)
-    forward_table.autocommit = False
-    forward_chain = iptc.Chain(forward_table, "FORWARD")
+#     for rule in forward_chain.rules:
+#         if rule.protocol == "tcp" and rule.dst == "192.168.1.101" and rule.dport == "80":
+#             if rule.target == "ACCEPT":
+#                 forward_chain.delete_rule(rule)
+#                 print("已移除iptables的FORWARD ACCEPT规则。")
 
-    for rule in forward_chain.rules:
-        if rule.protocol == "tcp" and rule.dst == "192.168.1.101" and rule.dport == "80":
-            if rule.target == "ACCEPT":
-                forward_chain.delete_rule(rule)
-                print("已移除iptables的FORWARD ACCEPT规则。")
+#     # 提交更改
+#     table.commit()
+#     nat_table.commit()
+#     forward_table.commit()
 
-    # 提交更改
-    table.commit()
-    nat_table.commit()
-    forward_table.commit()
-
-    print("已移除iptables规则，允许destination直接响应客户端。")
+#     print("已移除iptables规则，允许destination直接响应客户端。")
 
 def prepare(base_path, image_path, parent_path):
     if os.path.exists(base_path):
@@ -214,6 +213,73 @@ def transfer_vip():
         print(f"发生错误：{e}")
         return 1
 
+
+import re
+
+def calculate_uffd_copy(lp_log_file):
+    """
+    计算总的 UFFD 复制字节数。
+
+    参数:
+        lp_log_file (str): lp.log 文件的路径。
+
+    返回:
+        int: 总的 UFFD 复制字节数。
+    """
+    uffd_copy_pattern = re.compile(r'uffd_copy:\s+0x[0-9a-fA-F]+/(\d+)')
+    total_uffd_copy = 0
+    with open(lp_log_file, 'r') as f:
+        for line in f:
+            match = uffd_copy_pattern.search(line)
+            if match:
+                size = int(match.group(1))
+                total_uffd_copy += size
+                #print(f"UFFD copy: {size} bytes")
+    return total_uffd_copy
+
+def get_error_page_transfer_time(lp_log_file):
+    """
+    计算错误页面传输的总时间，从 lp.log 中匹配 'Connecting to server' 到 'page-xfer: Disconnect from the page server' 的时间间隔。
+
+    参数:
+        lp_log_file (str): lp.log 文件的路径。
+
+    返回:
+        float: 错误页面传输的总持续时间（秒）。
+    """
+    connect_pattern = re.compile(r'\(([\d\.]+)\)\s+Connecting to server\s+[\d\.]+:\d+')
+    disconnect_pattern = re.compile(r'\(([\d\.]+)\)\s+page-xfer:\s+Disconnect from the page server')
+
+    transfer_durations = []
+    connect_time = None
+
+    with open(lp_log_file, 'r') as f:
+        for line in f:
+            # 匹配错误页面传输开始
+            connect_match = connect_pattern.search(line)
+            if connect_match:
+                connect_time = float(connect_match.group(1))
+                #print(f"Error Page Transfer Started at: {connect_time} seconds")
+                continue
+
+            # 匹配错误页面传输完成
+            disconnect_match = disconnect_pattern.search(line)
+            if disconnect_match and connect_time is not None:
+                disconnect_time = float(disconnect_match.group(1))
+                duration = disconnect_time - connect_time
+                transfer_durations.append(duration)
+                #print(f"Error Page Transfer Finished at: {disconnect_time} seconds, Duration: {duration} seconds")
+                # 重置开始时间以便处理下一个传输
+                connect_time = None
+
+    total_error_transfer_time = sum(transfer_durations)
+    return total_error_transfer_time*1000
+
+
+
+
+# 页面大小（通常为4KB）
+page_size = 4096
 def migrate_server():
     HOST = ''   # Symbolic name meaning all available interfaces
     PORT = 18863
@@ -267,6 +333,7 @@ def migrate_server():
 
                     case {'pageserver':_}:
                         #os.system('criu -V')
+                        postcopy = 1
                         mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
                         umount_cmd = 'umount ' + msg['pageserver']['path']
 
@@ -319,43 +386,63 @@ def migrate_server():
 
                         old_cwd = os.getcwd()
                         os.chdir(msg['restore']['path'])
-                        #The following command is the restore command, which resotres execution of the container at destination
+
+                        # 构建恢复命令
                         cmd = 'time -p runc restore --console-socket ' + msg['restore']['path']
-                        cmd += '/console.sock -d --image-path ' + msg['restore']['image_path']
+                        cmd += '/console.sock -d  --image-path ' + msg['restore']['image_path']
                         cmd += ' --work-path ' + msg['restore']['path'] + "/migrate/r_log"
                         if tty:
                             cmd += ' --shell-job'
                         if netdump:
                             cmd += ' --tcp-established'
-                        #In case of a post-copy phase in the migration technique, the restore command restores the process without filling out the entire memory contents.
-                        #When the --lazy-pages option is used, restore registers the lazy virtual memory areas (VMAs) with the userfaultfd mechanism. The lazy pages are completely handled by dedicated lazy-pages daemon.
-                        #The daemon receives userfault file descriptors from restore via UNIX socket.
                         if lazy:
                             cmd += ' --lazy-pages'
                         cmd += ' ' + msg['restore']['name']
-                        print("Running " +  cmd)
-                        start = time.perf_counter() * 1000
-                        p = subprocess.Popen(cmd, shell=True)
-                        
-                        #This new command starts the lazy-pages daemon. The daemon monitors the UFFD events and repopulates the tasks address space by requesting lazy pages to the page server running on the source.
-                        #Please, read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/Userfaultfd for more information.
-                        #The daemon tracks and prints the flow of time and clearly prints when it starts requesting faulted pages and when it finishes, along with an indication of the number of transferred faulted pages.
-                        #Note that each page is 4KB.       
+                        print("Restore command: " + cmd)
+
+                        # 如果启用了懒恢复，先启动 lazy-pages 守护进程
                         if lazy:
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
                             lazy_cmd += " --port 27 -v4 -D "
                             lazy_cmd += msg['restore']['image_path']
                             lazy_cmd += " -W " + msg['restore']['path'] + "/migrate/r_log"
                             lazy_cmd += " -o " + msg['restore']['path'] + "/migrate/r_log/lp.log"
-                            print ("Running lazy-pages server: " + lazy_cmd)
+                            print("Running lazy-pages server: " + lazy_cmd)
+                            # 启动 lazy-pages 守护进程
                             lp = subprocess.Popen(lazy_cmd, shell=True)
+                            # 为了确保 lazy-pages.socket 已经创建，等待片刻
+                            time.sleep(1)  # 等待 1 秒，您可以根据需要调整时间
+
+                        # 现在启动 runc restore 命令
+                        print("Running restore command...")
+                        start = time.perf_counter() * 1000
+                        p = subprocess.Popen(cmd, shell=True)
                         ret = p.wait()
                         end = time.perf_counter() * 1000
+
+                        if lazy:
+                            # 等待 lazy-pages 守护进程结束
+                            lp.wait()
+
                         if ret == 0:
-                            reply = "runc restored %s successfully with %.3f ms" % (msg['restore']['name'], end - start)
+                            print(123)
+                            if lazy:
+                                print(456)
+                                lp_log_file = msg['restore']['path'] + "/migrate/r_log/lp.log"
+                                restore_log_file =msg['restore']['path'] + "/migrate/r_log/restore.log" 
+                                total_uffd_copy = calculate_uffd_copy(lp_log_file)
+                                error_transfer_time = get_error_page_transfer_time(lp_log_file)
+                                # 将 total_uffd_copy 从字节转换为 KB，保留两位小数
+                                total_uffd_copy_kb = total_uffd_copy / 1024.0
+                          
+                                reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, error_transfer_time: %.2f ms" % (
+    msg['restore']['name'], end - start, total_uffd_copy_kb, error_transfer_time)
+                            else:
+                                reply = "runc restored %s successfully with %.3f ms" % (msg['restore']['name'], end - start)
                         else:
                             reply = "runc failed(%d)" % ret
                         os.chdir(old_cwd)
+
                     case _:
                         print("Unknown request: " + msg)
                         reply = 'unknown request'

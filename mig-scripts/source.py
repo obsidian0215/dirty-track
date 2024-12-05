@@ -70,6 +70,20 @@ mig_time = 0.0
 chk_time = 0.0
 rst_time = 0.0
 xfer_time = 0.0
+# [tang change]定义全局变量用于累计预拷贝时间和大小
+pre_dump_time_total = 0.0  # 毫秒
+pre_dump_size_total = 0.0  # 字节
+pre_dump_transfer_time_total = 0.0  # 毫秒
+
+# 定义全局变量用于记录最后一次 dump 的时间和大小
+dump_time_total = 0.0                # 毫秒
+dump_size_total = 0.0                # 字节
+dump_transfer_time_total = 0.0        # 毫秒
+
+# post
+total_uffd_copy = 0.0
+error_transfer_time = 0.0
+
 
 # 初始化迭代和处理过的dirtymap文件
 iter_dirtymaps = []
@@ -385,7 +399,7 @@ def notify_transfer_vip(cs):
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
 def pre_dump(mig_base, container, i, dirtymap):
-    global chk_time
+    global chk_time, pre_dump_time_total, pre_dump_size_total,parent_path   #[change] 添加 pre_dump 的全局变量
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     cmd = 'runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}'.format(i, i)
@@ -400,10 +414,14 @@ def pre_dump(mig_base, container, i, dirtymap):
     end = time.perf_counter() * 1000
     print ("%s finished after %.3f ms with %d" % (cmd, end - start, ret))
     chk_time += end - start
+    pre_dump_time_total += (end - start)# 累计预拷贝时间
     os.chdir(old_cwd)
     if ret != 0:
         error()
-
+ # 计算并记录预拷贝的大小
+    # pre_dump_size = convert_byte(getdirsize(parent_path[i], 'pages'))[0] * 1024 * 1024  # 转换为字节
+    # pre_dump_size_total += pre_dump_size  # 累计预拷贝大小
+    # print('PRE-DUMP size: {}M\t{}'.format(convert_byte(pre_dump_size)[0], parent_path[i]))
 #create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
 #dump is stored in the image directory.
 #in case of pre-dump present, specify it is in the parent directory.
@@ -415,7 +433,7 @@ def pre_dump(mig_base, container, i, dirtymap):
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
 def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay):
-    global chk_time    
+    global chk_time, dump_time_total, dump_size_total, dump_transfer_time_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     
@@ -474,30 +492,75 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     if ret != 0:
         error()
 
+    # 计算并记录 dump 的大小和时间
+    dump_time_total = (end-start)
 #Transfer the previously created pre-dump using rsync
 def xfer_pre_dump(parent_path, dest, base_path, i):
-    global xfer_time
+    global xfer_time, pre_dump_transfer_time_total,pre_dump_size_total  # 添加 pre_dump_transfer_time_total
     sys.stdout.write('PRE-DUMP size: ')
     sys.stdout.flush()
-    cmd = 'du -hs %s' % parent_path
-    ret = os.system(cmd)
+    #cmd = 'du -hs %s' % parent_path
+    #ret = os.system(cmd)
+    cmd_du = ['du', '-hs', parent_path]
+    try:
+        result_du = subprocess.run(cmd_du, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        pre_dump_size_str = result_du.stdout.strip()  # 例如 "199M\t/path/to/parent_i"
+        print(pre_dump_size_str)
+        
+        # 解析大小（可选）
+        size_str, _ = pre_dump_size_str.split('\t')
+        size_value, size_unit = size_str[:-1], size_str[-1]
+        size_multiplier = {'K': 1024, 'M': 1024**2, 'G': 1024**3}
+        pre_dump_size = float(size_value) * size_multiplier.get(size_unit.upper(), 1)
+        pre_dump_size_total += pre_dump_size  # 累计预拷贝大小
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing du command: {e.stderr}")
+        pre_dump_size_str = "0B\t/path/to/parent_i"  # 赋予默认值或根据需要处理
+        print(pre_dump_size_str)
+        pre_dump_size = 0.0
+        pre_dump_size_total += pre_dump_size
+        error()
+
     cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, parent_path, dest, base_path)
     print("Transferring PRE-DUMP %d to %s" % (i, dest))
     start = time.perf_counter() * 1000
     ret = os.system(cmd)
     end = time.perf_counter() * 1000
     print("PRE-DUMP %d transfer time %.3f ms" % (i, end - start))
+    # 累计传输时间
+    pre_dump_transfer_time_total += (end -start)
     xfer_time += end -start
     if ret != 0:
         error()
+# 解析大小字符串，转换为以 KB 为单位的浮点数
+def parse_size(size_str):
+    size_multiplier = {'K': 1, 'M': 1024, 'G': 1024 * 1024}
+    unit = size_str[-1].upper()
+    if unit in size_multiplier:
+        size = float(size_str[:-1]) * size_multiplier[unit]
+    else:
+        size = float(size_str)  # 默认单位为字节，保持为原始值
+        size = size / 1024  # 转换为 KB
+    return size
 
 #Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, base_path):
-    global xfer_time
+    global xfer_time,dump_size_total,dump_time_total,dump_transfer_time_total
     sys.stdout.write('DUMP size: ')
     sys.stdout.flush()
-    cmd = 'du -hs %s' % image_path
-    ret = os.system(cmd)
+    #cmd = 'du -hs %s' % image_path
+    #ret = os.system(cmd)
+    cmd_du = ['du', '-hs', image_path]
+    try:
+        result = subprocess.run(cmd_du, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        # 提取大小部分
+        dump_size_str = result.stdout.strip().split('\t')[0]  # 例如 "124K"
+        dump_size_total = parse_size(dump_size_str)
+        print(dump_size_total)  # 继续打印输出
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing du command: {e.stderr}")
+        dump_size_total = "0B\t/path/to/image"  # 赋予默认值或根据需要处理
+        error()
     cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, image_path, dest, base_path)
     print("Transferring DUMP to %s" % dest)
     start = time.perf_counter() * 1000
@@ -505,6 +568,7 @@ def xfer_final(image_path, dest, base_path):
     end = time.perf_counter() * 1000
     print("DUMP transfer time %.3f ms" % (end - start))
     xfer_time += end -start
+    dump_transfer_time_total = end-start
     if ret != 0:
         error()
 
@@ -582,7 +646,9 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     if dirtymap:
         try:
             global device_fd
-            device_fd = open(DEVICE_PATH, 'wb')
+            global device_file
+            device_file = open(DEVICE_PATH, 'wb')
+            device_fd = device_file.fileno()
         except FileNotFoundError:
             print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
             sys.exit(1)
@@ -712,14 +778,73 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
                     rst_time = float(answer_list[-2])
         else:
             print("can't confirm VIP has been transfered, can't restore on destination")
-    
+ # 最后传输容器剩余状态
+    xfer_final(image_path, dest, mig_base)
+    dir_size = convert_byte(getdirsize(image_path))
+    print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
+
+    #send the restore command
+    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+    restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
+    cs.send(bytes(restore_cmd, encoding='utf-8'))
+
+    # while True:
+    #     #select.select calls the Unix select() system call
+    #     #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
+    #     #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
+    #     # post拷贝这里会很慢，把时间设置的大一点，就可以得到恢复时间了
+    #     inputready, outputready, exceptready = select.select(input, [], [], 5)
+
+    #     #If after 5 seconds there is nothing to read, then exit
+    #     if not inputready:
+    #         break
+
+    #     #If there is something in input to read (e.g., from the socket), then print it
+    #     for s in inputready:
+    #         answer = s.recv(1024).decode("utf-8")
+    #         print("answer is here:",answer)
+    #         answer_list = answer.split()
+    #         rst_time = float(answer_list[-2])
+
+    #select.select calls the Unix select() system call
+    #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
+    #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
+    # post拷贝这里会很慢，把时间设置的大一点，就可以得到恢复时间了
+    inputready, outputready, exceptready = select.select(input, [], [], 200)
+    #If there is something in input to read (e.g., from the socket), then print it
+    global total_uffd_copy,error_transfer_time
+    for s in inputready:
+        answer = s.recv(1024).decode("utf-8")
+        print(answer)
+        if "runc restored" in answer:
+            # 使用正则表达式提取数据
+            pattern = r"runc restored .* successfully with (\d+\.\d+) ms(?:, total_uffd_copy: (\d+\.\d+) KB, error_transfer_time: (\d+\.\d+) ms)?"
+            match = re.search(pattern, answer)
+            if match:
+                rst_time = float(match.group(1))
+                print("Restore time: {:.3f} ms".format(rst_time))
+                # 检查是否匹配到了 total_uffd_copy 和 error_transfer_time
+                if match.group(2) and match.group(3):
+                    total_uffd_copy = float(match.group(2))
+                    error_transfer_time = float(match.group(3))
+                    print("Total uffd copy: {:.2f} KB".format(total_uffd_copy))
+                    print("Error transfer time: {:.2f} ms".format(error_transfer_time))
+                else:
+                    # 如果没有匹配到，说明这是预拷贝的回复
+                    total_uffd_copy = None
+                    error_transfer_time = None
+            else:
+                print("Failed to parse reply:", answer)
+        else:
+            print("Received reply:", answer)
+  
     #after migration, rootfs sync process and opened files will be closed
     if rootfs:
         p.terminate()
         f.close()
     
     if dirtymap:
-        device_fd.close()
+        device_file.close()
 
     return True
 
@@ -781,10 +906,14 @@ if __name__ == '__main__':
     if args.replay and args.post:
         parser.error("Post-copy conflicted with replay.")
 
-    if args.pre and not args.iter:
-        max_iter = 5
+    if args.pre:
+        if args.iter:
+            max_iter = args.iter
+        else:
+            max_iter = 5
     else:
-        max_iter = args.iter
+        max_iter = 0  # 当未启用预拷贝时，将 max_iter 设为 0
+
 
     
     #The name of the container is the first argument
@@ -841,6 +970,80 @@ if __name__ == '__main__':
     mig_time = chk_time + rst_time
     print('total migration time is {:.3f}ms'.format(mig_time))
 
+
+    print("-----------------------for note------------")
+# 输出累计的预拷贝时间和大小
+    if pre:
+        print('Total pre-dump time: {:.0f} ms'.format(pre_dump_time_total))
+        print('Total pre-dump transfer time: {:.0f} ms'.format(pre_dump_transfer_time_total))
+        
+
+    # 输出 dump 的时间和大小
+    print('Total dump time: {:.0f} ms'.format(dump_time_total))
+    print('Total dump transfer time: {:.0f} ms'.format(dump_transfer_time_total))
+
+    print('resume time (pre dump can use):{:.0f} ms '.format(rst_time))
+    if pre:
+        print('Total pre-dump size: {:.2f} MB'.format(pre_dump_size_total / (1024 * 1024)))  # 转换为 MB
+    print('Total dump size:', dump_size_total,'KB')  # 直接输出字符串
+
+    if pre and not post:
+        total_time = pre_dump_time_total + pre_dump_transfer_time_total + dump_time_total + dump_transfer_time_total+rst_time
+    elif not pre and post:
+        total_time = dump_time_total + dump_transfer_time_total+rst_time + error_transfer_time
+    elif pre and post:
+        total_time = pre_dump_time_total + pre_dump_transfer_time_total + dump_time_total + dump_transfer_time_total+rst_time+error_transfer_time
+
+
+    stop_time = dump_time_total + dump_transfer_time_total+rst_time
+    
+    print(f"total migrate time: {total_time:.0f} ms",)
+    print(f"stop time: {stop_time:.0f} ms" )
+
+    if post:
+        print('Faulted pages transfer time（ms）: {:.0f} ms'.format(error_transfer_time))
+        print('Faulted pages size(KB): {:.2f} KB'.format(total_uffd_copy))
+
+    #input()
     # 迁移完成后，执行后处理
+
+
+    # for excel
+
+   # 输出数据行
+    output_values = []
+
+    if pre:
+        output_values.extend([
+            int(round(pre_dump_time_total)),
+            int(round(pre_dump_transfer_time_total))
+        ])
+
+    output_values.extend([
+        int(round(dump_time_total)),
+        int(round(dump_transfer_time_total)),
+        int(round(rst_time))
+    ])
+
+    if pre:
+        output_values.append('{:.2f}'.format(pre_dump_size_total / (1024 * 1024)))  # 预拷贝大小仍以 MB 为单位
+    else:
+        output_values.append('')
+
+    output_values.append('{:.2f}'.format(dump_size_total))  # dump_size_total 已经是以 KB 为单位的浮点数
+
+    output_values.extend([
+        int(round(total_time)),
+        int(round(stop_time))
+    ])
+
+    if post:
+        output_values.extend([
+            '{:.2f}'.format(total_uffd_copy),
+            int(round(error_transfer_time))
+        ])
+
+    print('\t'.join(map(str, output_values)))
+
     if diskless:
         post_process(max_iter)
