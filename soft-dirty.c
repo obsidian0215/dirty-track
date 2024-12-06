@@ -327,7 +327,7 @@ int main(int argc, char *argv[]) {
 
         // 计算 sleep 时间（微秒），为运行时间的5倍
         unsigned int sleep_time_us = (unsigned int)(last_run_duration / 1000);
-        if (sleep_time_us == 0) {
+        if (sleep_time_us > 10000) {
             sleep_time_us = 10000; // 最小睡眠时间为10ms
         }
 
