@@ -28,8 +28,8 @@ typedef struct dirty_page {
 // 链表头
 dirty_page_t *dirty_head = NULL;
 
-// 全局变量：存储上一次 track_dirty_pages 运行的时间（秒）
-double last_run_duration = 0.0;
+// 全局变量：存储上一次 track_dirty_pages 运行的时间（纳秒）
+long last_run_duration = 0;
 
 // 标志位，用于捕获 Ctrl+C
 volatile sig_atomic_t stop = 0;
@@ -318,15 +318,15 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // 计算运行时间（秒）
-        last_run_duration = (end_time.tv_sec - start_time.tv_sec) +
-                            (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+        // 计算运行时间（ns）
+        last_run_duration = (end_time.tv_sec - start_time.tv_sec) * 1000000000L +
+                               (end_time.tv_nsec - start_time.tv_nsec);
 
         // 输出运行时间
-        printf("Dirty-track run time: %.6f seconds\n", last_run_duration);
+        printf("Dirty-track run time: %ld ns\n", last_run_duration);
 
         // 计算 sleep 时间（微秒），为运行时间的5倍
-        unsigned int sleep_time_us = (unsigned int)(last_run_duration * 5 * 1e6);
+        unsigned int sleep_time_us = (unsigned int)(last_run_duration / 1000);
         if (sleep_time_us == 0) {
             sleep_time_us = 10000; // 最小睡眠时间为10ms
         }
