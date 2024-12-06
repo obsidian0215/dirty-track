@@ -28,6 +28,9 @@ typedef struct dirty_page {
 // 链表头
 dirty_page_t *dirty_head = NULL;
 
+// 全局变量：存储上一次 track_dirty_pages 运行的时间（秒）
+double last_run_duration = 0.0;
+
 // 标志位，用于捕获 Ctrl+C
 volatile sig_atomic_t stop = 0;
 
@@ -221,6 +224,13 @@ int track_dirty_pages(pid_t pid, dirty_page_t **dirty_head) {
                 continue;
             }
         }
+
+        // 在遍历完一个内存区域后，清除 soft-dirty 位
+        if (enable_soft_dirty_tracking(pid) != 0) {
+            fprintf(stderr, "Failed to clear soft-dirty bits for PID %d\n", pid);
+            // 可选择继续或中断，这里选择继续
+            continue;
+        }
     }
 
     fclose(maps);
@@ -288,11 +298,41 @@ int main(int argc, char *argv[]) {
 
     // 持续追踪脏页，直到用户中断
     while (!stop) {
+        struct timespec start_time, end_time;
+
+        // 获取开始时间
+        if (clock_gettime(CLOCK_MONOTONIC, &start_time) != 0) {
+            perror("clock_gettime");
+            break;
+        }
+
+        // 追踪脏页
         if (track_dirty_pages(pid, &dirty_head) != 0) {
             fprintf(stderr, "Failed to track dirty pages for PID %d\n", pid);
             break;
         }
-        usleep(10); // 每10ms扫描一次
+
+        // 获取结束时间
+        if (clock_gettime(CLOCK_MONOTONIC, &end_time) != 0) {
+            perror("clock_gettime");
+            break;
+        }
+
+        // 计算运行时间（秒）
+        last_run_duration = (end_time.tv_sec - start_time.tv_sec) +
+                            (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+
+        // 输出运行时间
+        printf("Dirty-track run time: %.6f seconds\n", last_run_duration);
+
+        // 计算 sleep 时间（微秒），为运行时间的5倍
+        unsigned int sleep_time_us = (unsigned int)(last_run_duration * 5 * 1e6);
+        if (sleep_time_us == 0) {
+            sleep_time_us = 10000; // 最小睡眠时间为10ms
+        }
+
+        // 休眠
+        usleep(sleep_time_us);
     }
 
     printf("\nStopping dirty page tracking for PID %d.\n", pid);
