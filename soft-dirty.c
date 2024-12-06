@@ -170,8 +170,8 @@ int enable_soft_dirty_tracking(pid_t pid) {
         return -1;
     }
 
-    // 写入 "0" 以清除 soft-dirty 位
-    if (write(fd, "0", 1) != 1) {
+    // 写入 "4" 以清除 soft-dirty 位
+    if (write(fd, "4", 1) != 1) {
         perror("write clear_refs");
         close(fd);
         return -1;
@@ -179,22 +179,6 @@ int enable_soft_dirty_tracking(pid_t pid) {
 
     close(fd);
     return 0;
-}
-
-// 函数：确定映射的页大小
-unsigned long get_mapping_page_size(unsigned long start, unsigned long end, const char *perms, const char *pathname) {
-    unsigned long size = end - start;
-
-    // 简单的推断：如果映射大小是 2MB 的倍数，且可能使用了 hugetlbfs
-    if (size % PAGE_SIZE_2M == 0) {
-        if (pathname && strlen(pathname) > 0) {
-            if (strstr(pathname, "huge")) { // 依据路径名包含 "huge" 来推断
-                return PAGE_SIZE_2M;
-            }
-        }
-    }
-
-    return PAGE_SIZE_4K;
 }
 
 // 遍历 /proc/[pid]/maps 并检查 Soft-Dirty 位
@@ -226,22 +210,12 @@ int track_dirty_pages(pid_t pid, dirty_page_t **dirty_head) {
         if (strchr(perms, 'w') == NULL)
             continue;
 
-        // 确定映射的页大小
-        unsigned long page_size = get_mapping_page_size(start, end, perms, pathname);
-
-        // 遍历该映射中的每个页
-        for (unsigned long addr = start; addr < end; addr += page_size) {
+        // 按4KB遍历每个页
+        for (unsigned long addr = start; addr < end; addr += PAGE_SIZE_4K) {
             int dirty = is_soft_dirty(pid, addr);
             if (dirty == 1) {
-                if (page_size == PAGE_SIZE_4K) {
-                    // 4KB 页，直接处理该地址
-                    add_or_update_dirty_page(dirty_head, addr);
-                } else if (page_size == PAGE_SIZE_2M) {
-                    // 2MB 页，处理所有包含的4KB子页
-                    for (unsigned long sub_addr = addr; sub_addr < addr + PAGE_SIZE_2M; sub_addr += PAGE_SIZE_4K) {
-                        add_or_update_dirty_page(dirty_head, sub_addr);
-                    }
-                }
+                // 4KB 页，直接处理该地址
+                add_or_update_dirty_page(dirty_head, addr);
             } else if (dirty == -1) {
                 // 出错处理，可选择记录日志或忽略
                 continue;
@@ -318,7 +292,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Failed to track dirty pages for PID %d\n", pid);
             break;
         }
-        sleep(1); // 每秒扫描一次
+        usleep(10); // 每10ms扫描一次
     }
 
     printf("\nStopping dirty page tracking for PID %d.\n", pid);
