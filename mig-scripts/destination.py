@@ -398,7 +398,7 @@ def migrate_server():
                         cmd += ' ' + msg['restore']['name']
                         print("Restore command: " + cmd)
 
-                        # 如果启用了懒恢复，先启动 lazy-pages 守护进程
+                        # 若启用post-copy，则先启动lazy-pages守护进程
                         if lazy:
                             lazy_cmd = "criu lazy-pages --page-server --address " + addr
                             lazy_cmd += " --port 27 -v4 -D "
