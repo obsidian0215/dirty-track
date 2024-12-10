@@ -84,6 +84,7 @@ dump_transfer_time_total = 0.0        # 毫秒
 total_uffd_copy = 0.0
 error_transfer_time = 0.0
 
+PAGE_SIZE = 4096  # 每页大小为4KB
 
 # 初始化迭代和处理过的dirtymap文件
 iter_dirtymaps = []
@@ -183,7 +184,7 @@ def execute_dirty_track(device_fd, first):
             print(f"启动对PID {pid}的脏页跟踪")
 
     # 等待一段时间以收集脏页数据
-    time.sleep(0.3)  # 根据实际情况调整等待时间
+    time.sleep(0.2)  # 根据实际情况调整等待时间
 
     # 停止所有容器进程的脏页跟踪
     for pid in container_pids:
@@ -195,6 +196,116 @@ def execute_dirty_track(device_fd, first):
     # print(f"脏页跟踪目录路径: {dirty_map_path}")
 
     # return dirty_map_path
+
+def read_unsigned_long(file_path):
+    """
+    读取包含ulong64数字的二进制文件，返回一个列表
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+            count = len(data) // 8  # sizeof(unsigned long)
+            return list(struct.unpack('<' + 'Q' * count, data))
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return []
+
+def read_dirtymap(file_path):
+    """
+    读取dirtymap文件，返回其中记录的脏页地址
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+            entry_size = 12  # sizeof(unsigned long) + sizeof(unsigned int)
+            if len(data) % entry_size != 0:
+                print(f"Invalid dirtymap file size: {len(data)} bytes")
+                return []
+            count = len(data) // entry_size
+            addresses = []
+            for i in range(count):
+                entry = data[i*entry_size:(i+1)*entry_size]
+                address, write_count = struct.unpack('<QI', entry)
+                addresses.append(address)
+            return addresses
+    except Exception as e:
+        print(f"Error reading dirtymap file {file_path}: {e}")
+        return []
+
+def merge_addresses(dirty_addresses, candidate_addresses):
+    """
+    去重合并脏页地址和候选页地址
+    """
+    merged = []
+    i = j = 0
+    len_dirty = len(dirty_addresses)
+    len_candidate = len(candidate_addresses)
+    
+    while i < len_dirty and j < len_candidate:
+        if dirty_addresses[i] < candidate_addresses[j]:
+            merged.append(dirty_addresses[i])
+            i += 1
+        elif dirty_addresses[i] > candidate_addresses[j]:
+            merged.append(candidate_addresses[j])
+            j += 1
+        else:
+            merged.append(dirty_addresses[i])
+            i += 1
+            j += 1
+    
+    while i < len_dirty:
+        merged.append(dirty_addresses[i])
+        i += 1
+    
+    while j < len_candidate:
+        merged.append(candidate_addresses[j])
+        j += 1
+    
+    return merged
+
+def pid_may_dump_size(addresses):
+    """
+    计算单个进程的内存大小（单位：字节）。
+    """
+    return len(addresses) * PAGE_SIZE
+
+def container_may_dump_size(container_pids, dirtymap_path):
+    """
+    遍历container_pids，计算每个pid的脏页列表，合并去重，计算总传输大小
+    """
+    total_transfer_size = 0
+    
+    for pid in container_pids:
+        # 步骤1: 读取timestamp_list.pid
+        timestamp_list_file = os.path.join(dirtymap_path, f"timestamp_list.{pid}")
+        timestamps = read_unsigned_long(timestamp_list_file)
+        if not timestamps:
+            print(f"No timestamps found for pid {pid}. Skipping.")
+        
+        latest_timestamp = timestamps[-1] if timestamps else 0
+
+        # 步骤2: 加载最新的dirtymap
+        if latest_timestamp != 0:
+            dirtymap_file = os.path.join(dirtymap_path, f"{pid}-{latest_timestamp}.dirtymap")
+            dirty_addresses = read_dirtymap(dirtymap_file)
+            print(f"[PID {pid}] Loaded {len(dirty_addresses)} dirty addresses")
+        else:
+            dirty_addresses = []
+            print(f"[PID {pid}] No latest dirtymap found.")
+
+        # 步骤3: 读取candidate_list.pid
+        candidate_list_file = os.path.join(dirtymap_path, f"candidate_list.{pid}")
+        candidate_addresses = read_unsigned_long(candidate_list_file)
+        print(f"[PID {pid}] Loaded {len(candidate_addresses)} candidate addresses")
+
+        # 步骤4: 合并并去重
+        merged_addresses = merge_addresses(dirty_addresses, candidate_addresses)
+        print(f"[PID {pid}] Merged {len(merged_addresses)} addresses that may be dumped")
+
+        # 将地址添加到总集合中
+        total_transfer_size += pid_may_dump_size(merged_addresses)
+    
+    return total_transfer_size
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
@@ -635,12 +746,11 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
 
     prepare(mig_base, image_path, parent_path, work_path)
 
-    # 测量初始带宽和最大传输值
+    # 测量初始带宽和状态传输最大值(Bytes)
     global mea_bandwidth, max_xfer_size
     mea_bandwidth = measure_bandwidth(dest)
-    max_xfer_size = mea_bandwidth * time_constraint / 1000
+    max_xfer_size = mea_bandwidth * time_constraint
     # print(f"current bandwidth is {mea_bandwidth}")
-
 
     # 打开dirty-track设备
     if dirtymap:
@@ -724,7 +834,6 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         # iter pre-dump
         last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
             # diskless_pre_dump(base_path, container, dest)
-            # xfer_pre_dump(parent_path, dest, base_path)
         # else:
             # pre_dump(base_path, container)
             # xfer_pre_dump(parent_path, dest, base_path)
@@ -740,50 +849,45 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     if dirtymap and not pre:
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
-    # print(dirtymap)
-    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
-    if replay:
-        ret = transfer_vip()
-        if ret == 0:
-            ret = notify_transfer_vip(cs)
-        # 确认VIP漂移后再恢复
-        if ret == 0:
-            # todo: 创建转发路由
-            
-            # 最后传输容器剩余状态
-            xfer_final(image_path, dest, mig_base)
-            dir_size = convert_byte(getdirsize(image_path))
-            print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
-            #send the restore command
-            restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
-            restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
-            cs.send(bytes(restore_cmd, encoding='utf-8'))
+    # todo: 获取容器尚未传输的内存状态大小，判断是否post-copy
+    # 读取timestamp_list.pid文件，获取最新的dirty-map
+    # 读取dirty-map中的被跳过温页和热页
+    # 读取candidate_list.pid文件维护的候选页
+    # 将两者累计并预计最终传输的内存状态大小(*4KB)
+    if dirtymap:
+        # 计算传输大小
+        total_transfer_size = container_may_dump_size(container_pids, dirtymap_path)
+        print(f"Container may dump {total_transfer_size} bytes of memory")
 
-            while True:
-                #select.select calls the Unix select() system call
-                #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
-                #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
-                inputready, outputready, exceptready = select.select(input, [], [], 5)
-
-                #If after 5 seconds there is nothing to read, then exit
-                if not inputready:
-                    break
-
-                #If there is something in input to read (e.g., from the socket), then print it
-                for s in inputready:
-                    answer = s.recv(1024).decode("utf-8")
-                    print(answer)
-                    answer_list = answer.split()
-                    rst_time = float(answer_list[-2])
+        # 步骤6: 与max_xfer_size比较
+        if total_transfer_size > 0.8 * max_xfer_size:
+            print(f"Exceed max_xfer_size {max_xfer_size}, post-copy is needed")
+            if not post:
+                print("[Warning]post-copy is not enabled, pre-copy may failed")
         else:
-            print("can't confirm VIP has been transfered, can't restore on destination")
- # 最后传输容器剩余状态
+            print(f"We can transfer within one-shot stop&dump")
+            if post:
+                post = False
+
+    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
+    ret = transfer_vip()
+    if ret == 0:
+        ret = notify_transfer_vip(cs)
+    # 确认VIP漂移后再恢复
+    if ret != 0:
+        print("can't confirm VIP has been transfered, can't restore on destination")
+        error()
+    
+    # 传输容器剩余状态
     xfer_final(image_path, dest, mig_base)
     dir_size = convert_byte(getdirsize(image_path))
     print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
-    #send the restore command
+    # if replay:
+    #     # todo: 创建转发路由
+
+    # one-shot restore with post-copy
     restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
@@ -792,7 +896,6 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     #     #select.select calls the Unix select() system call
     #     #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
     #     #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
-    #     # post拷贝这里会很慢，把时间设置的大一点，就可以得到恢复时间了
     #     inputready, outputready, exceptready = select.select(input, [], [], 5)
 
     #     #If after 5 seconds there is nothing to read, then exit
@@ -806,11 +909,11 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     #         answer_list = answer.split()
     #         rst_time = float(answer_list[-2])
 
-    #select.select calls the Unix select() system call
-    #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
-    #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
-    # post拷贝这里会很慢，把时间设置的大一点，就可以得到恢复时间了
-    inputready, outputready, exceptready = select.select(input, [], [], 200)
+    # post拷贝返回较慢，需要加大等待时间
+    if post:
+        inputready, outputready, exceptready = select.select(input, [], [], 200)
+    else:
+        inputready, outputready, exceptready = select.select(input, [], [], 5)
     #If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy,error_transfer_time
     for s in inputready:

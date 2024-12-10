@@ -276,8 +276,6 @@ def get_error_page_transfer_time(lp_log_file):
     return total_error_transfer_time*1000
 
 
-
-
 # 页面大小（通常为4KB）
 page_size = 4096
 def migrate_server():
