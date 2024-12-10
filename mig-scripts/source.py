@@ -833,10 +833,11 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
 
         # iter pre-dump
         last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
-            # diskless_pre_dump(base_path, container, dest)
-        # else:
-            # pre_dump(base_path, container)
-            # xfer_pre_dump(parent_path, dest, base_path)
+        #if diskless:
+        #   diskless_pre_dump(base_path, container, dest)
+        #else:
+        #   pre_dump(base_path, container)
+        #   xfer_pre_dump(parent_path, dest, base_path)
     else:
         last_iter = 0
 
