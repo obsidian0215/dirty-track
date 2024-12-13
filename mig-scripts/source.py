@@ -426,7 +426,7 @@ def measure_bandwidth(dest_ip):
         return 0
 
 # 流量控制函数
-def transfer_vip():
+def transfer_vip(new_prior):
     """
     降低源节点的优先级并触发 VIP 迁移到目标节点。
     """
@@ -446,10 +446,10 @@ def transfer_vip():
         # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
         pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
 
-        # 定义替换函数，将 priority 设置为较低的值（例如：50）
+        # 定义替换函数，将 priority设置为比目标节点较低的值
         def repl(match):
             original_priority = match.group(2)
-            new_priority = '50'  # 设置新的优先级
+            new_priority = new_prior  # 设置新的优先级
             print(f"将 VIP 的优先级从 {original_priority} 降低到 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
 
@@ -516,11 +516,14 @@ def notify_transfer_vip(cs, inputs):
 
 def async_vip_migration(cs, input):
     try:
-        ret = transfer_vip()
+        ret = transfer_vip('30')
         if ret == 0:
             ret = notify_transfer_vip(cs, inputs=input)
         if ret != 0:
             print("无法确认VIP已迁移，目标节点可能无法恢复")
+        else:
+            # 调整至目标节点原先的权重
+            transfer_vip('50')
     except Exception as e:
         print(f"VIP迁移过程中发生异常: {e}")
 
