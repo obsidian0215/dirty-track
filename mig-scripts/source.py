@@ -531,7 +531,7 @@ def async_vip_migration(cs, input):
 #pre-dump contains the entire content of the container virtual memory
 #pre-dump is stored in the parent directory
 def pre_dump(mig_base, container, i, dirtymap):
-    global chk_time, pre_dump_time_total, pre_dump_size_total,parent_path   #[change] 添加 pre_dump 的全局变量
+    global chk_time, pre_dump_time_total, pre_dump_size_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     cmd = 'runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}'.format(i, i)
@@ -550,10 +550,7 @@ def pre_dump(mig_base, container, i, dirtymap):
     os.chdir(old_cwd)
     if ret != 0:
         error()
- # 计算并记录预拷贝的大小
-    # pre_dump_size = convert_byte(getdirsize(parent_path[i], 'pages'))[0] * 1024 * 1024  # 转换为字节
-    # pre_dump_size_total += pre_dump_size  # 累计预拷贝大小
-    # print('PRE-DUMP size: {}M\t{}'.format(convert_byte(pre_dump_size)[0], parent_path[i]))
+
 #create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
 #dump is stored in the image directory.
 #in case of pre-dump present, specify it is in the parent directory.
@@ -562,7 +559,6 @@ def pre_dump(mig_base, container, i, dirtymap):
 #the page server will then read local memory dump and send memory pages upon request of the lazy-pages daemon running on the destination.
 #The page server listens on port 27.
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
-
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
 def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, input):
     global chk_time, dump_time_total, dump_size_total, dump_transfer_time_total
@@ -619,6 +615,7 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
         ret = p.wait()
 
     end = time.perf_counter() * 1000
+    chk_time += end - start
     print("%s finished after %.3f ms with %d" % (cmd, end - start, ret))
     os.chdir(old_cwd)
     if ret != 0:
@@ -707,7 +704,7 @@ def xfer_pre_dump(parent_path, dest, base_path, i):
 
 #Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, base_path):
-    global xfer_time,dump_size_total,dump_time_total,dump_transfer_time_total
+    global xfer_time, dump_size_total, dump_time_total, dump_transfer_time_total
     sys.stdout.write('DUMP size: ')
     sys.stdout.flush()
     #cmd = 'du -hs %s' % image_path
@@ -1131,14 +1128,10 @@ if __name__ == '__main__':
     migrate(container, dest, pre, post, replay, tty, netdump, rootfs,
                     max_iter, dirtymap, time_constraint)
 
-    if diskless:
-        print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))
-    else:
-        print('total checkpoint time is {:.3f}ms'.format(chk_time))
-        print('total transfer time is {:.3f}ms'.format(xfer_time))
-        chk_time += xfer_time
+    print('total checkpoint time is {:.3f}ms'.format(chk_time))
+    print('total transfer time is {:.3f}ms'.format(xfer_time))
     print('total restore time is {:.3f}ms'.format(rst_time))
-    mig_time = chk_time + rst_time
+    mig_time = chk_time + xfer_time + rst_time
     print('total migration time is {:.3f}ms'.format(mig_time))
 
 
