@@ -90,6 +90,10 @@ PAGE_SIZE = 4096  # 每页大小为4KB
 iter_dirtymaps = []
 processed_files = set()
 
+bandwidth_measurements = []  # List to store individual bandwidth measurements (Bytes/s)
+average_bandwidth = 0.0      # Average bandwidth (Bytes/s)
+bandwidth_stddev = 0.0       # Standard deviation of bandwidth (Bytes/s)
+
 # 通过ioctl设置脏页跟踪的目录路径
 def ioctl_set_dirty_map_path(device_fd, path):
     # 路径字符串打包为定长字节数组
@@ -240,7 +244,7 @@ def merge_addresses(dirty_addresses, candidate_addresses):
     i = j = 0
     len_dirty = len(dirty_addresses)
     len_candidate = len(candidate_addresses)
-    
+
     while i < len_dirty and j < len_candidate:
         if dirty_addresses[i] < candidate_addresses[j]:
             merged.append(dirty_addresses[i])
@@ -252,15 +256,15 @@ def merge_addresses(dirty_addresses, candidate_addresses):
             merged.append(dirty_addresses[i])
             i += 1
             j += 1
-    
+
     while i < len_dirty:
         merged.append(dirty_addresses[i])
         i += 1
-    
+
     while j < len_candidate:
         merged.append(candidate_addresses[j])
         j += 1
-    
+
     return merged
 
 def pid_may_dump_size(addresses):
@@ -274,14 +278,14 @@ def container_may_dump_size(container_pids, dirtymap_path):
     遍历container_pids，计算每个pid的脏页列表，合并去重，计算总传输大小
     """
     total_transfer_size = 0
-    
+
     for pid in container_pids:
         # 步骤1: 读取timestamp_list.pid
         timestamp_list_file = os.path.join(dirtymap_path, f"timestamp_list.{pid}")
         timestamps = read_unsigned_long(timestamp_list_file)
         if not timestamps:
             print(f"No timestamps found for pid {pid}. Skipping.")
-        
+
         latest_timestamp = timestamps[-1] if timestamps else 0
 
         # 步骤2: 加载最新的dirtymap
@@ -304,7 +308,7 @@ def container_may_dump_size(container_pids, dirtymap_path):
 
         # 将地址添加到总集合中
         total_transfer_size += pid_may_dump_size(merged_addresses)
-    
+
     return total_transfer_size
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
@@ -331,7 +335,7 @@ def prepare(base_path, image_path, parent_path, work_path):
                     shutil.rmtree(entry_path)
                 elif os.path.isdir(entry_path) and entry.startswith('pd_log'):
                     shutil.rmtree(entry_path)
-        except:     
+        except:
             pass
     else:
         os.mkdir(base_path)
@@ -350,7 +354,7 @@ def getdirsize(path, pattern=None):
     tsize = 0
     if not os.path.exists(path):
         return tsize
-    
+
     #skip soft link file
     if os.path.islink(path):
         return tsize
@@ -361,7 +365,7 @@ def getdirsize(path, pattern=None):
         if pattern:
             if pattern not in path:
                 return 0
-        
+
         return tsize
 
     if os.path.isdir(path):
@@ -387,7 +391,7 @@ def getdirsize(path, pattern=None):
         # else:
         #     print('the total size of {} is {}'.format(path, tsize))
         return tsize
-    
+
 def convert_byte(tsize):
     if tsize < 1024:
         return(round(tsize,2),'Byte')
@@ -407,7 +411,7 @@ def measure_bandwidth(dest_ip):
     print(f"开始测量到{dest_ip}的带宽")
     try:
         # 使用 iperf3 进行短时间带宽测量
-        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'], 
+        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             print("带宽测量失败:", result.stderr)
@@ -429,43 +433,43 @@ def transfer_vip():
         # 定义 Keepalived 配置文件路径和备份路径
         config_path = '/etc/keepalived/keepalived.conf'
         backup_path = '/etc/keepalived/keepalived.conf.bak'
-        
+
         # 备份原始配置文件
         shutil.copy(config_path, backup_path)
         print(f"已备份原始 Keepalived 配置文件到 {backup_path}")
-        
+
         # 读取原始配置文件内容
         with open(config_path, 'r') as f:
             config = f.read()
-        
+
         # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
         pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
-        
+
         # 定义替换函数，将 priority 设置为较低的值（例如：50）
         def repl(match):
             original_priority = match.group(2)
             new_priority = '50'  # 设置新的优先级
             print(f"将 VIP 的优先级从 {original_priority} 降低到 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
-        
+
         # 使用正则表达式替换 priority
         new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
-        
+
         if count == 0:
             print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
             return 1
-        
+
         # 将修改后的配置写回配置文件
         with open(config_path, 'w') as f:
             f.write(new_config)
         print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
-        
+
         # 重新加载 Keepalived 服务以应用更改
-        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'], 
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE, 
+        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
                                 text=True)
-        
+
         if result.returncode != 0:
             print(f"重新加载 Keepalived 服务失败：{result.stderr}")
             # 如果重新加载失败，可以选择恢复备份配置
@@ -476,7 +480,7 @@ def transfer_vip():
         else:
             print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
             return 0
-    
+
     except PermissionError:
         print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
         return 1
@@ -486,7 +490,7 @@ def transfer_vip():
     except Exception as e:
         print(f"发生错误：{e}")
         return 1
-    
+
 # 向dest发送提升优先级的通知
 def notify_transfer_vip(cs):
     vip_cmd = '{"transfer_vip"}'
@@ -500,7 +504,7 @@ def notify_transfer_vip(cs):
             if answer == 'OK':
                 return 0
             else:
-                return 1     
+                return 1
     else:
         print("can't confirm the VIP has been transfered")
         return 1
@@ -547,7 +551,7 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     global chk_time, dump_time_total, dump_size_total, dump_transfer_time_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    
+
     #cmd = 'runc checkpoint --image-path image --leave-running'
     cmd = 'runc checkpoint --image-path image --work-path d_log'
 
@@ -605,6 +609,17 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
 
     # 计算并记录 dump 的大小和时间
     dump_time_total = (end-start)
+
+# 解析大小字符串，转换为以Byte为单位
+def parse_size(size_str):
+    size_multiplier = {'K': 1024, 'M': 1024 * 1024, 'G': 1024 * 1024 * 1024}
+    unit = size_str[-1].upper()
+    if unit in size_multiplier:
+        size = float(size_str[:-1]) * size_multiplier[unit]
+    else:
+        size = float(size_str)  # 默认单位为字节，保持为原始值
+    return size
+
 #Transfer the previously created pre-dump using rsync
 def xfer_pre_dump(parent_path, dest, base_path, i):
     global xfer_time, pre_dump_transfer_time_total,pre_dump_size_total  # 添加 pre_dump_transfer_time_total
@@ -612,21 +627,26 @@ def xfer_pre_dump(parent_path, dest, base_path, i):
     sys.stdout.flush()
     #cmd = 'du -hs %s' % parent_path
     #ret = os.system(cmd)
-    cmd_du = ['du', '-hs', parent_path]
+    # bytes
+    cmd_du = ['du', '-bs', parent_path]
     try:
         result_du = subprocess.run(cmd_du, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        pre_dump_size_str = result_du.stdout.strip()  # 例如 "199M\t/path/to/parent_i"
-        print(pre_dump_size_str)
-        
+        predump_size_str = result_du.stdout.strip().split('\t')[0]  # 例如 "124K"
+        pre_dump_size = parse_size(predump_size_str)
+        print(pre_dump_size)  # 继续打印输出
+        # pre_dump_size_str = result_du.stdout.strip()  # 例如 "199M\t/path/to/parent_i"
+        # print(pre_dump_size_str)
+
         # 解析大小（可选）
-        size_str, _ = pre_dump_size_str.split('\t')
-        size_value, size_unit = size_str[:-1], size_str[-1]
-        size_multiplier = {'K': 1024, 'M': 1024**2, 'G': 1024**3}
-        pre_dump_size = float(size_value) * size_multiplier.get(size_unit.upper(), 1)
+        # size_str, _ = pre_dump_size_str.split('\t')
+        # size_value, size_unit = size_str[:-1], size_str[-1]
+        # size_multiplier = {'': 1, 'K': 1024, 'M': 1024**2, 'G': 1024**3}
+
+        # pre_dump_size = float(size_value) * size_multiplier.get(size_unit.upper(), 1)
         pre_dump_size_total += pre_dump_size  # 累计预拷贝大小
     except subprocess.CalledProcessError as e:
         print(f"Error executing du command: {e.stderr}")
-        pre_dump_size_str = "0B\t/path/to/parent_i"  # 赋予默认值或根据需要处理
+        pre_dump_size_str = "0 \t/path/to/parent_i"  # 赋予默认值或根据需要处理
         print(pre_dump_size_str)
         pre_dump_size = 0.0
         pre_dump_size_total += pre_dump_size
@@ -637,22 +657,24 @@ def xfer_pre_dump(parent_path, dest, base_path, i):
     start = time.perf_counter() * 1000
     ret = os.system(cmd)
     end = time.perf_counter() * 1000
-    print("PRE-DUMP %d transfer time %.3f ms" % (i, end - start))
+    transfer_time = end - start
+    print("PRE-DUMP %d transfer time %.3f ms" % (i, transfer_time))
     # 累计传输时间
-    pre_dump_transfer_time_total += (end -start)
-    xfer_time += end -start
+    pre_dump_transfer_time_total += transfer_time
+    xfer_time += transfer_time
+
+    # Calculate transfer speed (Bytes/s)
+    if transfer_time > 0:
+        transfer_speed = pre_dump_size / (transfer_time / 1000.0)  # Bytes per second
+    else:
+        transfer_speed = 0.0
+    print(f"Transfer speed for PRE-DUMP {i}: {transfer_speed:.2f} Bytes/s")
+
+    # Append to bandwidth measurements
+    bandwidth_measurements.append(transfer_speed)
+
     if ret != 0:
         error()
-# 解析大小字符串，转换为以 KB 为单位的浮点数
-def parse_size(size_str):
-    size_multiplier = {'K': 1, 'M': 1024, 'G': 1024 * 1024}
-    unit = size_str[-1].upper()
-    if unit in size_multiplier:
-        size = float(size_str[:-1]) * size_multiplier[unit]
-    else:
-        size = float(size_str)  # 默认单位为字节，保持为原始值
-        size = size / 1024  # 转换为 KB
-    return size
 
 #Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, base_path):
@@ -661,7 +683,8 @@ def xfer_final(image_path, dest, base_path):
     sys.stdout.flush()
     #cmd = 'du -hs %s' % image_path
     #ret = os.system(cmd)
-    cmd_du = ['du', '-hs', image_path]
+    # bytes
+    cmd_du = ['du', '-bs', image_path]
     try:
         result = subprocess.run(cmd_du, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         # 提取大小部分
@@ -707,17 +730,23 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
-        xfer_pre_dump(last_path, dest, mig_base, last_iter)        
+        xfer_pre_dump(last_path, dest, mig_base, last_iter)
 
-        dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
-        print('the total size of {} with pattern {} is {}{}'\
-                .format(last_path, 'pages', dir_size[0], dir_size[1]))
+        dir_size = getdirsize(parent_path[last_iter], 'pages')
+        print('the total size of {} with pattern {} is {} Bytes'\
+                .format(last_path, 'pages', dir_size))
+        average_bandwidth = statistics.mean(bandwidth_measurements)
+        if len(bandwidth_measurements) > 1:
+            bandwidth_stddev = statistics.stdev(bandwidth_measurements)
+        else:
+            bandwidth_stddev = 0.0
+        max_xfer_size = (average_bandwidth - bandwidth_stddev) * (time_constraint / 1000.0)  # Convert ms to seconds
         if getdirsize(last_path, 'pages') < max_xfer_size:
             break
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
-            if abs(getdirsize(last_path, 'pages') - getdirsize(less_last_path, 'pages')) < 102400 \
-                    or (getdirsize(last_path, 'pages') < 102400):     #100KB
+            if abs(getdirsize(last_path, 'pages') - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
+                    or (getdirsize(last_path, 'pages') < 1024 * 64):     #64KB
                 break
         last_iter += 1
         if last_iter >= max_iter:
@@ -747,9 +776,11 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     prepare(mig_base, image_path, parent_path, work_path)
 
     # 测量初始带宽和状态传输最大值(Bytes)
-    global mea_bandwidth, max_xfer_size
+    global max_xfer_size
+    # Measure initial bandwidth
     mea_bandwidth = measure_bandwidth(dest)
-    max_xfer_size = mea_bandwidth * time_constraint
+    max_xfer_size = mea_bandwidth * (time_constraint / 1000.0)  # Convert ms to seconds
+    bandwidth_measurements.append(mea_bandwidth)
     # print(f"current bandwidth is {mea_bandwidth}")
 
     # 打开dirty-track设备
@@ -762,7 +793,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         except FileNotFoundError:
             print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
             sys.exit(1)
-        
+
         # 迁移开始前配置dirty-map目录
         set_dirty_map_path(device_fd, dirtymap_path)
 
@@ -804,7 +835,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         search_cmd = 'runc list | grep ' + container
         container_exist = subprocess.getstatusoutput(search_cmd)
         #(0, 'redis-test   7289        running     /runc/containers/redis-test   2024-04-21T07:13:10.98300754Z   root')
-        
+
         #if the container is already running on the source, then we can transfer the rootfs
         #if the container is not running, then the script will exit
         if container_exist[0]:
@@ -817,18 +848,18 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         print("initial ROOTFS transfer time %.3f ms" % (end - start))
         if ret != 0:
             error()
-        
+
         #infinite sync loop
         f = open(mig_base + "/d_log/rootfs_sync_progress.logs", 'w')
         sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
         p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
-    
+
     if pre:
         if diskless:
             for i in range(0, max_iter):
                 mount_cmd = 'mount -t tmpfs none '+ parent_path[i]
                 ret = os.system(mount_cmd)
-                if ret != 0:   
+                if ret != 0:
                     error()
 
         # iter pre-dump
@@ -844,14 +875,27 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     if diskless:
         mount_cmd = 'mount -t tmpfs none '+ image_path
         ret = os.system(mount_cmd)
-        if ret != 0:   
+        if ret != 0:
             error()
 
     if dirtymap and not pre:
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
 
-    # todo: 获取容器尚未传输的内存状态大小，判断是否post-copy
+    # Calculate average bandwidth and standard deviation
+    average_bandwidth = statistics.mean(bandwidth_measurements)
+    if len(bandwidth_measurements) > 1:
+        bandwidth_stddev = statistics.stdev(bandwidth_measurements)
+    else:
+        bandwidth_stddev = 0.0
+    print(f"Average bandwidth: {average_bandwidth:.2f} Bytes/s")
+    print(f"Bandwidth standard deviation: {bandwidth_stddev:.2f} Bytes/s")
+
+    # Update max_xfer_size based on average_bandwidth and time_constraint
+    max_xfer_size = (average_bandwidth - bandwidth_stddev) * (time_constraint / 1000.0)  # Convert ms to seconds
+    print(f"Max_transfer_size: {max_xfer_size:.2f} Bytes based on average bandwidth and time constraint")
+
+    # 获取容器尚未传输的内存状态大小，判断是否post-copy
     # 读取timestamp_list.pid文件，获取最新的dirty-map
     # 读取dirty-map中的被跳过温页和热页
     # 读取candidate_list.pid文件维护的候选页
@@ -862,7 +906,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         print(f"Container may dump {total_transfer_size} bytes of memory")
 
         # 步骤6: 与max_xfer_size比较
-        if total_transfer_size > 0.8 * max_xfer_size:
+        if total_transfer_size > 0.9 * max_xfer_size:
             print(f"Exceed max_xfer_size {max_xfer_size}, post-copy is needed")
             if not post:
                 print("[Warning]post-copy is not enabled, pre-copy may failed")
@@ -872,14 +916,16 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
                 post = False
 
     real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
-    ret = transfer_vip()
-    if ret == 0:
-        ret = notify_transfer_vip(cs)
-    # 确认VIP漂移后再恢复
-    if ret != 0:
-        print("can't confirm VIP has been transfered, can't restore on destination")
-        error()
-    
+    # 若要迁移带TCP连接的容器，则需要将服务的IP迁移到目标节点
+    if netdump:
+        ret = transfer_vip()
+        if ret == 0:
+            ret = notify_transfer_vip(cs)
+        # 确认VIP漂移后再恢复
+        if ret != 0:
+            print("can't confirm VIP has been transfered, can't restore on destination")
+            error()
+
     # 传输容器剩余状态
     xfer_final(image_path, dest, mig_base)
     dir_size = convert_byte(getdirsize(image_path))
@@ -889,7 +935,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     #     # todo: 创建转发路由
 
     # one-shot restore with post-copy
-    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
@@ -941,12 +987,12 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
                 print("Failed to parse reply:", answer)
         else:
             print("Received reply:", answer)
-  
+
     #after migration, rootfs sync process and opened files will be closed
     if rootfs:
         p.terminate()
         f.close()
-    
+
     if dirtymap:
         device_file.close()
 
@@ -961,7 +1007,7 @@ def post_process(max_iter):
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:
             pass
-    
+
     try:
         umount_cmd = 'umount ' + mig_base + '/image'
         subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
@@ -990,7 +1036,7 @@ args = parser.parse_args()
 if __name__ == '__main__':
 
     runc_base = "/runc/containers/"
-    
+
     pre = False
     post = False
     diskless = False
@@ -1002,11 +1048,11 @@ if __name__ == '__main__':
     if args.time_constraint:
         time_constraint = args.time_constraint
     else:
-        time_constraint = 2000
+        time_constraint = 5000  # 5s
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
-    
+
     if args.replay and args.post:
         parser.error("Post-copy conflicted with replay.")
 
@@ -1019,7 +1065,7 @@ if __name__ == '__main__':
         max_iter = 0  # 当未启用预拷贝时，将 max_iter 设为 0
 
 
-    
+
     #The name of the container is the first argument
     #NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
     container = args.container
@@ -1061,7 +1107,7 @@ if __name__ == '__main__':
     rsync_opts = "-haz"
 
     # 开始热迁移
-    migrate(container, dest, pre, post, replay, tty, netdump, rootfs, 
+    migrate(container, dest, pre, post, replay, tty, netdump, rootfs,
                     max_iter, dirtymap, time_constraint)
 
     if diskless:
@@ -1080,7 +1126,7 @@ if __name__ == '__main__':
     if pre:
         print('Total pre-dump time: {:.0f} ms'.format(pre_dump_time_total))
         print('Total pre-dump transfer time: {:.0f} ms'.format(pre_dump_transfer_time_total))
-        
+
 
     # 输出 dump 的时间和大小
     print('Total dump time: {:.0f} ms'.format(dump_time_total))
@@ -1100,7 +1146,7 @@ if __name__ == '__main__':
 
 
     stop_time = dump_time_total + dump_transfer_time_total+rst_time
-    
+
     print(f"total migrate time: {total_time:.0f} ms",)
     print(f"stop time: {stop_time:.0f} ms" )
 
