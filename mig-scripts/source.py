@@ -492,18 +492,22 @@ def transfer_vip():
         return 1
 
 # 向dest发送提升优先级的通知
-def notify_transfer_vip(cs):
-    vip_cmd = '{"transfer_vip"}'
+def notify_transfer_vip(cs, inputs):
+    # vip_cmd = '{"transfer_vip"}'
+    vip_cmd = json.dumps({"transfer_vip": True})
     cs.send(bytes(vip_cmd, encoding='utf-8'))
-    inputready, outputready, exceptready = select.select(input, [], [], 3)
+    inputready, outputready, exceptready = select.select(inputs, [], [], 3)
 
     if inputready:
         for s in inputready:
-            answer = s.recv(1024)
+            answer_bytes = s.recv(1024)
+            answer = answer_bytes.decode('utf-8').strip()
             print(answer)
             if answer == 'OK':
+                print("okkkkkk")
                 return 0
             else:
+                print("notok")
                 return 1
     else:
         print("can't confirm the VIP has been transfered")
@@ -920,7 +924,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     if netdump:
         ret = transfer_vip()
         if ret == 0:
-            ret = notify_transfer_vip(cs)
+            ret = notify_transfer_vip(cs, inputs=input)
         # 确认VIP漂移后再恢复
         if ret != 0:
             print("can't confirm VIP has been transfered, can't restore on destination")

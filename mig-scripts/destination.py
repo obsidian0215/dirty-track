@@ -136,7 +136,7 @@ def prepare(base_path, image_path, parent_path):
                     umount_cmd = 'umount ' + entry_path
                     subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
                     shutil.rmtree(entry_path)
-        except:     
+        except:
             pass
     else:
         os.mkdir(base_path)
@@ -155,43 +155,43 @@ def transfer_vip():
         # 定义 Keepalived 配置文件路径和备份路径
         config_path = '/etc/keepalived/keepalived.conf'
         backup_path = '/etc/keepalived/keepalived.conf.bak'
-        
+
         # 备份原始配置文件
         shutil.copy(config_path, backup_path)
         print(f"已备份原始Keepalived配置文件到 {backup_path}")
-        
+
         # 读取原始配置文件内容
         with open(config_path, 'r') as f:
             config = f.read()
-        
+
         # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
         pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
-        
+
         # 定义替换函数，将 priority 设置为较低的值（例如：50）
         def repl(match):
             original_priority = match.group(2)
             new_priority = '100'  # 设置新的优先级
             print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
-        
+
         # 使用正则表达式替换 priority
         new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
-        
+
         if count == 0:
             print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
             sys.exit(1)
-        
+
         # 将修改后的配置写回配置文件
         with open(config_path, 'w') as f:
             f.write(new_config)
         print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
-        
+
         # 重新加载 Keepalived 服务以应用更改
-        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'], 
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE, 
+        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
                                 text=True)
-        
+
         if result.returncode != 0:
             print(f"重新加载 Keepalived 服务失败：{result.stderr}")
             # 如果重新加载失败，可以选择恢复备份配置
@@ -202,7 +202,7 @@ def transfer_vip():
         else:
             print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
             return 0
-    
+
     except PermissionError:
         print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
         return 1
@@ -310,20 +310,30 @@ def migrate_server():
             data = conn.recv(1024)
             #print(data)
             if not data:
+                print(111)
                 break
+            # 解码数据
+            decoded_data = data.decode('utf-8').strip()
+            if decoded_data.lower() == 'exit':
+                break
+            print(decoded_data)
+
+
             if data == 'exit':
                 break
 
             try:
                 #Parse JSON string into Python dictionary
-                msg = json.loads(data)
+                msg = json.loads(decoded_data)
                 print(msg)
-                
+
                 old_cwd = os.getcwd()
 
                 match msg:
                     case {'transfer_vip':_}:
+                        print(1111)
                         ret = transfer_vip()
+                        print(2222)
                         if ret == 0:
                             reply = 'OK'
                         else:
@@ -337,7 +347,7 @@ def migrate_server():
 
                         if msg['pageserver']['iter']:
                             i = msg['pageserver']['iter']
-                        
+
                         print("start page server")
                         os.system(mount_cmd)
 
@@ -354,7 +364,7 @@ def migrate_server():
                             reply = 'remote criu page-server failed'
                         else:
                             continue
-                
+
                     case {'prepare': prepare_info}:
                         path = prepare_info['path']
                         image_path = prepare_info['image_path']
@@ -427,12 +437,12 @@ def migrate_server():
                             if lazy:
                                 print(456)
                                 lp_log_file = msg['restore']['path'] + "/migrate/r_log/lp.log"
-                                restore_log_file =msg['restore']['path'] + "/migrate/r_log/restore.log" 
+                                restore_log_file =msg['restore']['path'] + "/migrate/r_log/restore.log"
                                 total_uffd_copy = calculate_uffd_copy(lp_log_file)
                                 error_transfer_time = get_error_page_transfer_time(lp_log_file)
                                 # 将 total_uffd_copy 从字节转换为 KB，保留两位小数
                                 total_uffd_copy_kb = total_uffd_copy / 1024.0
-                          
+
                                 reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, error_transfer_time: %.2f ms" % (
     msg['restore']['name'], end - start, total_uffd_copy_kb, error_transfer_time)
                             else:
@@ -458,7 +468,7 @@ def migrate_server():
         #wait to accept a connection - blocking call
         conn, addr = s.accept()
         print('Connected with ' + addr[0] + ':' + str(addr[1]))
-        global source_ip 
+        global source_ip
         source_ip = addr[0]
 
         #start new thread takes 1st argument as a function name to be run, second is the tuple of arguments to the function.
