@@ -20,6 +20,7 @@ import statistics
 import math
 import bisect
 import re
+import threading
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -513,6 +514,15 @@ def notify_transfer_vip(cs, inputs):
         print("can't confirm the VIP has been transfered")
         return 1
 
+def async_vip_migration(cs, input):
+    try:
+        ret = transfer_vip()
+        if ret == 0:
+            ret = notify_transfer_vip(cs, inputs=input)
+        if ret != 0:
+            print("无法确认VIP已迁移，目标节点可能无法恢复")
+    except Exception as e:
+        print(f"VIP迁移过程中发生异常: {e}")
 
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
@@ -551,7 +561,7 @@ def pre_dump(mig_base, container, i, dirtymap):
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay):
+def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, input):
     global chk_time, dump_time_total, dump_size_total, dump_transfer_time_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
@@ -610,6 +620,18 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     os.chdir(old_cwd)
     if ret != 0:
         error()
+
+    # 若要迁移带TCP连接的容器，则需要将服务的IP迁移到目标节点
+    if netdump:
+        vip_thread = threading.Thread(target=async_vip_migration, args=(cs, input))
+        vip_thread.start()
+        # ret = transfer_vip()
+        # if ret == 0:
+        #     ret = notify_transfer_vip(cs, inputs=input)
+        # # 确认VIP漂移后再恢复
+        # if ret != 0:
+        #     print("can't confirm VIP has been transfered, can't restore on destination")
+        #     error()
 
     # 计算并记录 dump 的大小和时间
     dump_time_total = (end-start)
@@ -913,22 +935,14 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         if total_transfer_size > 0.9 * max_xfer_size:
             print(f"Exceed max_xfer_size {max_xfer_size}, post-copy is needed")
             if not post:
-                print("[Warning]post-copy is not enabled, pre-copy may failed")
+                # print("[Warning]post-copy is not enabled, pre-copy may failed")
+                post = True
         else:
             print(f"We can transfer within one-shot stop&dump")
             if post:
                 post = False
 
-    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
-    # 若要迁移带TCP连接的容器，则需要将服务的IP迁移到目标节点
-    if netdump:
-        ret = transfer_vip()
-        if ret == 0:
-            ret = notify_transfer_vip(cs, inputs=input)
-        # 确认VIP漂移后再恢复
-        if ret != 0:
-            print("can't confirm VIP has been transfered, can't restore on destination")
-            error()
+    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, input)
 
     # 传输容器剩余状态
     xfer_final(image_path, dest, mig_base)
