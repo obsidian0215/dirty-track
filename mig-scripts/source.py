@@ -1155,8 +1155,8 @@ if __name__ == '__main__':
 
     print('resume time (pre dump can use):{:.0f} ms '.format(rst_time))
     if pre:
-        print('Total pre-dump size: {:.2f} MB'.format(pre_dump_size_total / (1024 * 1024)))  # 转换为 MB
-    print('Total dump size:', dump_size_total,'KB')  # 直接输出字符串
+        print('Total pre-dump size: {:.3f} KB'.format(pre_dump_size_total / 1024))  # 转换为 KB
+    print('Total dump size:{:.3f} KB'.format(dump_size_total / 1024))  # 转换为 KB
 
     if pre and not post:
         total_time = pre_dump_time_total + pre_dump_transfer_time_total + dump_time_total + dump_transfer_time_total+rst_time
