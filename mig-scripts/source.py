@@ -920,6 +920,9 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         #     error()
 
         #infinite rootfs sync
+        # 确保脚本有执行权限
+        if not os.access('./sync_rootfs.sh', os.X_OK):  # 检查是否有执行权限
+            os.chmod('./sync_rootfs.sh', 0o755)        # 添加执行权限
         f = open(mig_base + "/d_log/sync_rootfs.log", 'w')
         sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
         p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
