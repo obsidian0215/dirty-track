@@ -41,24 +41,24 @@ do
     # 获取当前时间（秒）
     CURRENT_TIME=$(date +%s)
 
-    # 获取该目录最后一次事件的时间
-    # 首次应初始化为0
-    if [[ ! "$LAST_EVENT_TIME["$FILE_DIR"]" =~ ^[0-9]+$ ]]; then
-        echo "DEBUG: LAST_TIME for '$FILE_DIR' 未初始化或无效，初始化为 0." >> "$LOG_TARGET"
-        LAST_TIME=0
-    else
-        LAST_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
-    fi
+    # 模拟第一次事件，未初始化
+    LAST_TIME=${LAST_SYNC_TIME["$FILE_DIR"]}
+    echo "初始 LAST_TIME: '$LAST_TIME'"
+
+    # if [[ ! "$LAST_TIME" =~ ^[0-9]+$ ]]; then
+    #     echo "LAST_TIME 未初始化或无效，初始化为 0."
+    #     LAST_TIME=0
+    # fi
 
     # 计算时间差
     if [ -n "$LAST_TIME" ]; then
-        TIME_DIFF=$(( CURRENT_TIME - LAST_TIME ))
+        TIME_DIFF=$(( $CURRENT_TIME - $LAST_TIME ))
     else
         TIME_DIFF=$DEBOUNCE_INTERVAL
     fi
 
     # 更新最新事件时间
-    LAST_EVENT_TIME["$FILE_DIR"]=$CURRENT_TIME
+    LAST_SYNC_TIME["$FILE_DIR"]=$CURRENT_TIME
 
     # 判断是否需要同步（时间差大于防抖间隔）
     if [ -z "$LAST_TIME" ] || [ "$TIME_DIFF" -ge "$DEBOUNCE_INTERVAL" ]; then
@@ -107,7 +107,7 @@ do
             TIMER_RUNNING["$FILE_DIR"]=1
             (
                 sleep "$DEBOUNCE_INTERVAL"
-                NEW_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
+                NEW_TIME=${LAST_SYNC_TIME["$FILE_DIR"]}
                 # 获取时间差
                 FINAL_TIME_DIFF=$(( $(date +%s) - NEW_TIME ))
                 if [ "$FINAL_TIME_DIFF" -ge "$DEBOUNCE_INTERVAL" ]; then
@@ -119,7 +119,7 @@ do
                     rsync -avzcR --delete $FILE_DIR root@$host:$rootfs/
 
                     # 清除最后事件时间
-                    unset LAST_EVENT_TIME["$FILE_DIR"]
+                    unset LAST_SYNC_TIME["$FILE_DIR"]
                 fi
                 # 清除定时器标记
                 unset TIMER_RUNNING["$FILE_DIR"]
