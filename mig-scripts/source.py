@@ -911,16 +911,16 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         if container_exist[0]:
             error()
 
-        init_xfer_cmd = 'rsync -aqz --delete --timeout=100 {0}/ root@{1}:{0}/'.format(rootfs_path, dest)
-        start = time.perf_counter() * 1000
-        ret = os.system(init_xfer_cmd)
-        end = time.perf_counter() * 1000
-        print("initial ROOTFS transfer time %.3f ms" % (end - start))
-        if ret != 0:
-            error()
+        # init_xfer_cmd = 'rsync -aqz --delete --timeout=100 {0}/ root@{1}:{0}/'.format(rootfs_path, dest)
+        # start = time.perf_counter() * 1000
+        # ret = os.system(init_xfer_cmd)
+        # end = time.perf_counter() * 1000
+        # print("initial ROOTFS transfer time %.3f ms" % (end - start))
+        # if ret != 0:
+        #     error()
 
-        #infinite sync loop
-        f = open(mig_base + "/d_log/rootfs_sync_progress.logs", 'w')
+        #infinite rootfs sync
+        f = open(mig_base + "/d_log/sync_rootfs.log", 'w')
         sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
         p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
 
