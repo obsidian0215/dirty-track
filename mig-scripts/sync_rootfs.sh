@@ -128,7 +128,6 @@ do
 
         # 保存定时器的 PID
         TIMER_PID["$FILE_DIR"]=$!
-        fi
     fi
 done
 
