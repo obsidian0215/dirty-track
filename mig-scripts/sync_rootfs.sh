@@ -43,10 +43,11 @@ do
 
     # 获取该目录最后一次事件的时间
     # 首次应初始化为0
-    LAST_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
-    if [[ ! "$LAST_TIME" =~ ^[0-9]+$ ]]; then
+    if [[ ! LAST_EVENT_TIME["$FILE_DIR"] =~ ^[0-9]+$ ]]; then
         echo "DEBUG: LAST_TIME for '$FILE_DIR' 未初始化或无效，初始化为 0." >> "$LOG_TARGET"
         LAST_TIME=0
+    else
+        LAST_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
     fi
 
     # 计算时间差
