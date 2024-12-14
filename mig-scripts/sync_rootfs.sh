@@ -6,6 +6,8 @@ DEBOUNCE_INTERVAL=1
 
 # 声明关联数组，用于记录每个目录的最后同步时间
 declare -A LAST_SYNC_TIME
+# 声明关联数组，用于标记每个目录是否有定时器在运行
+declare -A TIMER_RUNNING
 
 # 检查参数数量
 if [ $# -eq 2 ]; then
@@ -39,11 +41,19 @@ do
     # 获取当前时间（秒）
     CURRENT_TIME=$(date +%s)
 
-    # 获取该目录最后一次同步的时间
-    LAST_TIME=${LAST_SYNC_TIME["$FILE_DIR"]}
+    # 获取该目录最后一次事件的时间
+    LAST_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
 
     # 计算时间差
-    TIME_DIFF=$(( CURRENT_TIME - LAST_TIME ))
+    if [ -n "$LAST_TIME" ]; then
+        TIME_DIFF=$(( CURRENT_TIME - LAST_TIME ))
+    else
+        TIME_DIFF=$DEBOUNCE_INTERVAL
+    fi
+
+    # 更新最新事件时间
+    LAST_EVENT_TIME["$FILE_DIR"]=$CURRENT_TIME
+
     # 判断是否需要同步（时间差大于防抖间隔）
     if [ -z "$LAST_TIME" ] || [ "$TIME_DIFF" -ge "$DEBOUNCE_INTERVAL" ]; then
         echo "-------------------------------$(date)------------------------------------"
@@ -58,7 +68,7 @@ do
             # 避免只同步目标文件时漏文件的可能并平衡同步性能
             # -R参数把源的目录结构递归到目标后面，保证目录结构一致性
             # rsync -avzcR $(dirname ${INO_FILE}) root@$host::rootfs
-            rsync -avzcR $(dirname ${INO_FILE}) root@$host:$rootfs/
+            rsync -avzcR $FILE_DIR root@$host:$rootfs/
         fi
 
         # 删除、移动出事件
@@ -68,7 +78,7 @@ do
             # 直接同步已删除的路径${INO_FILE}会报no such or directory错误，rsync不能删除远程目标的指定文件
             # 同步的源是被删文件或目录的上一级路径，并加上--delete来删除目标上有而源中没有的文件
             # 缺点：如果删除的路径越靠近根，则同步的目录越多，同步删除的操作就越花时间
-            rsync -avzR --delete $(dirname ${INO_FILE}) root@$host:$rootfs/
+            rsync -avzR --delete $FILE_DIR root@$host:$rootfs/
         fi
 
         # 修改属性(touch, ch{grp,mod,own})事件
@@ -77,7 +87,7 @@ do
             # 不同步修改属性的目录，避免递归扫描
             # 等此目录下的文件发生同步时，rsync会同时更新此目录的属性
             if [ ! -d "$INO_FILE" ]; then
-                rsync -avzcR $(dirname ${INO_FILE}) root@$host:$rootfs/
+                rsync -avzcR $FILE_DIR root@$host:$rootfs/
 
             fi
         fi
@@ -85,7 +95,30 @@ do
         # 更新最后同步时间
         LAST_SYNC_TIME["$FILE_DIR"]=$CURRENT_TIME
     else
-        echo "跳过重复事件: ${line}"
+        echo "触发防抖机制: ${line}"
+        # 如果没有定时器在运行，则启动一个定时器
+        if [ "${TIMER_RUNNING["$FILE_DIR"]}" != "1" ]; then
+            TIMER_RUNNING["$FILE_DIR"]=1
+            (
+                sleep "$DEBOUNCE_INTERVAL"
+                NEW_TIME=${LAST_EVENT_TIME["$FILE_DIR"]}
+                # 获取时间差
+                FINAL_TIME_DIFF=$(( $(date +%s) - NEW_TIME ))
+                if [ "$FINAL_TIME_DIFF" -ge "$DEBOUNCE_INTERVAL" ]; then
+                    # 记录事件时间戳
+                    echo "-------------------------------$(date)------------------------------------" >> "$LOG_TARGET"
+                    echo "批量处理事件: $FILE_DIR"
+
+                    # 为了简单，重新执行一次rsync同步该目录
+                    rsync -avzcR --delete $FILE_DIR root@$host:$rootfs/
+
+                    # 清除最后事件时间
+                    unset LAST_EVENT_TIME["$FILE_DIR"]
+                fi
+                # 清除定时器标记
+                unset TIMER_RUNNING["$FILE_DIR"]
+            ) &
+        fi
     fi
 done
 
