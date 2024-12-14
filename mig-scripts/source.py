@@ -647,7 +647,7 @@ def parse_size(size_str):
     return size
 
 #Transfer the previously created pre-dump using rsync
-def xfer_pre_dump(parent_path, dest, base_path, i):
+def xfer_pre_dump(parent_path, dest, i):
     global xfer_time, pre_dump_transfer_time_total,pre_dump_size_total  # 添加 pre_dump_transfer_time_total
     sys.stdout.write('PRE-DUMP size: ')
     sys.stdout.flush()
@@ -678,13 +678,34 @@ def xfer_pre_dump(parent_path, dest, base_path, i):
         pre_dump_size_total += pre_dump_size
         error()
 
-    cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, parent_path, dest, base_path)
-    print("Transferring PRE-DUMP %d to %s" % (i, dest))
+    # 创建压缩包并通过SSH传输并解压
+    archive_name = f"pre_dump_{i}.tar.gz"
+    cmd_tar = f"tar -czf - -C {parent_path} . | ssh {dest} 'tar -xzf - -C {parent_path}'"
     start = time.perf_counter() * 1000
-    ret = os.system(cmd)
+    ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
     transfer_time = end - start
-    print("PRE-DUMP %d transfer time %.3f ms" % (i, transfer_time))
+    print(f"PRE-DUMP {i} transfer time {transfer_time:.3f} ms")
+
+    # # 创建压缩包并通过rsync传输
+    # archive_name = f"pre_dump_{i}.tar.gz"
+    # cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
+    # ret = os.system(cmd_tar)
+    # if ret != 0:
+    #     error()
+    # cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, archive_name, dest, parent_path)
+    # print("Transferring PRE-DUMP %d to %s" % (i, dest))
+    # start = time.perf_counter() * 1000
+    # ret = os.system(cmd)
+    # end = time.perf_counter() * 1000
+    # transfer_time = end - start
+    # print("PRE-DUMP %d transfer time %.3f ms" % (i, transfer_time))
+    # # 在目标服务器上解压
+    # cmd_ssh = f"ssh {dest} 'tar -xzf {parent_path}/{archive_name} -C {parent_path}'"
+    # ret = os.system(cmd_ssh)
+    # if ret != 0:
+    #     error()
+
     # 累计传输时间
     pre_dump_transfer_time_total += transfer_time
     xfer_time += transfer_time
@@ -703,7 +724,7 @@ def xfer_pre_dump(parent_path, dest, base_path, i):
         error()
 
 #Transfer the previosuly created dump using rsync
-def xfer_final(image_path, dest, base_path):
+def xfer_final(image_path, dest):
     global xfer_time, dump_size_total, dump_time_total, dump_transfer_time_total
     sys.stdout.write('DUMP size: ')
     sys.stdout.flush()
@@ -721,14 +742,37 @@ def xfer_final(image_path, dest, base_path):
         print(f"Error executing du command: {e.stderr}")
         dump_size_total = "0B\t/path/to/image"  # 赋予默认值或根据需要处理
         error()
-    cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, image_path, dest, base_path)
-    print("Transferring DUMP to %s" % dest)
+
+    # 创建压缩包并通过 SSH 传输
+    archive_name = "dump.tar.gz"
+    cmd_tar = f"tar -czf - -C {image_path} . | ssh {dest} 'tar -xzf - -C {image_path}'"
     start = time.perf_counter() * 1000
-    ret = os.system(cmd)
+    ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    print("DUMP transfer time %.3f ms" % (end - start))
-    xfer_time += end -start
-    dump_transfer_time_total = end-start
+    transfer_time = end - start
+    print(f"DUMP transfer time {transfer_time:.3f} ms")
+
+    # # 创建压缩包并通过rsync传输
+    # archive_name = "dump.tar.gz"
+    # cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
+    # ret = os.system(cmd_tar)
+    # if ret != 0:
+    #     error()
+    # cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, image_path, dest, base_path)
+    # print("Transferring DUMP to %s" % dest)
+    # start = time.perf_counter() * 1000
+    # ret = os.system(cmd)
+    # end = time.perf_counter() * 1000
+    # print("DUMP transfer time %.3f ms" % (end - start))
+    # # 在目标服务器上解压
+    # cmd_ssh = f"ssh {dest} 'tar -xzf {image_path}/{archive_name} -C {image_path}'"
+    # ret = os.system(cmd_ssh)
+    # if ret != 0:
+    #     error()
+
+    # 计算传输时间
+    xfer_time += transfer_time
+    dump_transfer_time_total = transfer_time
     if ret != 0:
         error()
 
@@ -756,7 +800,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
-        xfer_pre_dump(last_path, dest, mig_base, last_iter)
+        xfer_pre_dump(last_path, dest, last_iter)
 
         dir_size = getdirsize(parent_path[last_iter], 'pages')
         print('the total size of {} with pattern {} is {} Bytes'\
@@ -945,7 +989,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, input)
 
     # 传输容器剩余状态
-    xfer_final(image_path, dest, mig_base)
+    xfer_final(image_path, dest)
     dir_size = convert_byte(getdirsize(image_path))
     print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
@@ -1122,7 +1166,7 @@ if __name__ == '__main__':
     #-a enables archive mode, which preserves permissions, ownership, and modification times, among other things
     #-z enables compression during transfer
     #-P reserves files which are not completely transferred to speed-up the following re-transferring
-    rsync_opts = "-haz"
+    rsync_opts = "-haz --whole-file"
 
     # 开始热迁移
     migrate(container, dest, pre, post, replay, tty, netdump, rootfs,
@@ -1170,8 +1214,6 @@ if __name__ == '__main__':
 
     #input()
     # 迁移完成后，执行后处理
-
-
     # for excel
 
    # 输出数据行
