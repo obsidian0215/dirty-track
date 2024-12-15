@@ -31,6 +31,9 @@ long last_run_duration_ns = 0;
 // 标志位，用于捕获 Ctrl+C
 volatile sig_atomic_t stop = 0;
 
+// 全局文件指针
+FILE *global_output_file = NULL;
+
 // 信号处理器，用于捕获 Ctrl+C
 void handle_sigint(int sig) {
     stop = 1;
@@ -87,7 +90,7 @@ int generate_dirty_map_filename(pid_t pid, char *filename, size_t size) {
     return 0;
 }
 
-// 比较两个 dirty_page_t 结构体的地址
+// 比较函数
 int compare_dirty_pages(const void *a, const void *b) {
     const dirty_page_t *page_a = (const dirty_page_t *)a;
     const dirty_page_t *page_b = (const dirty_page_t *)b;
@@ -144,7 +147,7 @@ void free_dirty_pages_tree() {
     tdestroy(root, free_dirty_page);
 }
 
-// 函数：启用 soft-dirty tracking（清除 soft-dirty 位）
+// 启用 soft-dirty tracking（清除 soft-dirty 位）
 int enable_soft_dirty_tracking(pid_t pid) {
     char clear_refs_path[256];
     snprintf(clear_refs_path, sizeof(clear_refs_path), "/proc/%d/clear_refs", pid);
@@ -166,48 +169,37 @@ int enable_soft_dirty_tracking(pid_t pid) {
     return 0;
 }
 
-// 批量读取 pagemap 数据
-int is_soft_dirty_bulk(pid_t pid, unsigned long start_addr, unsigned long end_addr) {
-    char pagemap_path[256];
-    snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
+// 修改后的 is_soft_dirty 函数，不再依赖 mmap
+int is_soft_dirty(pid_t pid, unsigned long vaddr, int pagemap_fd) {
+    // 计算条目索引
+    unsigned long index = vaddr / PAGE_SIZE_4K;
+    off_t offset = index * sizeof(uint64_t);
 
-    int fd = open(pagemap_path, O_RDONLY);
-    if (fd < 0) {
-        perror("open pagemap");
-        return -1;
-    }
-
-    unsigned long num_pages = (end_addr - start_addr) / PAGE_SIZE_4K;
-    uint64_t *pagemap_entries = malloc(num_pages * sizeof(uint64_t));
-    if (!pagemap_entries) {
-        perror("malloc pagemap_entries");
-        close(fd);
-        return -1;
-    }
-
-    off_t offset = (start_addr / PAGE_SIZE_4K) * sizeof(uint64_t);
-    ssize_t bytes_read = pread(fd, pagemap_entries, num_pages * sizeof(uint64_t), offset);
-    if (bytes_read != (ssize_t)(num_pages * sizeof(uint64_t))) {
+    uint64_t pagemap_entry;
+    ssize_t bytes_read = pread(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry), offset);
+    if (bytes_read != sizeof(pagemap_entry)) {
         perror("pread pagemap");
-        free(pagemap_entries);
-        close(fd);
         return -1;
     }
 
-    for (unsigned long i = 0; i < num_pages; i++) {
-        if (pagemap_entries[i] & ((uint64_t)1 << 55)) {
-            unsigned long addr = start_addr + (i * PAGE_SIZE_4K);
-            add_or_update_dirty_page(addr);
-        }
+    // 检查 Soft-Dirty 位（第 55 位）
+    if (pagemap_entry & ((uint64_t)1 << 55)) {
+        return 1; // Soft-Dirty
+    } else {
+        return 0; // Not Soft-Dirty
     }
+}
 
-    free(pagemap_entries);
-    close(fd);
-    return 0;
+// 辅助函数，用于 twalk 的回调，写入文件
+void write_to_file_callback(const void *nodep, const VISIT which, const int depth) {
+    if (which == preorder || which == leaf) {
+        const dirty_page_t *page = *(const dirty_page_t **)nodep;
+        fprintf(global_output_file, "Page address: 0x%lx, Write count: %u\n", page->address, page->write_count);
+    }
 }
 
 // 遍历 /proc/[pid]/maps 并检查 Soft-Dirty 位
-int track_dirty_pages(pid_t pid) {
+int track_dirty_pages(pid_t pid, int pagemap_fd) {
     char maps_path[256];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
 
@@ -235,24 +227,21 @@ int track_dirty_pages(pid_t pid) {
         if (strchr(perms, 'w') == NULL)
             continue;
 
-        // 批量读取 soft-dirty 位
-        if (is_soft_dirty_bulk(pid, start, end) != 0) {
-            // 出错处理，可选择记录日志或忽略
-            continue;
+        // 按4KB遍历每个页
+        for (unsigned long addr = start; addr < end; addr += PAGE_SIZE_4K) {
+            int dirty = is_soft_dirty(pid, addr, pagemap_fd);
+            if (dirty == 1) {
+                // 4KB 页，直接处理该地址
+                add_or_update_dirty_page(addr);
+            } else if (dirty == -1) {
+                // 出错处理，可选择记录日志或忽略
+                continue;
+            }
         }
     }
 
     fclose(maps);
     return 0;
-}
-
-// 辅助函数，用于 twalk 的回调，写入文件
-void write_to_file_callback(const void *nodep, const VISIT which, const int depth, void *arg) {
-    if (which == preorder || which == leaf) {
-        FILE *file = (FILE *)arg;
-        const dirty_page_t *page = *(const dirty_page_t **)nodep;
-        fprintf(file, "Page address: 0x%lx, Write count: %u\n", page->address, page->write_count);
-    }
 }
 
 // 将脏页信息写入文件
@@ -263,8 +252,14 @@ int write_dirty_pages_to_file(const char *filepath) {
         return -1;
     }
 
+    // 设置全局文件指针
+    global_output_file = file;
+
     // 使用 twalk 进行中序遍历并写入文件
-    twalk(root, write_to_file_callback, file);
+    twalk(root, write_to_file_callback);
+
+    // 重置全局文件指针
+    global_output_file = NULL;
 
     fclose(file);
     return 0;
@@ -298,6 +293,15 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    // 打开 pagemap 文件一次
+    char pagemap_path[256];
+    snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
+    int pagemap_fd = open(pagemap_path, O_RDONLY);
+    if (pagemap_fd < 0) {
+        perror("open pagemap");
+        return EXIT_FAILURE;
+    }
+
     // 设置信号处理器
     struct sigaction sa;
     sa.sa_handler = handle_sigint;
@@ -305,6 +309,7 @@ int main(int argc, char *argv[]) {
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("sigaction");
+        close(pagemap_fd);
         return EXIT_FAILURE;
     }
 
@@ -321,7 +326,7 @@ int main(int argc, char *argv[]) {
         }
 
         // 追踪脏页
-        if (track_dirty_pages(pid) != 0) {
+        if (track_dirty_pages(pid, pagemap_fd) != 0) {
             fprintf(stderr, "Failed to track dirty pages for PID %d\n", pid);
             break;
         }
@@ -371,6 +376,7 @@ int main(int argc, char *argv[]) {
 
     // 清理
     free_dirty_pages_tree();
+    close(pagemap_fd);
 
     return EXIT_SUCCESS;
 }
