@@ -313,7 +313,6 @@ int main(int argc, char *argv[]) {
     sigemptyset(&sa.sa_mask);
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("sigaction");
-        close(pagemap_fd);
         return EXIT_FAILURE;
     }
 
