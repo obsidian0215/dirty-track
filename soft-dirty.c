@@ -218,7 +218,7 @@ void write_to_file_callback(const void *nodep, const VISIT which, const int dept
 }
 
 // 遍历 /proc/[pid]/maps 并检查 Soft-Dirty 位
-int track_dirty_pages(pid_t pid, int pagemap_fd) {
+int track_dirty_pages(pid_t pid) {
     char maps_path[256];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
 
@@ -329,7 +329,7 @@ int main(int argc, char *argv[]) {
         }
 
         // 追踪脏页
-        if (track_dirty_pages(pid, pagemap_fd) != 0) {
+        if (track_dirty_pages(pid) != 0) {
             fprintf(stderr, "Failed to track dirty pages for PID %d\n", pid);
             break;
         }
