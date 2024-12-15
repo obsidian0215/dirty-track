@@ -247,7 +247,7 @@ int track_dirty_pages(pid_t pid, int pagemap_fd) {
             continue;
 
         // 批量读取 soft-dirty 位
-        if (is_soft_dirty_bulk(pid, start, end, dirty_head) != 0) {
+        if (is_soft_dirty_bulk(pid, start, end) != 0) {
             // 出错处理，可选择记录日志或忽略
             continue;
         }
