@@ -264,7 +264,7 @@ int write_dirty_pages_to_file(const char *filepath) {
     }
 
     // 使用 twalk 进行中序遍历并写入文件
-    twalk(root, write_to_file);
+    twalk(root, write_to_file_callback, file);
 
     fclose(file);
     return 0;
