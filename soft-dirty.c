@@ -169,25 +169,44 @@ int enable_soft_dirty_tracking(pid_t pid) {
     return 0;
 }
 
-// 修改后的 is_soft_dirty 函数，不再依赖 mmap
-int is_soft_dirty(pid_t pid, unsigned long vaddr, int pagemap_fd) {
-    // 计算条目索引
-    unsigned long index = vaddr / PAGE_SIZE_4K;
-    off_t offset = index * sizeof(uint64_t);
+// 批量读取 pagemap 数据
+int is_soft_dirty_bulk(pid_t pid, unsigned long start_addr, unsigned long end_addr) {
+    char pagemap_path[256];
+    snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
 
-    uint64_t pagemap_entry;
-    ssize_t bytes_read = pread(pagemap_fd, &pagemap_entry, sizeof(pagemap_entry), offset);
-    if (bytes_read != sizeof(pagemap_entry)) {
-        perror("pread pagemap");
+    int fd = open(pagemap_path, O_RDONLY);
+    if (fd < 0) {
+        perror("open pagemap");
         return -1;
     }
 
-    // 检查 Soft-Dirty 位（第 55 位）
-    if (pagemap_entry & ((uint64_t)1 << 55)) {
-        return 1; // Soft-Dirty
-    } else {
-        return 0; // Not Soft-Dirty
+    unsigned long num_pages = (end_addr - start_addr) / PAGE_SIZE_4K;
+    uint64_t *pagemap_entries = malloc(num_pages * sizeof(uint64_t));
+    if (!pagemap_entries) {
+        perror("malloc pagemap_entries");
+        close(fd);
+        return -1;
     }
+
+    off_t offset = (start_addr / PAGE_SIZE_4K) * sizeof(uint64_t);
+    ssize_t bytes_read = pread(fd, pagemap_entries, num_pages * sizeof(uint64_t), offset);
+    if (bytes_read != (ssize_t)(num_pages * sizeof(uint64_t))) {
+        perror("pread pagemap");
+        free(pagemap_entries);
+        close(fd);
+        return -1;
+    }
+
+    for (unsigned long i = 0; i < num_pages; i++) {
+        if (pagemap_entries[i] & ((uint64_t)1 << 55)) {
+            unsigned long addr = start_addr + (i * PAGE_SIZE_4K);
+            add_or_update_dirty_page(addr);
+        }
+    }
+
+    free(pagemap_entries);
+    close(fd);
+    return 0;
 }
 
 // 辅助函数，用于 twalk 的回调，写入文件
@@ -227,16 +246,10 @@ int track_dirty_pages(pid_t pid, int pagemap_fd) {
         if (strchr(perms, 'w') == NULL)
             continue;
 
-        // 按4KB遍历每个页
-        for (unsigned long addr = start; addr < end; addr += PAGE_SIZE_4K) {
-            int dirty = is_soft_dirty(pid, addr, pagemap_fd);
-            if (dirty == 1) {
-                // 4KB 页，直接处理该地址
-                add_or_update_dirty_page(addr);
-            } else if (dirty == -1) {
-                // 出错处理，可选择记录日志或忽略
-                continue;
-            }
+        // 批量读取 soft-dirty 位
+        if (is_soft_dirty_bulk(pid, start, end, dirty_head) != 0) {
+            // 出错处理，可选择记录日志或忽略
+            continue;
         }
     }
 
