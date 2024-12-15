@@ -306,15 +306,6 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // 打开 pagemap 文件一次
-    char pagemap_path[256];
-    snprintf(pagemap_path, sizeof(pagemap_path), "/proc/%d/pagemap", pid);
-    int pagemap_fd = open(pagemap_path, O_RDONLY);
-    if (pagemap_fd < 0) {
-        perror("open pagemap");
-        return EXIT_FAILURE;
-    }
-
     // 设置信号处理器
     struct sigaction sa;
     sa.sa_handler = handle_sigint;
@@ -389,7 +380,6 @@ int main(int argc, char *argv[]) {
 
     // 清理
     free_dirty_pages_tree();
-    close(pagemap_fd);
 
     return EXIT_SUCCESS;
 }
