@@ -124,7 +124,7 @@ def get_runc_container_pidtree(container_name):
     container_pids.clear()      # 先清空pid列表
     container_pid_path = f'/run/runc/{container_name}/state.json'
     if not os.path.exists(container_pid_path):
-        raise FileNotFoundError(f"runc容器{container_name}的状态文件不存在：{container_pid_path}")
+        raise FileNotFoundError(f"runc容器 {container_name} 的状态文件不存在：{container_pid_path}")
 
     with open(container_pid_path, 'r') as f:
         state = json.load(f)
@@ -176,7 +176,7 @@ def start_dirty_track(device_fd):
 
 # 在pre-dump之间执行dirty-track并获取dirty-map
 def execute_dirty_track(device_fd, first):
-    """启动并停止脏页跟踪，获取dirty-map"""
+    """启动并停止脏页跟踪, 获取dirty-map"""
     # 启动所有容器进程的脏页跟踪
     # 启动暂时放入criu中
     if first:
@@ -272,7 +272,7 @@ def pid_may_dump_size(addresses):
 
 def container_may_dump_size(container_pids, dirtymap_path):
     """
-    遍历container_pids，计算每个pid的脏页列表，合并去重，计算总传输大小
+    遍历container_pids, 计算每个pid的脏页列表, 合并去重, 计算总传输大小
     """
     total_transfer_size = 0
 
@@ -424,7 +424,7 @@ def measure_bandwidth(dest_ip):
 # 流量控制函数
 def transfer_vip(new_prior):
     """
-    降低源节点的优先级并触发 VIP 迁移到目标节点。
+    降低源节点的优先级并触发 VIP 迁移到目标节点
     """
     try:
         # 定义 Keepalived 配置文件路径和备份路径
@@ -556,7 +556,7 @@ def pre_dump(mig_base, container, i, dirtymap):
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
 def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, input):
-    global chk_time, dump_time, dump_size, dump_xfer_time
+    global dump_time, dump_size, dump_xfer_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -642,14 +642,15 @@ def parse_size(size_str):
 def xfer_pre_dump(parent_path, dest, i):
     global pre_dump_xfer_time_total
 
+    print(f"xfer PRE-DUMP {i}")
+
     # 创建压缩包并通过SSH传输并解压
     archive_name = f"pre_dump_{i}.tar.gz"
     cmd_tar = f"tar -czf - -C {parent_path} . | ssh {dest} 'tar -xzf - -C {parent_path}'"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    transfer_time = end - start
-    print(f"PRE-DUMP {i} transfer time {transfer_time:.3f} ms")
+    # print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
 
     # # 创建压缩包并通过rsync传输
     # archive_name = f"pre_dump_{i}.tar.gz"
@@ -671,19 +672,19 @@ def xfer_pre_dump(parent_path, dest, i):
     #     error()
 
     # 累计传输时间
-    pre_dump_xfer_time_total += transfer_time
+    pre_dump_xfer_time_total += end - start
 
-    if time_constraint > 0:
-        # Calculate transfer speed (Bytes/s)
-        if transfer_time > 0:
-            # todo: 10000需要修改为真实传输大小
-            transfer_speed = 10000 / (transfer_time / 1000.0)  # Bytes per second
-        else:
-            transfer_speed = 0.0
-        print(f"Transfer speed for PRE-DUMP {i}: {transfer_speed:.2f} Bytes/s")
+    # if time_constraint > 0:
+    #     # Calculate transfer speed (Bytes/s)
+    #     if transfer_time > 0:
+    #         # todo: 10000需要修改为真实传输大小
+    #         transfer_speed = 10000 / (transfer_time / 1000.0)  # Bytes per second
+    #     else:
+    #         transfer_speed = 0.0
+    #     print(f"Transfer speed for PRE-DUMP {i}: {transfer_speed:.2f} Bytes/s")
 
-        # Append to bandwidth measurements
-        bandwidth_measurements.append(transfer_speed)
+    #     # Append to bandwidth measurements
+    #     bandwidth_measurements.append(transfer_speed)
 
     if ret != 0:
         error()
@@ -692,14 +693,14 @@ def xfer_pre_dump(parent_path, dest, i):
 def xfer_final(image_path, dest):
     global dump_size, dump_time, dump_xfer_time
 
+    print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
     archive_name = "dump.tar.gz"
     cmd_tar = f"tar -czf - -C {image_path} . | ssh {dest} 'tar -xzf - -C {image_path}'"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    transfer_time = end - start
-    print(f"DUMP transfer time {transfer_time:.3f} ms")
+    # print(f"DUMP transfer time {(end - start):.3f} ms")
 
     # # 创建压缩包并通过rsync传输
     # archive_name = "dump.tar.gz"
@@ -720,7 +721,7 @@ def xfer_final(image_path, dest):
     #     error()
 
     # 计算传输时间
-    dump_xfer_time = transfer_time
+    dump_xfer_time = end - start
     if ret != 0:
         error()
 
