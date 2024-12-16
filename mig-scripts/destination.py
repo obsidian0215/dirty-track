@@ -15,6 +15,7 @@ from collections import deque
 
 VIP = "192.168.2.100"
 
+rst_time = 0.0
 # def configure_iptables_forward():
 #     """
 #     配置iptables规则，缓存并转发请求包至source
@@ -158,7 +159,7 @@ def transfer_vip():
 
         # 备份原始配置文件
         shutil.copy(config_path, backup_path)
-        print(f"已备份原始Keepalived配置文件到 {backup_path}")
+        # print(f"已备份原始Keepalived配置文件到 {backup_path}")
 
         # 读取原始配置文件内容
         with open(config_path, 'r') as f:
@@ -171,7 +172,7 @@ def transfer_vip():
         def repl(match):
             original_priority = match.group(2)
             new_priority = '100'  # 设置新的优先级
-            print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
+            # print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
 
         # 使用正则表达式替换 priority
@@ -184,7 +185,7 @@ def transfer_vip():
         # 将修改后的配置写回配置文件
         with open(config_path, 'w') as f:
             f.write(new_config)
-        print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
+        # print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
 
         # 重新加载 Keepalived 服务以应用更改
         result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'],
@@ -200,7 +201,7 @@ def transfer_vip():
             print("已恢复原始 Keepalived 配置文件并重新加载服务。")
             return 1
         else:
-            print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
+            # print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
             return 0
 
     except PermissionError:
@@ -212,7 +213,6 @@ def transfer_vip():
     except Exception as e:
         print(f"发生错误：{e}")
         return 1
-
 
 import re
 
@@ -237,7 +237,61 @@ def calculate_uffd_copy(lp_log_file):
                 #print(f"UFFD copy: {size} bytes")
     return total_uffd_copy
 
-def get_error_page_transfer_time(lp_log_file):
+def parse_stats_restore(stats_restore_path):
+    """
+    解析 stat-dump 文件并累加时间值到全局变量。
+
+    :param stat_dump_path: stat-dump 文件的路径
+    :param log_type: 日志类型，'pre_dump' 或 'dump'
+    """
+    global rst_time
+
+    try:
+        # 执行 'crit decode' 命令并获取输出
+        result = subprocess.run(
+            ['crit', 'decode', stats_restore_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+
+        # 解析 JSON 输出
+        stat_data = json.loads(result.stdout)
+        entries = stat_data.get('entries', [])
+
+        for entry in entries:
+            dump_info = entry.get('restore', {})
+            # 提取所有 *_time 字段并累加(us)
+            total_time = 0.0
+            for key, value in dump_info.items():
+                if key.endswith('_time'):
+                    try:
+                        total_time += float(value)
+                    except ValueError:
+                        (f"无法将{key}的值转换为浮点数: {value}")
+
+            rst_time = total_time / 1000;
+    except subprocess.CalledProcessError as e:
+        print(f"执行 crit decode 时出错: {e.stderr}")
+    except json.JSONDecodeError as e:
+        print(f"解析 JSON 时出错: {e}")
+    except Exception as e:
+        print(f"处理 stats-restore 文件时发生未知错误: {e}")
+
+def get_restore_time(work_path):
+    """
+    在work_path中查找stats-restore文件并解析
+
+    :param work_path: 包含stats-restore文件的工作路径
+    """
+    stats_restore_file = os.path.join(work_path, 'stats-restore')
+    if os.path.isfile(stats_restore_file):
+        parse_stats_restore(stats_restore_file)
+    else:
+        print(f"未找到stats-restore文件: {stats_restore_file}")
+
+def get_rpf_handle_time(lp_log_file):
     """
     计算错误页面传输的总时间，从 lp.log 中匹配 'Connecting to server' 到 'page-xfer: Disconnect from the page server' 的时间间隔。
 
@@ -331,9 +385,9 @@ def migrate_server():
 
                 match msg:
                     case {'transfer_vip':_}:
-                        print(1111)
+                        # print(1111)
                         ret = transfer_vip()
-                        print(2222)
+                        # print(2222)
                         if ret == 0:
                             reply = 'OK'
                         else:
@@ -376,11 +430,12 @@ def migrate_server():
 
                         path_exist = os.path.exists(path)
                         if not path_exist and not os.path.exists(path + '/..'):
-                            reply = 'cannot find corresponding container bundle'
+                            reply = 'Cannot find corresponding container bundle'
                         else:
                             prepare(path, image_path, parent_paths)
                             # parent_path为None时，仅准备image_path
-                            continue
+                            reply = 'OK'
+                            # continue
 
                     case {'restore':_}:
                         os.system('criu -V')
@@ -406,7 +461,7 @@ def migrate_server():
                         if lazy:
                             cmd += ' --lazy-pages'
                         cmd += ' ' + msg['restore']['name']
-                        print("Restore command: " + cmd)
+                        # print("Restore command: " + cmd)
 
                         # 若启用post-copy，则先启动lazy-pages守护进程
                         if lazy:
@@ -419,34 +474,37 @@ def migrate_server():
                             # 启动 lazy-pages 守护进程
                             lp = subprocess.Popen(lazy_cmd, shell=True)
                             # 为了确保 lazy-pages.socket 已经创建，等待片刻
-                            time.sleep(1)  # 等待 1 秒，您可以根据需要调整时间
+                            time.sleep(0.1)  # 等待0.1秒，可根据需要调整时间
 
                         # 现在启动 runc restore 命令
-                        print("Running restore command...")
-                        start = time.perf_counter() * 1000
+                        # print("Running restore command...")
+                        # start = time.perf_counter() * 1000
                         p = subprocess.Popen(cmd, shell=True)
                         ret = p.wait()
-                        end = time.perf_counter() * 1000
+                        # end = time.perf_counter() * 1000
 
                         if lazy:
                             # 等待 lazy-pages 守护进程结束
                             lp.wait()
 
                         if ret == 0:
-                            print(123)
+                            global rst_time
+                            restore_log_path =msg['restore']['path'] + "/migrate/r_log"
+                            get_restore_time(restore_log_path)
+                            # print(123)
                             if lazy:
-                                print(456)
+                                # print(456)
                                 lp_log_file = msg['restore']['path'] + "/migrate/r_log/lp.log"
-                                restore_log_file =msg['restore']['path'] + "/migrate/r_log/restore.log"
+
                                 total_uffd_copy = calculate_uffd_copy(lp_log_file)
-                                error_transfer_time = get_error_page_transfer_time(lp_log_file)
+                                rpf_handle_time = get_rpf_handle_time(lp_log_file)
                                 # 将 total_uffd_copy 从字节转换为 KB，保留两位小数
                                 total_uffd_copy_kb = total_uffd_copy / 1024.0
 
-                                reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, error_transfer_time: %.2f ms" % (
-    msg['restore']['name'], end - start, total_uffd_copy_kb, error_transfer_time)
+                                reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, rpf_handle_time: %.2f ms" % (
+    msg['restore']['name'], rst_time, total_uffd_copy_kb, rpf_handle_time)
                             else:
-                                reply = "runc restored %s successfully with %.3f ms" % (msg['restore']['name'], end - start)
+                                reply = "runc restored %s successfully with %.3f ms" % (msg['restore']['name'], rst_time)
                         else:
                             reply = "runc failed(%d)" % ret
                         os.chdir(old_cwd)
