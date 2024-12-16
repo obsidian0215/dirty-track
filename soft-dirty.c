@@ -318,6 +318,8 @@ int main(int argc, char *argv[]) {
 
     printf("Starting dirty page tracking for PID %d. Press Ctrl+C to stop.\n", pid);
 
+    unsigned long total_run_duration_ns = 0;
+    int i = 1;
     // 持续追踪脏页，直到用户中断
     while (!stop) {
         struct timespec start_time, end_time;
@@ -350,8 +352,15 @@ int main(int argc, char *argv[]) {
         last_run_duration_ns = (end_time.tv_sec - start_time.tv_sec) * 1000000000L +
                                (end_time.tv_nsec - start_time.tv_nsec);
 
-        // 输出运行时间
-        printf("Dirty-track run time: %ld ns\n", last_run_duration_ns);
+        // 累积运行时间，每50次重置并输出平均运行时间
+        total_run_duration_ns += last_run_duration_ns;
+        i++;
+        if (i % 50 == 0) {
+            // 输出运行时间
+            printf("Dirty-track run time: %ld ns\n", total_run_duration_ns /i);
+            total_run_duration_ns = 0;
+            i = 1;
+        }
 
         // 计算sleep时间, 默认1ms
         unsigned long sleep_time_us = 1000;

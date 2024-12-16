@@ -76,9 +76,9 @@ typedef struct dirty_track {
 
     /* dirty-map相关字段 */
     char dirty_map_path[256];               // 定位保存dirty-map的共享内存(tmpfs文件)
-    struct xarray dirty_xarray;             // 记录进程页写入次数的dirty-map(Xarray)    
+    struct xarray dirty_xarray;             // 记录进程页写入次数的dirty-map(Xarray)
     bool dirty_map_updated;                 // 是否更新过dirty-map
-    
+
     /* clear-soft-dirty循环相关字段 */
     bool soft_cleared;                      // 是否清除过soft-dirty位
     unsigned long delay_timer;              // 页表项处理延时，单位为ns
@@ -86,7 +86,7 @@ typedef struct dirty_track {
     struct hrtimer timer;                   // 脏页追踪内核线程的高精度定时器
     bool timer_fired;                       // 定时器是否触发
     spinlock_t timer_lock;                  // 保护timer_fired的自旋锁
-    
+
     /* 优先停止任务的相关字段 */
     bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
     struct completion stop_completed;       // dirty-map写入完成信号，用于通知ioctl
@@ -172,7 +172,7 @@ static inline void xarray_remove(struct xarray *xarray, unsigned long address) {
     if (entry) {
         kfree(entry);
         // printk(KERN_DEBUG "xarray_remove: 已删除地址 0x%lx 从xarray\n", address);
-    } else {  
+    } else {
         // printk(KERN_DEBUG "xarray_remove: 地址 0x%lx 未在xarray中找到，跳过删除\n", address);
         return;
     }
@@ -227,7 +227,7 @@ static inline bool pte_is_pinned(struct vm_area_struct *vma, unsigned long addr,
 // 检查pmd的soft dirty标志位
 // 若被设置则表明发生写入，更新脏页映射并返回true
 // 若未被设置则表明未发生写入，返回false
-static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp, 
+static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
             unsigned long addr, struct vm_area_struct *vma) {
     pmd_t pmd = *pmdp;
     unsigned long pmd_start = addr;
@@ -268,7 +268,7 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
 // 检查pte的soft dirty标志位是否设置
 // 若被设置则表明发生写入，更新脏页映射并返回true
 // 若未被设置则表明未发生写入，返回false
-static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep, 
+static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
             unsigned long addr, struct vm_area_struct *vma) {
     pte_t pte = *ptep;
     dirty_address_t *addr_dirty;
@@ -298,10 +298,10 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
         return false;
     }
 }
- 
+
 /* clear soft-dirty's */
 // 清除pmd的soft dirty标志位
-static inline void clear_pmd_soft_dirty(pmd_t *pmdp, unsigned long addr, 
+static inline void clear_pmd_soft_dirty(pmd_t *pmdp, unsigned long addr,
             struct vm_area_struct *vma) {
 	pmd_t old, pmd = *pmdp;
 
@@ -324,7 +324,7 @@ static inline void clear_pmd_soft_dirty(pmd_t *pmdp, unsigned long addr,
 }
 
 // 清除pte的soft dirty标志位
-static inline void clear_pte_soft_dirty(pte_t *pte, unsigned long addr, 
+static inline void clear_pte_soft_dirty(pte_t *pte, unsigned long addr,
             struct vm_area_struct *vma) {
 	// pte_t ptent = ptep_get(pte);
     pte_t ptent = *pte;
@@ -345,7 +345,7 @@ static inline void clear_pte_soft_dirty(pte_t *pte, unsigned long addr,
 }
 
 // 读取并清除pmd粒度及以下所有页表项的soft dirty标志位
-static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr, 
+static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
             unsigned long end, struct vm_area_struct *vma, dirty_track_t *dti) {
     // pte_t *pte, ptent;
     pte_t *pte;
@@ -364,13 +364,13 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
         // pmd_t pmdval = pmd_read_atomic(pmd);
         // if (pmd_bad(pmd_wrprotect(pmdval))) {
         //     printk(KERN_ALERT "Not trans_huge pmd: 0x%p, value: 0x%lx at addr: 0x%lx\n", pmd, pmdval, addr);
-            
+
         //     // spin_unlock(ptl);
         //     goto no_clear;
         // }
 
         if (dti->soft_cleared)
-            need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);          
+            need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);
 
 clear:
         if (need_clear)
@@ -399,7 +399,7 @@ no_clear:
 }
 
 // 遍历vma内部所有页表项并清除其soft dirty标志位
-static int __walk_clear_wp(dirty_track_t *dti, unsigned long addr, 
+static int __walk_clear_wp(dirty_track_t *dti, unsigned long addr,
             unsigned long end, struct vm_area_struct *vma) {
     int err = 0;
     pgd_t *pgd;
@@ -432,7 +432,7 @@ static int __walk_clear_wp(dirty_track_t *dti, unsigned long addr,
 
             pud = pud_offset(p4d, addr);
             do {
-again_pud:        
+again_pud:
                 next = pud_addr_end(addr, end);
                 if (pud_none(*pud)) {
                     continue;
@@ -604,7 +604,7 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long start, unsigned long 
 {
 	int err;
 
-	if (is_vm_hugetlb_page(vma) || 
+	if (is_vm_hugetlb_page(vma) ||
             (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
         err = 0;
 	} else {
@@ -641,7 +641,7 @@ static int traverse_vmas(dirty_track_t *dti) {
             next = min(end, vma->vm_end);
             vma = find_vma(dti->mm, vma->vm_end);
             // 忽略以下vma：PFN映射、不可写、hugetlb页
-            if ((walk_vma->vm_flags & VM_PFNMAP) || 
+            if ((walk_vma->vm_flags & VM_PFNMAP) ||
                     is_vm_hugetlb_page(walk_vma))
                 continue;
             err = walk_clear_wp(dti, start, next, walk_vma);
@@ -719,7 +719,7 @@ static enum hrtimer_restart wp_timer_callback(struct hrtimer *timer)
     spin_unlock(&dti->timer_lock);
 
     // 唤醒等待队列，通知线程定时器已超时
-    wake_up_interruptible(&dti->stop_wq); 
+    wake_up_interruptible(&dti->stop_wq);
     return HRTIMER_NORESTART;   // 不自动重启定时器
 }
 
@@ -728,11 +728,11 @@ static enum hrtimer_restart wp_timer_callback(struct hrtimer *timer)
 static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
     pid_t pid = dti->pid;
-    int ret = 0;
+    int ret = 0, i = 1;
     unsigned long default_delay;
     ktime_t start, end, kt;
-    s64 delta_ns;
-    
+    s64 delta_ns, total_ns = 0;
+
     // 初始化定时器
     hrtimer_init(&dti->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     dti->timer.function = wp_timer_callback;
@@ -758,7 +758,7 @@ static int wp_fault_track(void *data) {
         hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
     }
     else {
-        printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);       
+        printk(KERN_ERR "[PID %d]first clear_soft_dirty_once has encountered an error %d\n", pid, ret);
         return -EFAULT;
     }
 
@@ -797,14 +797,23 @@ static int wp_fault_track(void *data) {
 
                 // 执行定时器到期后的任务
                 dti->dirty_map_updated = false;
-                ktime_t start = ktime_get();
-                int ret = clear_soft_dirty_once(dti);
-                ktime_t end = ktime_get();
-                s64 delta_ns = ktime_to_ns(ktime_sub(end, start));
+                start = ktime_get();
+                ret = clear_soft_dirty_once(dti);
+                end = ktime_get();
+                delta_ns = ktime_to_ns(ktime_sub(end, start));
 
                 if (ret) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
+                } else {
+                    // 每50次统计一次平均执行时间
+                    i++;
+                    total_ns += delta_ns;
+                    if (i % 50 == 0) {
+                        printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / i);
+                        total_ns = 0;
+                        i = 1;
+                    }
                 }
 
                 // 动态调整定时器超时时间
@@ -824,10 +833,8 @@ static int wp_fault_track(void *data) {
                 }
 
                 // 启动新的定时器
-                ktime_t kt = ktime_set(0, dti->delay_timer);
+                kt = ktime_set(0, dti->delay_timer);
                 hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
-
-                // printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, delta_ns);
             } else {
                 spin_unlock(&dti->timer_lock);
             }
@@ -883,7 +890,7 @@ static void nbstop_kthread_fn(struct work_struct *work) {
         kfree(addr_dirty);
     }
     xa_destroy(&dti->dirty_xarray);
-    
+
     // 解除对进程mm的引用
     mmput(dti->mm);
     kfree(dti);
@@ -923,7 +930,7 @@ static int start_dirty_track(pid_t pid) {
     dti = kzalloc(sizeof(*dti), GFP_KERNEL);
     if (!dti)
         return -ENOMEM;
-    
+
     // 初始化控制字段
     dti->soft_cleared = false;
     dti->dirty_map_updated = false;
@@ -1016,7 +1023,7 @@ static int stop_dirty_track(pid_t pid) {
             write_unlock(&dirty_track_rwlock);
 
             // 优先停止clear-soft-dirty循环并将dirty-map写入文件
-            
+
             // start_time = ktime_get();  // 获取开始时间
             dti->stop_requested = true;
             wake_up_interruptible(&dti->stop_wq); // 唤醒内核线程
@@ -1163,7 +1170,7 @@ static int __init lkm_init(void) {
         printk(KERN_ALERT "Failed to create dirty_track_class\n");
         return PTR_ERR(dirty_track_class);
     }
-    
+
     // device_create(dirty_track_class, NULL, dev, NULL, DEVICE_NAME);
     // 创建设备节点
     if (device_create(dirty_track_class, NULL, dev, NULL, DEVICE_NAME) == NULL) {
@@ -1194,7 +1201,7 @@ static void __exit lkm_exit(void) {
     list_for_each_entry_safe(dti, tmp, &dirty_track_list, list) {
         list_del(&dti->list);
         write_unlock(&dirty_track_rwlock);
-        
+
         // 分配工作队列完成通知结构体
         wqtask_completion_t *wqtc = kzalloc(sizeof(*wqtc), GFP_KERNEL);
         if (!wqtc) {
@@ -1229,7 +1236,7 @@ static void __exit lkm_exit(void) {
         // 移除完成通知结构体并释放内存
         list_del(&wqtc->list);
         kfree(wqtc);
-        
+
         // 减少跟踪进程计数
         atomic_dec(&tracked_processes);
         write_lock(&dirty_track_rwlock);
