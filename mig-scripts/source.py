@@ -1022,7 +1022,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
     if inputready:
         for s in inputready:
-            answer = s.recv(1024)
+            answer = s.recv(1024).decode("utf-8")
             # print(answer)
             pattern = r"OK"
             match = re.search(pattern, answer)
