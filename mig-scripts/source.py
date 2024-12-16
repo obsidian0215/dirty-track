@@ -87,6 +87,9 @@ PAGE_SIZE = 4096  # 每页大小为4KB
 iter_dirtymaps = []
 processed_files = set()
 
+# 传输事件通知
+xfer_events = []
+
 bandwidth_measurements = []  # List to store individual bandwidth measurements (Bytes/s)
 average_bandwidth = 0.0      # Average bandwidth (Bytes/s)
 bandwidth_stddev = 0.0       # Standard deviation of bandwidth (Bytes/s)
@@ -642,15 +645,17 @@ def parse_size(size_str):
 def xfer_pre_dump(parent_path, dest, i):
     global pre_dump_xfer_time_total
 
-    print(f"xfer PRE-DUMP {i}")
+    # print(f"xfer PRE-DUMP {i}")
 
     # 创建压缩包并通过SSH传输并解压
-    archive_name = f"pre_dump_{i}.tar.gz"
-    cmd_tar = f"tar -czf - -C {parent_path} . | ssh {dest} 'tar -xzf - -C {parent_path}'"
+    if compress:
+        cmd_tar = f"tar -czf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {parent_path}'"
+    else:
+        cmd_tar = f"tar -cf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {parent_path}'"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    # print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
+    print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
 
     # # 创建压缩包并通过rsync传输
     # archive_name = f"pre_dump_{i}.tar.gz"
@@ -690,17 +695,19 @@ def xfer_pre_dump(parent_path, dest, i):
         error()
 
 #Transfer the previosuly created dump using rsync
-def xfer_final(image_path, dest):
-    global dump_size, dump_time, dump_xfer_time
+def xfer_final(image_path, dest, compress):
+    global dump_xfer_time
 
-    print("xfer DUMP")
+    # print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
-    archive_name = "dump.tar.gz"
-    cmd_tar = f"tar -czf - -C {image_path} . | ssh {dest} 'tar -xzf - -C {image_path}'"
+    if compress:
+        cmd_tar = f"tar -czf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {image_path}'"
+    else:
+        cmd_tar = f"tar -cf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {image_path}'"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    # print(f"DUMP transfer time {(end - start):.3f} ms")
+    print(f"DUMP transfer time {(end - start):.3f} ms")
 
     # # 创建压缩包并通过rsync传输
     # archive_name = "dump.tar.gz"
@@ -724,6 +731,71 @@ def xfer_final(image_path, dest):
     dump_xfer_time = end - start
     if ret != 0:
         error()
+
+
+def xfer_pre_dump_async(parent_path, dest, i, cs):
+    global pre_dump_xfer_time_total, xfer_events
+
+    event = threading.Event()
+    xfer_events.append(event)
+
+    def transfer():
+        global pre_dump_xfer_time_total
+        nonlocal parent_path, dest, i, cs, event
+        print(f"开始传输 PRE-DUMP {i} 到 {dest}")
+        if compress:
+            cmd_tar = f"tar -czf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {parent_path}'"
+        else:
+            cmd_tar = f"tar -cf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {parent_path}'"
+        start = time.perf_counter() * 1000
+        ret = os.system(cmd_tar)
+        end = time.perf_counter() * 1000
+        print(f"PRE-DUMP {i} 传输时间 {(end - start):.3f} ms")
+        pre_dump_xfer_time_total += end - start
+
+        if ret != 0:
+            error()
+
+        # 传输完成后发送标志
+        transfer_complete_msg = json.dumps({"transfer_complete": f"pre_dump_{i}"})
+        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+        print(f"已发送 PRE-DUMP {i} 传输完成标志")
+        event.set()  # 设置事件，表示传输完成
+
+    transfer_thread = threading.Thread(target=transfer)
+    transfer_thread.start()
+
+def xfer_final_async(image_path, dest, cs):
+    global dump_xfer_time
+
+    # event = threading.Event()
+    # xfer_events.append(event)
+
+    def transfer():
+        global dump_xfer_time
+        nonlocal image_path, dest, cs
+        print(f"开始传输 DUMP 到 {dest}")
+        if compress:
+            cmd_tar = f"tar -czf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {image_path}'"
+        else:
+            cmd_tar = f"tar -cf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {image_path}'"
+        start = time.perf_counter() * 1000
+        ret = os.system(cmd_tar)
+        end = time.perf_counter() * 1000
+        print(f"DUMP 传输时间 {(end - start):.3f} ms")
+        dump_xfer_time = end - start
+
+        if ret != 0:
+            error()
+
+        # 传输完成后发送标志
+        transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
+        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+        print("已发送 DUMP 传输完成标志")
+        # event.set()  # 设置事件，表示传输完成
+
+    transfer_thread = threading.Thread(target=transfer)
+    transfer_thread.start()
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
@@ -749,7 +821,8 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
-        xfer_pre_dump(last_path, dest, last_iter)
+        # xfer_pre_dump(last_path, dest, last_iter)
+        xfer_pre_dump_async(last_path, dest, last_iter, cs)
 
         dir_size = getdirsize(last_path, 'pages')
 
@@ -873,7 +946,8 @@ def get_dump_size(image_path, pre_dump):
             dump_size = 0.0  # 累计拷贝大小
             error()
 
-def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
+def migrate(container, dest, pre, post, replay, tty, netdump,
+            rootfs, max_iter, dirtymap, time_constraint):
     global rst_time, dirtymap_path, device_fd
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
@@ -930,7 +1004,8 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
             "prepare": {
                 "path": mig_base,
                 "image_path": image_path,
-                "parent_path": parent_path  # parent_path为列表
+                "parent_path": parent_path,  # parent_path为列表
+                "async": True
             }
         })
     else:
@@ -1009,7 +1084,13 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
 
+    # 等待所有预拷贝传输完成
+    for event in xfer_events:
+        event.wait()
+
     if time_constraint > 0:
+        mea_bandwidth = measure_bandwidth(dest)
+        bandwidth_measurements.append(mea_bandwidth)
         # Calculate average bandwidth and standard deviation
         average_bandwidth = statistics.mean(bandwidth_measurements)
         if len(bandwidth_measurements) > 1:
@@ -1047,7 +1128,8 @@ def migrate(container, dest, pre, post, replay, tty, netdump, rootfs, max_iter, 
     real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, input)
 
     # 传输容器剩余状态
-    xfer_final(image_path, dest)
+    # xfer_final(image_path, dest)
+    xfer_final_async(image_path, dest, cs)
     # dir_size = convert_byte(getdirsize(image_path))
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
@@ -1162,6 +1244,7 @@ parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
+parser.add_argument('-z', '--compress', dest='compress', action='store_true', help="enable compression")
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -1176,6 +1259,11 @@ if __name__ == '__main__':
     replay = False
     rootfs = True
     dirtymap = False
+    compress = False
+
+    if args.compress:
+        compress = True
+
     if args.time_constraint:
         time_constraint = args.time_constraint
     else:
@@ -1232,6 +1320,7 @@ if __name__ == '__main__':
     #-P reserves files which are not completely transferred to speed-up the following re-transferring
     # rsync_opts = "-haz --whole-file"
     rsync_opts = "-az --whole-file"
+    ssh_opts = "-o TCPWindowSize=65536 -o SSHBufferSize=65536 -c aes128-ctr"
 
     # 开始热迁移
     migrate(container, dest, pre, post, replay, tty, netdump, rootfs,
