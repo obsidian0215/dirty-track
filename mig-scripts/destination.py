@@ -421,16 +421,6 @@ def migrate_server():
                         else:
                             reply = 'Received, but server not in async-xfer mode'
 
-                    case {'restore': restore_info}:
-                        if xfer_async:
-                            with condition:
-                                restore_received = True
-                                print(f"收到 restore 指令: {restore_info}")
-                                # 保存 restore 信息，等待所有传输完成
-                                restore_info = restore_info
-                        else:
-                            reply = perform_restore(restore_info)
-
                     case {'prepare': prepare_info}:
                         path = prepare_info['path']
                         image_path = prepare_info['image_path']
@@ -484,13 +474,6 @@ def migrate_server():
                         else:
                             reply = perform_restore(msg["restore"])
 
-                    case _:
-                        print("Unknown request: " + msg)
-                        reply = 'unknown request'
-            except:
-                continue
-
-            print(reply)
                     case _:
                         print("Unknown request: " + msg)
                         reply = 'unknown request'
