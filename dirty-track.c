@@ -713,8 +713,10 @@ static void post_kthread_stop(dirty_track_t *dti) {
     // 解除对进程mm的引用
     mmput(dti->mm);
 
-    // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
+    // 仅在不使用stop_pid ioctl时执行
+    // 即目标进程结束导致的追踪停止
     if (!dti->stop_requested) {
+        // 写入dirty_map文件
         if (!xa_empty(&dti->dirty_xarray)) {
             struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
             if (!IS_ERR(file)) {
@@ -726,6 +728,11 @@ static void post_kthread_stop(dirty_track_t *dti) {
             }
         } else
             printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
+
+        // 从追踪列表中删除该进程
+        write_lock(&dirty_track_rwlock);
+        list_del(&dti->list);
+        write_unlock(&dirty_track_rwlock);
     }
 
     // 清理dirty_xarray
