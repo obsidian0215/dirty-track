@@ -139,8 +139,9 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
     // 检查mm_users，判断是否有进程在使用该地址空间
     if (atomic_read(&mm->mm_users) > 1) {
         // 地址空间仍有进程在使用
+        printk(KERN_INFO"mm_struct_can_be_freed: mm_struct 0x%p cannot be freed\n", mm);
         return false;
-    } else if (atomic_read(&mm->mm_users) == 1 && atomic_read(&mm->mm_count) == 1) {
+    } else {
         // mm_count也为0，说明可以被释放
         printk(KERN_INFO"mm_struct_can_be_freed: mm_struct 0x%p can be freed\n", mm);
         return true;
