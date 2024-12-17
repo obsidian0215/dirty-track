@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 # Global variable to track port list
 INIT_PORT = 12345
-iteration_list = []
 iteration_list: List[int] = []
 port_list: List[int] = [INIT_PORT]
 transfer_processes: Dict[int, subprocess.Popen] = {}
@@ -74,7 +73,6 @@ def handle_pre_xfer_complete(msg):
                 logger.info(f"端口 {port} 的传输进程已终止")
 
     logger.info(f"迭代 {last_iter} 及之前的传输均已完成，并且其他进程已关闭")
-    return 'OK'
 
 def prepare(base_path, image_path, parent_path):
     # parent_path为None时，仅准备image_path
@@ -426,7 +424,7 @@ def handle_restore(msg):
     """
     处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
     """
-    global last_iter
+    global last_iter, iteration_list
     os.system('criu -V')  # 检查 CRIU 版本
     logger.info("收到 restore 指令")
 
