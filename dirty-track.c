@@ -828,10 +828,10 @@ static int wp_fault_track(void *data) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
                 } else {
-                    // 每50次统计一次平均执行时间
+                    // 每2s统计一次平均执行时间
                     i++;
                     total_ns += delta_ns;
-                    if (i % 50 == 0) {
+                    if (total_ns >= 2e10) { // 2e10 ns = 2s
                         printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / i);
                         total_ns = 0;
                         i = 1;

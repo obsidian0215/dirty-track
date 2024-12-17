@@ -352,10 +352,10 @@ int main(int argc, char *argv[]) {
         last_run_duration_ns = (end_time.tv_sec - start_time.tv_sec) * 1000000000L +
                                (end_time.tv_nsec - start_time.tv_nsec);
 
-        // 累积运行时间，每50次重置并输出平均运行时间
+        // 累积运行时间，每2s重置并输出平均运行时间
         total_run_duration_ns += last_run_duration_ns;
         i++;
-        if (i % 50 == 0) {
+        if (total_run_duration_ns >= 2e10) {
             // 输出运行时间
             printf("Dirty-track run time: %ld ns\n", total_run_duration_ns /i);
             total_run_duration_ns = 0;
