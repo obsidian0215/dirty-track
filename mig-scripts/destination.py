@@ -45,7 +45,7 @@ def handle_pre_xfer_complete(msg):
     处理 pre_xfer_complete 命令，等待指定迭代及之前的传输完成。
     """
     global last_iter
-    last_iter = msg["pre_xfer_complete"]["transfer_complete"]
+    last_iter = msg["pre_xfer_complete"]
     logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
 
     # 等待指定迭代及之前的传输完成
