@@ -139,10 +139,10 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
     // 检查mm_users，判断是否有进程在使用该地址空间
     if (atomic_read(&mm->mm_users) > 1) {
         // 地址空间仍有进程在使用
-        printk(KERN_INFO"mm_struct_can_be_freed: mm_struct 0x%p cannot be freed\n", mm);
+        // printk(KERN_INFO"mm_struct_can_be_freed: mm_struct 0x%p cannot be freed\n", mm);
         return false;
     } else {
-        // mm_count也为0，说明可以被释放
+        // 只剩track-worker引用，说明可以被释放
         printk(KERN_INFO"mm_struct_can_be_freed: mm_struct 0x%p can be freed\n", mm);
         return true;
     }
@@ -690,27 +690,6 @@ out:
     return err;
 }
 
-// // 向指定pid进程的clear_refs写入4以启用soft-dirty tracking
-// static int write_clear_refs_pid(pid_t pid) {
-//     char *argv[] = {"/bin/bash", "-c", NULL, NULL};
-//     char cmd[256];
-//     char *envp[] = {"HOME=/", "PATH=/sbin:/bin:/usr/sbin:/usr/bin", NULL};
-//     int ret;
-
-//     // 设置目标PID并构建shell命令
-//     snprintf(cmd, sizeof(cmd), "echo 4 > /proc/%d/clear_refs", pid);
-
-//     argv[2] = cmd;
-
-//     // 执行shell命令
-//     ret = call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
-//     if (ret != 0) {
-//         printk(KERN_ERR "Enabling soft-dirty tracking failed: %d\n", ret);
-//     } else {
-//         printk(KERN_INFO "Soft-dirty tracking of process %d enabled\n", pid);
-//     }
-//     return ret;
-// }
 static enum hrtimer_restart wp_timer_callback(struct hrtimer *timer)
 {
     dirty_track_t *dti = container_of(timer, dirty_track_t, timer);
@@ -741,7 +720,6 @@ static int wp_fault_track(void *data) {
 
     start = ktime_get();
     ret = clear_soft_dirty_once(dti);
-    // ret = write_clear_refs_pid(pid);
     end = ktime_get();
     delta_ns = ktime_to_ns(ktime_sub(end, start));
     if (!ret) {
@@ -842,33 +820,17 @@ static int wp_fault_track(void *data) {
             }
         }
     }
+    post_kthread_stop(dti);
     return ret;
 }
 
-// 工作队列nbstop_kthread_wq的处理函数
-static void nbstop_kthread_fn(struct work_struct *work) {
-    nbstop_kthread_t *sw = container_of(work, nbstop_kthread_t, work);
-    dirty_track_t *dti = sw->dti;
-    wqtask_completion_t *wqtc = sw->wq_comp;
-
-    if (!dti) {
-        printk(KERN_ERR "No dirty_track instance provided to stop\n");
-        if (wqtc)
-            complete(&wqtc->wq_comp);
-        kfree(sw);
-        return;
-    }
-
-    // 停止内核线程
-    if (!kthread_stop(dti->track_worker)) {
-        printk(KERN_INFO "Successfully stopped tracker for PID %d\n", dti->pid);
-    } else {
-        printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
-    }
-
+static void post_kthread_stop(dirty_track_t *dti) {
     // 取消定时器
     hrtimer_cancel(&dti->timer);
     printk(KERN_INFO "Cancelled hrtimer for PID %d\n", dti->pid);
+
+    // 解除对进程mm的引用
+    mmput(dti->mm);
 
     // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
     if (!dti->stop_requested) {
@@ -893,14 +855,34 @@ static void nbstop_kthread_fn(struct work_struct *work) {
     }
     xa_destroy(&dti->dirty_xarray);
 
-    // 解除对进程mm的引用
-    mmput(dti->mm);
+    printk(KERN_INFO "PID %d's dirty_track is clear\n", dti->pid);
     kfree(dti);
+}
+
+// 工作队列nbstop_kthread_wq的处理函数
+static void nbstop_kthread_fn(struct work_struct *work) {
+    nbstop_kthread_t *sw = container_of(work, nbstop_kthread_t, work);
+    dirty_track_t *dti = sw->dti;
+    wqtask_completion_t *wqtc = sw->wq_comp;
+
+    if (!dti) {
+        printk(KERN_ERR "No dirty_track instance provided to stop\n");
+        if (wqtc)
+            complete(&wqtc->wq_comp);
+        kfree(sw);
+        return;
+    }
+
+    // 停止内核线程
+    if (!kthread_stop(dti->track_worker)) {
+        printk(KERN_INFO "Successfully stopped tracker for PID %d\n", dti->pid);
+    } else {
+        printk(KERN_WARNING "Failed to stop tracker for PID %d\n", dti->pid);
+    }
 
     if (wqtc)
         complete(&wqtc->wq_comp);   // 通知内核线程已停止
     kfree(sw);
-    printk(KERN_INFO "PID %d's dirty_track is clear\n", dti->pid);
 }
 
 // 创建并启动新的脏页追踪
