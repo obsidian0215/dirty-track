@@ -705,6 +705,41 @@ static enum hrtimer_restart wp_timer_callback(struct hrtimer *timer)
 }
 
 
+static void post_kthread_stop(dirty_track_t *dti) {
+    // 取消定时器
+    hrtimer_cancel(&dti->timer);
+    printk(KERN_INFO "Cancelled hrtimer for PID %d\n", dti->pid);
+
+    // 解除对进程mm的引用
+    mmput(dti->mm);
+
+    // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
+    if (!dti->stop_requested) {
+        if (!xa_empty(&dti->dirty_xarray)) {
+            struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
+            if (!IS_ERR(file)) {
+                loff_t pos = 0;
+                dirty_map_to_file(&dti->dirty_xarray, file, &pos);
+                filp_close(file, NULL);
+            } else {
+                printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
+            }
+        } else
+            printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
+    }
+
+    // 清理dirty_xarray
+    unsigned long addr;
+    dirty_address_t *addr_dirty;
+    xa_for_each(&dti->dirty_xarray, addr, addr_dirty) {
+        kfree(addr_dirty);
+    }
+    xa_destroy(&dti->dirty_xarray);
+
+    printk(KERN_INFO "PID %d's dirty_track is clear\n", dti->pid);
+    kfree(dti);
+}
+
 // 脏页追踪线程的主函数
 static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
@@ -822,41 +857,6 @@ static int wp_fault_track(void *data) {
     }
     post_kthread_stop(dti);
     return ret;
-}
-
-static void post_kthread_stop(dirty_track_t *dti) {
-    // 取消定时器
-    hrtimer_cancel(&dti->timer);
-    printk(KERN_INFO "Cancelled hrtimer for PID %d\n", dti->pid);
-
-    // 解除对进程mm的引用
-    mmput(dti->mm);
-
-    // 写入dirty_map文件（仅在不使用stop_pid ioctl时）
-    if (!dti->stop_requested) {
-        if (!xa_empty(&dti->dirty_xarray)) {
-            struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
-            if (!IS_ERR(file)) {
-                loff_t pos = 0;
-                dirty_map_to_file(&dti->dirty_xarray, file, &pos);
-                filp_close(file, NULL);
-            } else {
-                printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
-            }
-        } else
-            printk(KERN_INFO "Empty dirty-map for PID %d\n", dti->pid);
-    }
-
-    // 清理dirty_xarray
-    unsigned long addr;
-    dirty_address_t *addr_dirty;
-    xa_for_each(&dti->dirty_xarray, addr, addr_dirty) {
-        kfree(addr_dirty);
-    }
-    xa_destroy(&dti->dirty_xarray);
-
-    printk(KERN_INFO "PID %d's dirty_track is clear\n", dti->pid);
-    kfree(dti);
 }
 
 // 工作队列nbstop_kthread_wq的处理函数
