@@ -87,9 +87,6 @@ PAGE_SIZE = 4096  # 每页大小为4KB
 iter_dirtymaps = []
 processed_files = set()
 
-# 传输事件通知
-xfer_events = []
-
 bandwidth_measurements = []  # List to store individual bandwidth measurements (Bytes/s)
 average_bandwidth = 0.0      # Average bandwidth (Bytes/s)
 bandwidth_stddev = 0.0       # Standard deviation of bandwidth (Bytes/s)
@@ -642,16 +639,16 @@ def parse_size(size_str):
     return size
 
 #Transfer the previously created pre-dump using rsync
-def xfer_pre_dump(parent_path, dest, i):
+def xfer_pre_dump(parent_path, dest, i, port):
     global pre_dump_xfer_time_total
 
     # print(f"xfer PRE-DUMP {i}")
 
     # 创建压缩包并通过SSH传输并解压
     if compress:
-        cmd_tar = f"tar -czf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {parent_path}'"
+        cmd_tar = f"tar -czf - -C {parent_path} . | nc {dest} {port}"
     else:
-        cmd_tar = f"tar -cf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {parent_path}'"
+        cmd_tar = f"tar -cf - -C {parent_path} . | nc {dest} {port}"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
@@ -695,15 +692,15 @@ def xfer_pre_dump(parent_path, dest, i):
         error()
 
 #Transfer the previosuly created dump using rsync
-def xfer_final(image_path, dest, compress):
+def xfer_final(image_path, dest, compress, port):
     global dump_xfer_time
 
     # print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
     if compress:
-        cmd_tar = f"tar -czf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {image_path}'"
+        cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}'"
     else:
-        cmd_tar = f"tar -cf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {image_path}'"
+        cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
@@ -733,20 +730,17 @@ def xfer_final(image_path, dest, compress):
         error()
 
 
-def xfer_pre_dump_async(parent_path, dest, i, cs):
-    global pre_dump_xfer_time_total, xfer_events
-
-    event = threading.Event()
-    xfer_events.append(event)
+def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
+    global pre_dump_xfer_time_total
 
     def transfer():
         global pre_dump_xfer_time_total
-        nonlocal parent_path, dest, i, cs, event
+        nonlocal parent_path, dest, i, cs, port, iter_terminate
         print(f"开始传输 PRE-DUMP {i} 到 {dest}")
         if compress:
-            cmd_tar = f"tar -czf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {parent_path}'"
+            cmd_tar = f"tar -czf - -C {parent_path} . | nc {dest} {port}"
         else:
-            cmd_tar = f"tar -cf - -C {parent_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {parent_path}'"
+            cmd_tar = f"tar -cf - -C {parent_path} . | nc {dest} {port}"
         start = time.perf_counter() * 1000
         ret = os.system(cmd_tar)
         end = time.perf_counter() * 1000
@@ -757,28 +751,25 @@ def xfer_pre_dump_async(parent_path, dest, i, cs):
             error()
 
         # 传输完成后发送标志
-        transfer_complete_msg = json.dumps({"transfer_complete": f"pre_dump_{i}"})
-        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-        print(f"已发送 PRE-DUMP {i} 传输完成标志")
-        event.set()  # 设置事件，表示传输完成
+        if iter_terminate:
+            transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{i}"})
+            cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+            print(f"已发送 PRE-DUMP {i} 传输完成标志")
 
     transfer_thread = threading.Thread(target=transfer)
     transfer_thread.start()
 
-def xfer_final_async(image_path, dest, cs):
+def xfer_final_async(image_path, dest, port, cs):
     global dump_xfer_time
-
-    # event = threading.Event()
-    # xfer_events.append(event)
 
     def transfer():
         global dump_xfer_time
         nonlocal image_path, dest, cs
         print(f"开始传输 DUMP 到 {dest}")
         if compress:
-            cmd_tar = f"tar -czf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xzf - -C {image_path}'"
+            cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
         else:
-            cmd_tar = f"tar -cf - -C {image_path} . | ssh {ssh_opts} {dest} 'tar -xf - -C {image_path}'"
+            cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
         start = time.perf_counter() * 1000
         ret = os.system(cmd_tar)
         end = time.perf_counter() * 1000
@@ -799,6 +790,8 @@ def xfer_final_async(image_path, dest, cs):
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
+    global port_list
+    iter_terminate = False
     last_iter = 0
     if dirtymap:
         # 在pre-copy开启前先启动对容器的dirty-track
@@ -821,20 +814,20 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
-        # xfer_pre_dump(last_path, dest, last_iter)
-        xfer_pre_dump_async(last_path, dest, last_iter, cs)
 
         dir_size = getdirsize(last_path, 'pages')
+        less_last_path = parent_path[last_iter - 1]
+        if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
+                    or (dir_size < 1024 * 64) or last_iter == max_iter - 1:     #64KB
+            iter_terminate = True
 
-        if last_iter > 0:
-            less_last_path = parent_path[last_iter - 1]
-            if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
-                    or (dir_size < 1024 * 64):     #64KB
-                break
-        last_iter += 1
-        if last_iter >= max_iter:
-            last_iter = max_iter - 1
+        # xfer_pre_dump(last_path, dest, last_iter, iter_terminate)
+        xfer_pre_dump_async(last_path, dest, last_iter, port_list[last_iter], iter_terminate, cs)
+
+
+        if iter_terminate:
             break
+        last_iter += 1
     return last_iter
 
 def parse_stats_dump(stats_dump_path, log_type):
@@ -946,6 +939,8 @@ def get_dump_size(image_path, pre_dump):
             dump_size = 0.0  # 累计拷贝大小
             error()
 
+INIT_PORT = 12345
+
 def migrate(container, dest, pre, post, replay, tty, netdump,
             rootfs, max_iter, dirtymap, time_constraint):
     global rst_time, dirtymap_path, device_fd
@@ -958,6 +953,8 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     work_path = []
     global dirtymap_path
     dirtymap_path = mig_base + "/dirty_map"
+    global port_list
+    port_list = [INIT_PORT]
 
     if pre:
         for i in range(0, max_iter):
@@ -965,6 +962,8 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
             parent_path.append(pathname)
             pathname = mig_base + "/pd_log_{}".format(i)
             work_path.append(pathname)
+            port_list.append(INIT_PORT + i + 1)
+
 
     prepare(mig_base, image_path, parent_path, work_path)
 
@@ -1005,14 +1004,16 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
                 "path": mig_base,
                 "image_path": image_path,
                 "parent_path": parent_path,  # parent_path为列表
-                "async": True
+                "compress": compress
+
             }
         })
     else:
         prepare_cmd = json.dumps({
             "prepare": {
                 "path": mig_base,
-                "image_path": image_path
+                "image_path": image_path,
+                "compress": compress
                 # 不包含 parent_path
             }
         })
@@ -1084,10 +1085,6 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
 
-    # 等待所有预拷贝传输完成
-    for event in xfer_events:
-        event.wait()
-
     if time_constraint > 0:
         mea_bandwidth = measure_bandwidth(dest)
         bandwidth_measurements.append(mea_bandwidth)
@@ -1101,7 +1098,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         print(f"Bandwidth standard deviation: {bandwidth_stddev:.2f} Bytes/s")
 
         # Update max_xfer_size based on average_bandwidth and time_constraint
-        max_xfer_size = (average_bandwidth - bandwidth_stddev) * (time_constraint / 1000.0)  # Convert ms to seconds
+        max_xfer_size = (average_bandwidth - bandwidth_stddev - 0.4) * (time_constraint / 1000.0)  # Convert ms to seconds
         print(f"Max_transfer_size: {max_xfer_size:.2f} Bytes based on average bandwidth and time constraint")
 
         # 获取容器尚未传输的内存状态大小，判断是否post-copy
@@ -1115,7 +1112,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
             print(f"Container may dump {total_transfer_size} bytes of memory")
 
             # 步骤6: 与max_xfer_size比较
-            if total_transfer_size > 0.9 * max_xfer_size:
+            if total_transfer_size > 0.95 * max_xfer_size:
                 print(f"Exceed max_xfer_size {max_xfer_size}, post-copy is needed")
                 if not post:
                     # print("[Warning]post-copy is not enabled, pre-copy may failed")
@@ -1129,7 +1126,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
 
     # 传输容器剩余状态
     # xfer_final(image_path, dest)
-    xfer_final_async(image_path, dest, cs)
+    xfer_final_async(image_path, dest, port_list[-1], cs)
     # dir_size = convert_byte(getdirsize(image_path))
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 

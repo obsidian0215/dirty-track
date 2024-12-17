@@ -11,22 +11,76 @@ import time
 import subprocess
 import re
 import iptc
+import logging
 from collections import deque
 import threading
+from typing import List, Dict
 
-xfer_async = False
-expected_transfers = set()  # 预期的传输完成标志
-completed_transfers = set()  # 已完成的传输标志
-restore_received = False
-lock = threading.Lock()
-condition = threading.Condition(lock)
+compress = False
 restore_info = None
+
+# 设置日志记录
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global variable to track port list
+INIT_PORT = 12345
+iteration_list = []
+iteration_list: List[int] = []
+port_list: List[int] = [INIT_PORT]
+transfer_processes: Dict[int, subprocess.Popen] = {}
+restore_received = False
+last_iter = 0
+
+# Lock 以确保线程安全
+process_lock = threading.Lock()
+
 
 VIP = "192.168.2.100"
 
 rst_time = 0.0
 
+def handle_pre_xfer_complete(msg):
+    """
+    处理 pre_xfer_complete 命令，等待指定迭代及之前的传输完成。
+    """
+    global last_iter
+    last_iter = msg["pre_xfer_complete"]["transfer_complete"]
+    logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
+
+    # 等待指定迭代及之前的传输完成
+    for iter_num in iteration_list:
+        if iter_num <= last_iter:
+            port = INIT_PORT + 1 + iter_num
+            with process_lock:
+                process = transfer_processes.get(port)
+            if process:
+                logger.info(f"等待端口 {port} 的传输完成")
+                process.wait()  # 阻塞直到进程完成
+                logger.info(f"端口 {port} 的传输已完成")
+                with process_lock:
+                    del transfer_processes[port]
+        else:
+            # 对于大于last_iter的进程，终止它们
+            # 最后一次迭代不包含在iteration_list，不会被终止
+            port = INIT_PORT + 1 + iter_num
+            with process_lock:
+                process = transfer_processes.get(port)
+            if process:
+                logger.info(f"终止端口 {port} 的传输进程")
+                process.terminate()  # 终止该进程
+                process.wait()  # 等待进程终止
+                with process_lock:
+                    del transfer_processes[port]
+                logger.info(f"端口 {port} 的传输进程已终止")
+
+    logger.info(f"迭代 {last_iter} 及之前的传输均已完成，并且其他进程已关闭")
+
+    logger.info(f"迭代 {last_iter} 及之前的传输均已完成")
+    return 'OK'
+
 def prepare(base_path, image_path, parent_path):
+    # parent_path为None时，仅准备image_path
     if os.path.exists(base_path):
         try:
             umount_cmd = 'umount ' + image_path
@@ -57,6 +111,64 @@ def prepare(base_path, image_path, parent_path):
     os.mkdir(image_path)
     os.mkdir(base_path + '/r_log')
     # os.mkdir(base_path + '/lp_log')
+
+def handle_prepare(prepare_info):
+    path = prepare_info['path']
+    image_path = prepare_info['image_path']
+
+    parent_paths = prepare_info.get('parent_path', [])
+    compress = prepare_info.get('compress', False)
+
+    # 初始化监听端口列表和迭代列表
+    for parent in parent_paths:
+        iter_suffix = parent.split('_')[-1]
+        try:
+            iter_num = int(iter_suffix)
+        except ValueError:
+            logger.error(f"无法解析迭代号，从 parent_path 中提取的迭代号为 {iter_suffix}")
+            continue
+        iteration_list.append(iter_num)
+        port = INIT_PORT + 1 + iter_num
+        port_list.append(port)
+
+    path_exist = os.path.exists(path)
+    if not path_exist and not os.path.exists(os.path.dirname(path)):
+        reply = 'Cannot find corresponding container bundle'
+        logger.error(reply)
+    else:
+        prepare(path, image_path, parent_paths)
+
+        # 根据端口和迭代列表，启动ncat进程监听
+        for parent, iter_num, port in zip(parent_paths, iteration_list, port_list):
+            # 定义解压路径
+            extract_path = parent
+
+            # 启动 ncat 监听并解压的管道命令
+            # 命令: nc -l {port} | tar -xzf - -C {extract_path}
+            cmd = f"nc -l {port} | tar -xzf - -C {extract_path}"
+            logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # 将进程记录到字典中
+            with process_lock:
+                transfer_processes[port] = process
+
+        # 最后一个端口用于解压到 image_path
+        if port_list:
+            last_port = port_list[-1]
+            # os.makedirs(image_path, exist_ok=True)
+            extract_path = image_path
+
+            cmd = f"nc -l {last_port} | tar -xzf - -C {extract_path}"
+            logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            with process_lock:
+                transfer_processes[last_port] = process
+
+        reply = 'OK'
+
+    return reply
 
 def transfer_vip():
     """
@@ -237,7 +349,7 @@ def get_rpf_handle_time(lp_log_file):
     total_error_transfer_time = sum(transfer_durations)
     return total_error_transfer_time*1000
 
-def perform_restore(restore_info):
+def perform_restore(msg):
     try:
         lazy = bool(distutils.util.strtobool(msg['restore']['lazy']))
         tty = bool(distutils.util.strtobool(msg['restore']['shell-job']))
@@ -309,6 +421,46 @@ msg['restore']['name'], rst_time, total_uffd_copy_kb, rpf_handle_time)
     os.chdir(old_cwd)
     return reply
 
+def handle_restore(msg):
+    """
+    处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
+    """
+    global restore_received, last_iter
+    os.system('criu -V')  # 检查 CRIU 版本
+    restore_received = True
+    logger.info("收到 restore 指令")
+
+    # 持续等待最后一个迭代传输及指定迭代及之前的传输完成
+    while True:
+        with process_lock:
+            all_transfers_complete = True
+            # 检查所有传输进程是否已完成
+            for iter_num in iteration_list:
+                if iter_num <= last_iter:
+                    port = INIT_PORT + 1 + iter_num
+                    process = transfer_processes.get(port)
+                    if process and process.poll() is None:  # 如果进程尚未完成
+                        all_transfers_complete = False
+                        break
+            # 检查最后一个传输进程是否已完成
+            if transfer_processes:
+                last_port = port_list[-1]
+                last_process = transfer_processes.get(last_port)
+                if last_process and last_process.poll() is None:  # 如果最后一个传输进程尚未完成
+                    all_transfers_complete = False
+
+        if all_transfers_complete:
+            logger.info("所有指定迭代和最后一个迭代的传输已完成，开始执行恢复操作")
+            reply = perform_restore(msg)
+            break
+        else:
+            logger.info("等待所有传输完成后再执行恢复操作")
+            # 休眠一段时间后再次检查
+            time.sleep(2)
+
+    restore_info = None
+    return reply
+
 def migrate_server():
     HOST = ''   # Symbolic name meaning all available interfaces
     PORT = 18863
@@ -331,7 +483,7 @@ def migrate_server():
 
     #Function for handling connections. This will be used to create threads
     def clientthread(conn, addr):
-        global xfer_async, restore_info, expected_transfers, completed_transfers, restore_received
+        global compress, iteration_list, last_iter
         #Sending message to connected client
 
         #infinite loop so that function does not terminate and thread does not end.
@@ -371,108 +523,17 @@ def migrate_server():
                         else:
                             reply = 'Error'
 
-                    case {'pageserver':_}:
-                        #os.system('criu -V')
-                        postcopy = 1
-                        mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
-                        umount_cmd = 'umount ' + msg['pageserver']['path']
-
-                        if msg['pageserver']['iter']:
-                            i = msg['pageserver']['iter']
-
-                        print("start page server")
-                        os.system(mount_cmd)
-
-                        cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
-                        if not i is None:
-                            cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps_{}.log'.format(i)
-                        else:
-                            cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps.log'
-                        print ("Running page server for pre-copy: " + cmd)
-                        ps = subprocess.Popen(cmd, shell=True)
-                        exitcode = ps.poll()
-                        print(exitcode)
-                        if exitcode is not None:
-                            reply = 'remote criu page-server failed'
-                        else:
-                            continue
-
-                    case {'transfer_complete':_}:
-                        transfer_id = msg["transfer_complete"]
-                        if xfer_async:
-                            with condition:
-                                if transfer_id in expected_transfers:
-                                    completed_transfers.add(transfer_id)
-                                    print(f"收到传输完成标志: {transfer_id}")
-                                else:
-                                    print(f"收到未知的传输完成标志: {transfer_id}")
-
-                                # 如果已收到 restore 指令并且所有传输完成，执行恢复
-                                if restore_received and completed_transfers >= expected_transfers:
-                                    print("所有传输完成且收到 restore 指令，开始恢复")
-                                    reply = perform_restore(restore_info)
-                                    # 重置状态
-                                    expected_transfers.clear()
-                                    completed_transfers.clear()
-                                    restore_received = False
-                                    restore_info = None
-                                else:
-                                    reply = "OK"
-                        else:
-                            reply = 'Received, but server not in async-xfer mode'
+                    case {'pre_xfer_complete':_}:
+                        # 只需等待该次及之前迭代以及最后一次迭代的传输完成
+                        # 中间的所有ncat线程全部可以退出，不会被用于传输
+                        handle_pre_xfer_complete(msg)
 
                     case {'prepare': prepare_info}:
-                        path = prepare_info['path']
-                        image_path = prepare_info['image_path']
-
-                        if 'parent_path' in prepare_info:
-                            parent_paths = prepare_info['parent_path']  # parent_path为列表
-                        else:
-                            parent_paths = []
-                        if 'async' in prepare_info:
-                            xfer_async = prepare_info['async']
-                        if xfer_async:
-                            with condition:
-                                expected_transfers.clear()
-                                completed_transfers.clear()
-                                restore_received = False
-                                # 设置预期的传输标志
-                                for parent in parent_paths:
-                                    transfer_id = f"pre_dump_{parent.split('_')[-1]}"
-                                    expected_transfers.add(transfer_id)
-                                expected_transfers.add("dump")  # 添加 DUMP 的传输标志
-                                print(f"预期的传输标志: {expected_transfers}")
-
-                        path_exist = os.path.exists(path)
-                        if not path_exist and not os.path.exists(path + '/..'):
-                            reply = 'Cannot find corresponding container bundle'
-                        else:
-                            prepare(path, image_path, parent_paths)
-                            # parent_path为None时，仅准备image_path
-                            reply = 'OK'
-                            # continue
-
+                        reply = handle_prepare(prepare_info)
                     case {'restore':_}:
-                        os.system('criu -V')
-                        if xfer_async:
-                            with condition:
-                                restore_received = True
-                                restore_info = msg["restore"]
-                                print("收到 restore 指令")
-
-                                # 如果所有传输已完成，立即执行恢复
-                                if completed_transfers >= expected_transfers and expected_transfers:
-                                    print("所有传输完成，开始恢复")
-                                    reply = perform_restore(restore_info)
-                                    # 重置状态
-                                    expected_transfers.clear()
-                                    completed_transfers.clear()
-                                    restore_received = False
-                                    restore_info = None
-                                else:
-                                    print("等待所有传输完成后再执行恢复")
-                        else:
-                            reply = perform_restore(msg["restore"])
+                        # 如果所有传输已完成，立即执行恢复
+                        # 所有传输指last_iter及之前的传输，和最大端口对应的传输
+                        reply = handle_restore(msg)
 
                     case _:
                         print("Unknown request: " + msg)
@@ -601,3 +662,28 @@ if __name__ == '__main__':
 #     forward_table.commit()
 
 #     print("已移除iptables规则，允许destination直接响应客户端。")
+#                     case {'pageserver':_}:
+#                         #os.system('criu -V')
+#                         postcopy = 1
+#                         mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
+#                         umount_cmd = 'umount ' + msg['pageserver']['path']
+
+#                         if msg['pageserver']['iter']:
+#                             i = msg['pageserver']['iter']
+
+#                         print("start page server")
+#                         os.system(mount_cmd)
+
+#                         cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
+#                         if not i is None:
+#                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps_{}.log'.format(i)
+#                         else:
+#                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps.log'
+#                         print ("Running page server for pre-copy: " + cmd)
+#                         ps = subprocess.Popen(cmd, shell=True)
+#                         exitcode = ps.poll()
+#                         print(exitcode)
+#                         if exitcode is not None:
+#                             reply = 'remote criu page-server failed'
+#                         else:
+#                             continue
