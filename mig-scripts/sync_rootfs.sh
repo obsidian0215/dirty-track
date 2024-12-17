@@ -23,6 +23,14 @@ fi
 cd "$rootfs" || { echo "无法切换到目录 $rootfs"; exit 1; }
 
 cd $rootfs  # rsync同步的特性，这里必须要先cd到源目录，inotify再监听./ 才能rsync同步后目录结构一致
+
+# 同步config.json
+rsync -avz --timeout=100 "$rootfs/../config.json" "root@$host:$rootfs/../config.json"
+if [ $? -ne 0 ]; then
+    echo "同步config.json失败"
+    exit 1
+fi
+
 rsync -ahvzP --delete --timeout=100 "$rootfs/" "root@$host:$rootfs/"   # 首先执行一次rsync，保证目录结构一致
 if [ $? -ne 0 ]; then
     echo "初始 rsync 失败"
