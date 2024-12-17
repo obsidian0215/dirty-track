@@ -29,7 +29,6 @@ iteration_list = []
 iteration_list: List[int] = []
 port_list: List[int] = [INIT_PORT]
 transfer_processes: Dict[int, subprocess.Popen] = {}
-restore_received = False
 last_iter = 0
 
 # Lock 以确保线程安全
@@ -44,7 +43,7 @@ def handle_pre_xfer_complete(msg):
     """
     处理 pre_xfer_complete 命令，等待指定迭代及之前的传输完成。
     """
-    global last_iter
+    global last_iter, iteration_list
     last_iter = msg["pre_xfer_complete"]
     logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
 
@@ -75,8 +74,6 @@ def handle_pre_xfer_complete(msg):
                 logger.info(f"端口 {port} 的传输进程已终止")
 
     logger.info(f"迭代 {last_iter} 及之前的传输均已完成，并且其他进程已关闭")
-
-    logger.info(f"迭代 {last_iter} 及之前的传输均已完成")
     return 'OK'
 
 def prepare(base_path, image_path, parent_path):
@@ -113,7 +110,7 @@ def prepare(base_path, image_path, parent_path):
     # os.mkdir(base_path + '/lp_log')
 
 def handle_prepare(prepare_info):
-    global compress
+    global compress, iteration_list, port_list
     path = prepare_info['path']
     image_path = prepare_info['image_path']
 
@@ -429,9 +426,8 @@ def handle_restore(msg):
     """
     处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
     """
-    global restore_received, last_iter
+    global last_iter
     os.system('criu -V')  # 检查 CRIU 版本
-    restore_received = True
     logger.info("收到 restore 指令")
 
     # 持续等待最后一个迭代传输及指定迭代及之前的传输完成
