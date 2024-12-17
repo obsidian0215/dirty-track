@@ -738,15 +738,23 @@ def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
         nonlocal parent_path, dest, i, cs, port, iter_terminate
         print(f"开始传输 PRE-DUMP {i} 到 {dest}")
         if compress:
-            cmd_tar = f"tar -czf - -C {parent_path} . | nc {dest} {port}"
+            archive_name = "pre_dump_{i}.tar.gz"
+            cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
         else:
-            cmd_tar = f"tar -cf - -C {parent_path} . | nc {dest} {port}"
+            archive_name = "pre_dump_{i}.tar"
+            cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
         start = time.perf_counter() * 1000
         ret = os.system(cmd_tar)
         end = time.perf_counter() * 1000
+        print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
+        pre_dump_xfer_time_total += end - start
+        # 传输到目标服务器
+        nc_cmd = f"nc {dest} {port} < {archive_name}"
+        start = time.perf_counter() * 1000
+        ret = os.system(nc_cmd)
+        end = time.perf_counter() * 1000
         print(f"PRE-DUMP {i} 传输时间 {(end - start):.3f} ms")
         pre_dump_xfer_time_total += end - start
-
         if ret != 0:
             error()
 
@@ -767,22 +775,41 @@ def xfer_final_async(image_path, dest, port, cs):
         nonlocal image_path, dest, cs
         print(f"开始传输 DUMP 到 {dest}")
         if compress:
-            cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
+            archive_name = "dump.tar.gz"
+            cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
         else:
-            cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
+            archive_name = "dump.tar"
+            cmd_tar = f"tar -cf {archive_name} -C {image_path} ."
         start = time.perf_counter() * 1000
         ret = os.system(cmd_tar)
         end = time.perf_counter() * 1000
+        print(f"DUMP 压缩时间 {(end - start):.3f} ms")
+        dump_xfer_time += end - start
+        # 传输到目标服务器
+        nc_cmd = f"nc {dest} {port} < {archive_name}"
+        start = time.perf_counter() * 1000
+        ret = os.system(nc_cmd)
+        end = time.perf_counter() * 1000
         print(f"DUMP 传输时间 {(end - start):.3f} ms")
-        dump_xfer_time = end - start
-
+        dump_xfer_time += end - start
         if ret != 0:
             error()
+        # if compress:
+        #     cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
+        # else:
+        #     cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
+        # start = time.perf_counter() * 1000
+        # ret = os.system(cmd_tar)
+        # end = time.perf_counter() * 1000
+        # print(f"DUMP 传输时间 {(end - start):.3f} ms")
+        # dump_xfer_time = end - start
+        # if ret != 0:
+        #     error()
 
         # 传输完成后发送标志
-        transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
-        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-        print("已发送 DUMP 传输完成标志")
+        # transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
+        # cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+        # print("已发送 DUMP 传输完成标志")
         # event.set()  # 设置事件，表示传输完成
 
     transfer_thread = threading.Thread(target=transfer)
@@ -842,7 +869,7 @@ def parse_stats_dump(stats_dump_path, log_type):
     try:
         # 执行 'crit decode' 命令并获取输出
         result = subprocess.run(
-            ['crit', 'decode', stats_dump_path],
+            ['crit', 'show', stats_dump_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

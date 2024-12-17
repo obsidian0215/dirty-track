@@ -113,6 +113,7 @@ def prepare(base_path, image_path, parent_path):
     # os.mkdir(base_path + '/lp_log')
 
 def handle_prepare(prepare_info):
+    global compress
     path = prepare_info['path']
     image_path = prepare_info['image_path']
 
@@ -145,7 +146,10 @@ def handle_prepare(prepare_info):
 
             # 启动 ncat 监听并解压的管道命令
             # 命令: nc -l {port} | tar -xzf - -C {extract_path}
-            cmd = f"nc -l {port} | tar -xzf - -C {extract_path}"
+            if compress:
+                cmd = f"nc -l {port} | tar -xzf - -C {extract_path}"
+            else:
+                cmd = f"nc -l {port} | tar -xf - -C {extract_path}"
             logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -269,7 +273,7 @@ def parse_stats_restore(stats_restore_path):
     try:
         # 执行 'crit decode' 命令并获取输出
         result = subprocess.run(
-            ['crit', 'decode', stats_restore_path],
+            ['crit', 'show', stats_restore_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
