@@ -355,7 +355,7 @@ int main(int argc, char *argv[]) {
         // 累积运行时间，每2s重置并输出平均运行时间
         total_run_duration_ns += last_run_duration_ns;
         i++;
-        if (total_run_duration_ns >= 2e10) {
+        if (total_run_duration_ns >= 2000000000) {
             // 输出运行时间
             printf("Dirty-track run time: %ld ns\n", total_run_duration_ns /i);
             total_run_duration_ns = 0;
