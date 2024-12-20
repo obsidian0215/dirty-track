@@ -43,13 +43,19 @@ def handle_pre_xfer_complete(msg):
     处理 pre_xfer_complete 命令，等待指定迭代及之前的传输完成。
     """
     global last_iter, iteration_list
-    last_iter = msg["pre_xfer_complete"]
+    try:
+        last_iter = msg["pre_xfer_complete"]
+    except Exception as e:
+        print("error;",e)
     logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
-
     # 等待指定迭代及之前的传输完成
+
     for iter_num in iteration_list:
-        if iter_num <= last_iter:
-            port = INIT_PORT + 1 + iter_num
+        last_iter = int(last_iter)
+        #print("iter_num:",iter_num)
+        #print("last_iter:",last_iter)
+        if iter_num < last_iter:
+            port = INIT_PORT  + iter_num  #  -1
             with process_lock:
                 process = transfer_processes.get(port)
             if process:
@@ -61,11 +67,12 @@ def handle_pre_xfer_complete(msg):
         else:
             # 对于大于last_iter的进程，终止它们
             # 最后一次迭代不包含在iteration_list，不会被终止
-            port = INIT_PORT + 1 + iter_num
+            port = INIT_PORT + iter_num - 1
             with process_lock:
                 process = transfer_processes.get(port)
             if process:
-                logger.info(f"终止端口 {port} 的传输进程")
+                logger.info(f"终止端口 {port} 的传输进程{process}")
+                #print_transfer_processes()
                 process.terminate()  # 终止该进程
                 process.wait()  # 等待进程终止
                 with process_lock:
@@ -109,6 +116,8 @@ def prepare(base_path, image_path, parent_path):
 
 def handle_prepare(prepare_info):
     global compress, iteration_list, port_list
+    print("port_list:",port_list)
+
     path = prepare_info['path']
     image_path = prepare_info['image_path']
 
@@ -124,9 +133,10 @@ def handle_prepare(prepare_info):
             logger.error(f"无法解析迭代号，从 parent_path 中提取的迭代号为 {iter_suffix}")
             continue
         iteration_list.append(iter_num)
-        port = INIT_PORT + 1 + iter_num
+        port = INIT_PORT + iter_num
         port_list.append(port)
-
+        #print(port_list)
+    #input()
     path_exist = os.path.exists(path)
     if not path_exist and not os.path.exists(os.path.dirname(path)):
         reply = 'Cannot find corresponding container bundle'
@@ -135,19 +145,19 @@ def handle_prepare(prepare_info):
         prepare(path, image_path, parent_paths)
 
         # 根据端口和迭代列表，启动ncat进程监听
+        print(port_list)
         for parent, iter_num, port in zip(parent_paths, iteration_list, port_list):
             # 定义解压路径
             extract_path = parent
-
             # 启动 ncat 监听并解压的管道命令
             # 命令: nc -l {port} | tar -xzf - -C {extract_path}
             if compress:
-                cmd = f"nc -l {port} | tar -xzf - -C {extract_path}"
+                cmd = f"nc -lp {port} | tar -xzf - -C {extract_path}"
             else:
-                cmd = f"nc -l {port} | tar -xf - -C {extract_path}"
+                cmd = f"nc -lp {port} | tar -xf - -C {extract_path}"
             logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
+            #print("process id:",process)
             # 将进程记录到字典中
             with process_lock:
                 transfer_processes[port] = process
@@ -157,14 +167,17 @@ def handle_prepare(prepare_info):
             last_port = port_list[-1]
             # os.makedirs(image_path, exist_ok=True)
             extract_path = image_path
-
-            cmd = f"nc -l {last_port} | tar -xzf - -C {extract_path}"
+            if compress:
+                cmd = f"nc -lp {last_port} | tar -xzf - -C {extract_path}"
+            else:
+                cmd = f"nc -lp {last_port} | tar -xf - -C {extract_path}"
+                #cmd = f"nc -lp {last_port} "
+                #cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
             logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
             with process_lock:
                 transfer_processes[last_port] = process
-
+        #print_transfer_processes()
         reply = 'OK'
 
     return reply
@@ -358,7 +371,7 @@ def perform_restore(msg):
 
     old_cwd = os.getcwd()
     os.chdir(msg['restore']['path'])
-
+ #   input()
     # 构建恢复命令
     cmd = 'time -p runc restore --console-socket ' + msg['restore']['path']
     cmd += '/console.sock -d  --image-path ' + msg['restore']['image_path']
@@ -374,7 +387,7 @@ def perform_restore(msg):
 
     # 若启用post-copy，则先启动lazy-pages守护进程
     if lazy:
-        lazy_cmd = "criu lazy-pages --page-server --address " + addr
+        lazy_cmd = "criu lazy-pages --page-server --address " + str(source_ip)
         lazy_cmd += " --port 27 -v4 -D "
         lazy_cmd += msg['restore']['image_path']
         lazy_cmd += " -W " + msg['restore']['path'] + "/migrate/r_log"
@@ -420,6 +433,15 @@ msg['restore']['name'], rst_time, total_uffd_copy_kb, rpf_handle_time)
     os.chdir(old_cwd)
     return reply
 
+def print_transfer_processes():
+    if not transfer_processes:
+        print("transfer_processes 字典为空。")
+    else:
+        print("当前 transfer_processes 内容:")
+        for port, process in transfer_processes.items():
+            status = '运行中' if process.poll() is None else f'已结束 (退出码: {process.returncode})'
+            print(f"  端口: {port}, PID: {process.pid}, 状态: {status}, 命令: {process.args}")
+
 def handle_restore(msg):
     """
     处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
@@ -430,6 +452,7 @@ def handle_restore(msg):
 
     # 持续等待最后一个迭代传输及指定迭代及之前的传输完成
     while True:
+        print_transfer_processes()
         with process_lock:
             all_transfers_complete = True
             # 检查所有传输进程是否已完成
@@ -437,16 +460,37 @@ def handle_restore(msg):
                 if iter_num <= last_iter:
                     port = INIT_PORT + 1 + iter_num
                     process = transfer_processes.get(port)
+                    # if process and process.poll() is None:  # 如果进程尚未完成
+                    #     all_transfers_complete = False
+                    #     break
+                    if process:
+                        status = process.poll()
+                        print(f"端口 {port} 对应的进程状态: {'运行中' if status is None else '已结束'}")
+                    else:
+                        print(f"端口 {port} 没有对应的传输进程")
                     if process and process.poll() is None:  # 如果进程尚未完成
+                        print(f"发现端口 {port} 的传输进程仍在运行，设置 all_transfers_complete = False")
                         all_transfers_complete = False
                         break
             # 检查最后一个传输进程是否已完成
             if transfer_processes:
                 last_port = port_list[-1]
+                print(f"开始检查最后一个传输进程的端口号: {last_port}")
+                print_transfer_processes()
+                #time.sleep(2)
                 last_process = transfer_processes.get(last_port)
+                #print("last_process:",last_process)
+                if last_process:
+                    last_status = last_process.poll()
+                    print(f"最后一个端口 {last_port} 对应的进程状态: {'运行中' if last_status is None else '已结束'}")
+                else:
+                    print(f"最后一个端口 {last_port} 没有对应的传输进程")
+                   # input()
                 if last_process and last_process.poll() is None:  # 如果最后一个传输进程尚未完成
+                    print(f"发现最后一个端口 {last_port} 的传输进程仍在运行，设置 all_transfers_complete = False")
                     all_transfers_complete = False
-
+            else:
+                print("transfer_processes 字典为空，跳过最后一个传输进程的检查")
         if all_transfers_complete:
             logger.info("所有指定迭代和最后一个迭代的传输已完成，开始执行恢复操作")
             reply = perform_restore(msg)
@@ -507,7 +551,8 @@ def migrate_server():
             try:
                 #Parse JSON string into Python dictionary
                 msg = json.loads(decoded_data)
-                print(msg)
+                print("clientthread msg:",msg)
+                #print("msg keys:", list(msg.keys()), repr(list(msg.keys())[0]))
 
                 old_cwd = os.getcwd()
 
@@ -524,6 +569,7 @@ def migrate_server():
                     case {'pre_xfer_complete':_}:
                         # 只需等待该次及之前迭代以及最后一次迭代的传输完成
                         # 中间的所有ncat线程全部可以退出，不会被用于传输
+                        #print("============handle_pre_xfer_complete=============")
                         handle_pre_xfer_complete(msg)
 
                     case {'prepare': prepare_info}:
