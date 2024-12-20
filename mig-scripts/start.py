@@ -1,9 +1,9 @@
+
 import subprocess
 import sys
 import time
 import argparse
 import re
-
 
 SOURCE_IP = None
 DEST_IP = None
@@ -26,7 +26,7 @@ def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
         # 同时将输出重定向到文件，防止阻塞
         cmd = f"nohup {cmd}  &"
 
-    full_cmd = f"ssh {DEST_IP} '{cmd}'"
+    full_cmd = f"ssh {DEST_IP} \"{cmd}\""
     print("Executing remotely:", full_cmd)
     result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 and not ignore_error:
@@ -34,10 +34,6 @@ def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
         sys.exit(1)
     else:
         print(result.stdout)
-
-
-
-
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
     """
@@ -179,7 +175,9 @@ def destination_clean(args):
     cmds = [
         (f"runc kill {container_name}", True),  # 如果容器不存在可忽略错误
         (f"runc delete {container_name}", True), # 如果容器不存在可忽略错误
-        (f"kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null",True) # 杀死recvtty进程
+        (f"kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null",True), # 杀死recvtty进程
+        #(f"ps aux | grep '[n]c -lp' | awk '{{print $2}}' | xargs -r kill -9", False),
+        (f"ps aux | grep '[n]c -lp' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9", True)
     ]
 
     for c, ign in cmds:
@@ -192,11 +190,9 @@ def execute_ycsb_tests():
     run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=DEST_IP)
     run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP)
 
-
     # 还原keepalived配置
     update_keepalived_priority(100)
     update_keepalived_priority(50,True,DEST_IP)
-
 
     # 杀死之前可能未完成的run进程, 开启load
     run_remote_cmd('pkill -f "ycsb run redis"; pkill -f "site.ycsb.Client"',target_ip=CLIENT_IP,ignore_error=True)
@@ -255,7 +251,6 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         else:
             run_cmd(cmd, ignore_error=ignore_error)
 
-
 def configure_network():
     # 清空网络配置
     run_cmd("sudo tc qdisc del dev ens33 root",ignore_error=True)
@@ -299,9 +294,8 @@ experiments = {
     "pre-copy-dirtymap": "-pre -d -t -s -dm",
     "post-copy": "-post -d -t -s",
     "hybrid": "-pre -post -d -t -s",
-    "hybrid-dirtymap": "-pre -post -d -t -s -dm"
+    #"hybrid-dirtymap": "-pre -post -d -t -s -dm"
 }
-
 
 # 每种实验进行三次
 runs = 3
@@ -316,8 +310,6 @@ if __name__ == "__main__":
     parser.add_argument("--client-ip", required=False, help="IP address of the machine running client such as ycsb.")
     parser.add_argument("--virtual-ip", required=False, help="virtual ip ")
     args = parser.parse_args()
-
-
 
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
@@ -352,6 +344,7 @@ if __name__ == "__main__":
             finally:
                 # 无论前面是否出错，清理源和目标节点资源
                 print("Cleaning up source and destination resources...")
+                input()
                 source_clean(args)
                 destination_clean(args)
 
