@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <endian.h> // 用于字节序转换
 
 // 假设内核使用小端字节序
