@@ -33,7 +33,7 @@ int main(int argc, char *argv[]) {
 
     // 逐个读取文件中的索引（页地址）和结构体数据
     index = 0;
-    ret = fread(&file_header, sizeof(file_header_t), 1, file)
+    ret = fread(&file_header, sizeof(file_header_t), 1, file);
     if (ret != 1) {
         perror("Error reading file_header_t data");
         fclose(file);
