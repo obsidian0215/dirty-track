@@ -40,7 +40,7 @@ int main(int argc, char *argv[]) {
         fclose(file);
         return 1;
     }
-    printf("Track duration: 0x%lu ns\n",
+    printf("Track duration: %lu ns\n",
                    file_header.track_duration_ns);
 
     while (ret = fread(&dirty_page, sizeof(struct dirty_page), 1, file)) {
