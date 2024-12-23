@@ -161,7 +161,8 @@ static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff
     struct xarray *xarray = &dti->dirty_xarray;
     unsigned long address;
     dirty_address_t *entry;
-    u64 total_duration_ns = cpu_to_le64(dti->end_time - dti->start_time);   // 确保字节序一致性
+    s64 total_duration_ns = ktime_to_ns(ktime_sub(dti->end_time, dti->start_time));
+    u64 total_duration_le = cpu_to_le64(total_duration_ns);   // 确保字节序一致性
 
     // 写入追踪持续时间
     // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
