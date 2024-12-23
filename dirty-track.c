@@ -164,6 +164,7 @@ static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff
     s64 total_duration_ns = ktime_to_ns(ktime_sub(dti->end_time, dti->start_time));
     u64 total_duration_le = cpu_to_le64(total_duration_ns);   // 确保字节序一致性
 
+    printk(KERN_INFO "[PID %d] Total dirty-track duration: %lld ns\n", dti->pid, total_duration_ns);
     // 写入追踪持续时间
     // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
     kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), pos);
