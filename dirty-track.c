@@ -163,14 +163,15 @@ static inline void dirty_map_to_file(struct xarray *xarray,
     u64 total_duration_le = cpu_to_le64(track_duration_ns); // 确保字节序一致性
 
     // 写入追踪持续时间
+    // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
     kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), pos);
     // 遍历xarray，输出索引（页地址）和脏页统计数据
     xa_for_each(xarray, address, entry) {
         // 先写入页地址（索引）
-        kernel_write(file, (char *)&address, sizeof(address), &file->f_pos);
+        kernel_write(file, (char *)&address, sizeof(address), pos);
 
         // 再写入脏页统计数据
-        kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), &file->f_pos);
+        kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), pos);
     }
 }
 
