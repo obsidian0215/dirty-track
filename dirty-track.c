@@ -94,7 +94,8 @@ typedef struct dirty_track {
 
     /* 时间追踪字段 */
     ktime_t start_time;            // 追踪开始时间
-    s64 track_duration_ns;         // 累计持续时间（纳秒）
+    ktime_t end_time;              // 追踪结束时间
+    // s64 track_duration_ns;         // 累计持续时间（纳秒）
 } dirty_track_t;
 
 // 保存单个页的修改历史
@@ -156,15 +157,15 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
 // 将xarray序列化为数组，并保存在tmpfs文件中
 // xarray仅内核可用，用户态内无等价实现
 // 需要将xarray索引(即脏页地址)一起序列化
-static inline void dirty_map_to_file(struct xarray *xarray,
-        struct file *file, loff_t *pos, s64 track_duration_ns) {
+static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff_t *pos) {
+    struct xarray *xarray = dti->dirty_xarray;
     unsigned long address;
     dirty_address_t *entry;
-    u64 total_duration_le = cpu_to_le64(track_duration_ns); // 确保字节序一致性
+    u64 total_duration_ns = cpu_to_le64(dti->end_time - dti->start_time);   // 确保字节序一致性
 
     // 写入追踪持续时间
     // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
-    kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), pos);
+    kernel_write(file, (char *)&total_duration_ns, sizeof(total_duration_ns), pos);
     // 遍历xarray，输出索引（页地址）和脏页统计数据
     xa_for_each(xarray, address, entry) {
         // 先写入页地址（索引）
@@ -730,7 +731,7 @@ static void post_kthread_stop(dirty_track_t *dti) {
             struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
             if (!IS_ERR(file)) {
                 loff_t pos = 0;
-                dirty_map_to_file(&dti->dirty_xarray, file, &pos, dti->track_duration_ns);
+                dirty_map_to_file(dti, file, &pos);
                 filp_close(file, NULL);
             } else {
                 printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
@@ -771,13 +772,13 @@ static int wp_fault_track(void *data) {
 
     start = ktime_get();
     dti->start_time = start;
-    dti->track_duration_ns = 0;
+    // dti->track_duration_ns = 0;
     ret = clear_soft_dirty_once(dti);
     end = ktime_get();
     delta_ns = ktime_to_ns(ktime_sub(end, start));
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
-        dti->track_duration_ns += delta_ns;
+        // dti->track_duration_ns += delta_ns;
         dti->soft_cleared = true;
         if (delta_ns < INIT_DELAY / 10) {
             default_delay = 9 * delta_ns;
@@ -807,7 +808,7 @@ static int wp_fault_track(void *data) {
                 struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
                 if (!IS_ERR(file)) {
                     loff_t pos = 0;
-                    dirty_map_to_file(&dti->dirty_xarray, file, &pos, dti->track_duration_ns);
+                    dirty_map_to_file(dti, file, &pos);
                     filp_close(file, NULL);
                 } else {
                     printk(KERN_ERR "Failed to open dirty-map file for PID %d: %ld\n", dti->pid, PTR_ERR(file));
@@ -835,7 +836,7 @@ static int wp_fault_track(void *data) {
                 ret = clear_soft_dirty_once(dti);
                 end = ktime_get();
                 delta_ns = ktime_to_ns(ktime_sub(end, start));
-                dti->track_duration_ns += delta_ns;
+                // dti->track_duration_ns += delta_ns;
                 if (ret) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
@@ -874,6 +875,8 @@ static int wp_fault_track(void *data) {
             }
         }
     }
+    // 获取当前时间戳
+    dti->end_time = ktime_get();
     post_kthread_stop(dti);
     return ret;
 }
