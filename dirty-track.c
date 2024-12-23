@@ -158,7 +158,7 @@ bool mm_struct_can_be_freed(struct mm_struct *mm)
 // xarray仅内核可用，用户态内无等价实现
 // 需要将xarray索引(即脏页地址)一起序列化
 static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff_t *pos) {
-    struct xarray *xarray = dti->dirty_xarray;
+    struct xarray *xarray = &dti->dirty_xarray;
     unsigned long address;
     dirty_address_t *entry;
     u64 total_duration_ns = cpu_to_le64(dti->end_time - dti->start_time);   // 确保字节序一致性
