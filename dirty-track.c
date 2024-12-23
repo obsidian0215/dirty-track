@@ -166,7 +166,7 @@ static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff
 
     // 写入追踪持续时间
     // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
-    kernel_write(file, (char *)&total_duration_ns, sizeof(total_duration_ns), pos);
+    kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), pos);
     // 遍历xarray，输出索引（页地址）和脏页统计数据
     xa_for_each(xarray, address, entry) {
         // 先写入页地址（索引）
@@ -804,6 +804,8 @@ static int wp_fault_track(void *data) {
 
         // 检查是否由ioctl请求停止
         if (dti->stop_requested) {
+            // 获取当前时间戳
+            dti->end_time = ktime_get();
             // write dirty_map to file
             if (!xa_empty(&dti->dirty_xarray)) {
                 struct file *file = filp_open(dti->dirty_map_path, O_WRONLY | O_CREAT, 0644);
