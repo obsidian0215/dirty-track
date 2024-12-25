@@ -211,27 +211,49 @@ def read_unsigned_long(file_path):
         print(f"Error reading {file_path}: {e}")
         return []
 
+import struct
+
 def read_dirtymap(file_path):
     """
-    读取dirtymap文件，返回其中记录的脏页地址
+    读取dirtymap文件，返回文件头（时间）和记录的脏页地址。
     """
     try:
         with open(file_path, 'rb') as f:
             data = f.read()
+
+            # 文件头大小（unsigned long）
+            header_size = 8  # sizeof(unsigned long)
+
+            # 验证文件长度是否足够
+            if len(data) < header_size:
+                print(f"Invalid dirtymap file: file size ({len(data)} bytes) is too small.")
+                return None, []
+
+            # 读取文件头（时间）
+            time_header = struct.unpack('<Q', data[:header_size])[0]
+
+            # 每个条目的大小
             entry_size = 12  # sizeof(unsigned long) + sizeof(unsigned int)
+
+            # 剩余数据的长度
+            data = data[header_size:]
+
             if len(data) % entry_size != 0:
-                print(f"Invalid dirtymap file size: {len(data)} bytes")
-                return []
+                print(f"Invalid dirtymap file size after header: {len(data)} bytes")
+                return time_header, []
+
+            # 解析脏页地址和写次数
             count = len(data) // entry_size
             addresses = []
             for i in range(count):
                 entry = data[i*entry_size:(i+1)*entry_size]
                 address, write_count = struct.unpack('<QI', entry)
                 addresses.append(address)
-            return addresses
+
+            return time_header, addresses
     except Exception as e:
         print(f"Error reading dirtymap file {file_path}: {e}")
-        return []
+        return None, []
 
 def merge_addresses(dirty_addresses, candidate_addresses):
     """
@@ -288,7 +310,7 @@ def container_may_dump_size(container_pids, dirtymap_path):
         # 步骤2: 加载最新的dirtymap
         if latest_timestamp != 0:
             dirtymap_file = os.path.join(dirtymap_path, f"{pid}-{latest_timestamp}.dirtymap")
-            dirty_addresses = read_dirtymap(dirtymap_file)
+            track_time, dirty_addresses = read_dirtymap(dirtymap_file)
             print(f"[PID {pid}] Loaded {len(dirty_addresses)} dirty addresses")
         else:
             dirty_addresses = []
@@ -307,6 +329,71 @@ def container_may_dump_size(container_pids, dirtymap_path):
         total_transfer_size += pid_may_dump_size(merged_addresses)
 
     return total_transfer_size
+
+def read_warmlist(file_path):
+    """
+    读取warmlist文件，返回其中选择次数(uchar)最大的脏页地址(ulong)和选择次数
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+
+            # 每个条目的大小
+            entry_size = 9  # sizeof(unsigned long) + sizeof(unsigned char)
+
+            # 验证文件长度是否有效
+            if len(data) % entry_size != 0:
+                print(f"Invalid warmlist file size: {len(data)} bytes")
+                return None, None
+
+            count = len(data) // entry_size
+            max_address = None
+            max_s_count = 0  # 初始化最大选择次数
+
+            for i in range(count):
+                # 解析单个条目
+                entry = data[i*entry_size:(i+1)*entry_size]
+                address, s_count = struct.unpack('<QB', entry)  # Q: unsigned long, B: unsigned char
+
+                # 更新最大值
+                if s_count > max_s_count:
+                    max_address = address
+                    max_s_count = s_count
+
+            return max_address, max_s_count
+    except Exception as e:
+        print(f"Error reading warmlist file {file_path}: {e}")
+        return None, None
+
+def read_max_scount(container_pids, dirtymap_path):
+    """
+    遍历container_pids, 遍历每个pid的温页列表, 找到其中最大的选择次数
+
+    参数:
+    - container_pids: 包含容器的 PID 列表
+    - dirtymap_path: 存放 warm_list.pid 文件的目录路径
+
+    返回:
+    - max_scount: 所有温页列表中最大的选择次数
+    """
+    max_scount = 0  # 初始化最大选择次数
+
+    for pid in container_pids:
+        # 拼接文件路径
+        warm_list_file = os.path.join(dirtymap_path, f"warm_list.{pid}")
+
+        # 调用 read_warmlist 函数读取温页列表
+        max_address, max_scount_pid = read_warmlist(warm_list_file)
+
+        if max_address is None or max_scount_pid is None:
+            print(f"No valid data found for pid {pid}. Skipping.")
+            continue
+
+        # 更新全局最大选择次数
+        if max_scount_pid > max_scount:
+            max_scount = max_scount_pid
+
+    return max_scount
 
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
@@ -388,20 +475,6 @@ def getdirsize(path, pattern=None):
         # else:
         #     print('the total size of {} is {}'.format(path, tsize))
         return tsize
-
-# def convert_byte(tsize):
-#     if tsize < 1024:
-#         return(round(tsize,2),'Byte')
-#     else:
-#         KBX = tsize / 1024
-#         if KBX < 1024:
-#             return(round(KBX,2),'KB')
-#         else:
-#             MBX = KBX / 1024
-#             if MBX < 1024:
-#                 return(round(MBX,2),'MB')
-#             else:
-#                 return(round(MBX/1024,2),'GB')
 
 # 带宽测量（使用异步或多线程）
 def measure_bandwidth(dest_ip):
@@ -559,7 +632,6 @@ def pre_dump(mig_base, container, i, dirtymap):
     if ret != 0:
         error()
 
-
 def real_dump_0(mig_base, tty, netdump):
     global dump_time, dump_size, dump_xfer_time
     old_cwd = os.getcwd()
@@ -686,51 +758,64 @@ def xfer_pre_dump(parent_path, dest, i, port):
     # print(f"xfer PRE-DUMP {i}")
 
     # 创建压缩包并通过SSH传输并解压
+    print(f"开始传输 PRE-DUMP {i} 到 {dest}")
     if compress:
-        cmd_tar = f"tar -czf - -C {parent_path} . | nc {dest} {port}"
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
+        cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
     else:
-        cmd_tar = f"tar -cf - -C {parent_path} . | nc {dest} {port}"
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
+    print(cmd_tar)
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
+    # 检查返回值
+    if ret != 0:
+        # os.system返回值是退出状态码左移8位，需要右移8位获取实际退出码
+        exit_code = ret >> 8
+        print(f"pre_dump_{i} tar命令执行失败，退出码: {exit_code}")
+        # 可根据需要处理:
+        # 1. 抛出异常
+        raise RuntimeError(f" pre_dump_{i} tar命令执行失败(退出码 {exit_code})，请检查{parent_path}目录或权限。")
+        # 或者 2. 打印警告并返回
+        # return
 
-    # # 创建压缩包并通过rsync传输
-    # archive_name = f"pre_dump_{i}.tar.gz"
-    # cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
-    # ret = os.system(cmd_tar)
-    # if ret != 0:
-    #     error()
-    # cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, archive_name, dest, parent_path)
-    # print("Transferring PRE-DUMP %d to %s" % (i, dest))
-    # start = time.perf_counter() * 1000
-    # ret = os.system(cmd)
-    # end = time.perf_counter() * 1000
-    # transfer_time = end - start
-    # print("PRE-DUMP %d transfer time %.3f ms" % (i, transfer_time))
-    # # 在目标服务器上解压
-    # cmd_ssh = f"ssh {dest} 'tar -xzf {parent_path}/{archive_name} -C {parent_path}'"
-    # ret = os.system(cmd_ssh)
-    # if ret != 0:
-    #     error()
+    # 若执行成功，可检查文件是否真的存在且非空
+    if not os.path.exists(archive_name):
+        print(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
+        raise FileNotFoundError(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
+    else:
+        # 还可检查tar文件大小，若为0说明打包空目录失败
+        size = os.path.getsize(archive_name)
+        if size == 0:
+            print(f"pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
+            raise ValueError(f" pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
+        else:
+            print(f"pre_dump_{i} 打包文件 {archive_name} 大小为{size}")
+    print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
+    pre_dump_xfer_time_total += end - start
+    # 传输到目标服务器
+    nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
+    if not os.path.exists(archive_name):
+        print(f"File {archive_name} does not exist!")
+    print(nc_cmd)
+
+    start = time.perf_counter() * 1000
+    ret = os.system(nc_cmd)
+    end = time.perf_counter() * 1000
+
+    print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
+    if ret != 0:
+        print("ret:")
+        print(ret)
+        print("xfer_pre_dump_async transfer error")
+        error()
+    if time_constraint > 0:
+        # Calculate transfer speed (Bytes/s)
+        bandwidth_measurements.append(1000.0 * size / (end - start))
 
     # 累计传输时间
     pre_dump_xfer_time_total += end - start
-
-    # if time_constraint > 0:
-    #     # Calculate transfer speed (Bytes/s)
-    #     if transfer_time > 0:
-    #         # todo: 10000需要修改为真实传输大小
-    #         transfer_speed = 10000 / (transfer_time / 1000.0)  # Bytes per second
-    #     else:
-    #         transfer_speed = 0.0
-    #     print(f"Transfer speed for PRE-DUMP {i}: {transfer_speed:.2f} Bytes/s")
-
-    #     # Append to bandwidth measurements
-    #     bandwidth_measurements.append(transfer_speed)
-
-    if ret != 0:
-        error()
 
 #Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, compress, port):
@@ -747,29 +832,10 @@ def xfer_final(image_path, dest, compress, port):
     end = time.perf_counter() * 1000
     print(f"DUMP transfer time {(end - start):.3f} ms")
 
-    # # 创建压缩包并通过rsync传输
-    # archive_name = "dump.tar.gz"
-    # cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
-    # ret = os.system(cmd_tar)
-    # if ret != 0:
-    #     error()
-    # cmd = 'rsync %s --stats %s %s:%s/' % (rsync_opts, image_path, dest, base_path)
-    # print("Transferring DUMP to %s" % dest)
-    # start = time.perf_counter() * 1000
-    # ret = os.system(cmd)
-    # end = time.perf_counter() * 1000
-    # print("DUMP transfer time %.3f ms" % (end - start))
-    # # 在目标服务器上解压
-    # cmd_ssh = f"ssh {dest} 'tar -xzf {image_path}/{archive_name} -C {image_path}'"
-    # ret = os.system(cmd_ssh)
-    # if ret != 0:
-    #     error()
-
     # 计算传输时间
     dump_xfer_time = end - start
     if ret != 0:
         error()
-
 
 def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
     global pre_dump_xfer_time_total
@@ -785,11 +851,9 @@ def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
             archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
             cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
         print(cmd_tar)
-        print(f"pre_dump_{i}:1")
         start = time.perf_counter() * 1000
         ret = os.system(cmd_tar)
         end = time.perf_counter() * 1000
-        print(f"pre_dump_{i}:2")
         # 检查返回值
         if ret != 0:
             # os.system返回值是退出状态码左移8位，需要右移8位获取实际退出码
@@ -816,16 +880,10 @@ def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
         print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
         pre_dump_xfer_time_total += end - start
         # 传输到目标服务器
-        #print("nc_cmd start")
-        #print(os.getcwd())
-        #nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
         nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
         if not os.path.exists(archive_name):
             print(f"File {archive_name} does not exist!")
-        #print("nc_cmd fiissssssssssssssssssssssssssssssssssssssssssssssssssssssssssssh")
-        #print(i)
         print(nc_cmd)
-        #print("nc_cmd")
 
         nc_cmd = ["nc", "-q", "0", dest, str(port)]
         archive_path = archive_name
@@ -838,9 +896,11 @@ def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
 
         with open(archive_path, 'rb') as f:
             start = time.perf_counter() * 1000
-            result = subprocess.run(nc_cmd, stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ret = subprocess.run(nc_cmd, stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             end = time.perf_counter() * 1000
         print(f"PRE-DUMP {i} 传输时间 {(end - start):.3f} ms")
+        if time_constraint > 0:
+            bandwidth_measurements.append(1000 * size / (end - start))
         pre_dump_xfer_time_total += end - start
         if ret != 0:
             print("ret:")
@@ -940,6 +1000,10 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
                     or (dir_size < 1024 * 64) or last_iter == max_iter:     #64KB
             iter_terminate = True
+
+        if dirtymap:
+            if read_max_scount(container_pids, dirtymap_path) >= 3:
+                iter_terminate = True
 
         # xfer_pre_dump(last_path, dest, last_iter, iter_terminate)
         xfer_pre_dump_async(last_path, dest, last_iter, port_list[last_iter], iter_terminate, cs)
@@ -1124,9 +1188,9 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     if time_constraint > 0:
         global max_xfer_size
         # Measure initial bandwidth
-        mea_bandwidth = measure_bandwidth(dest)
-        max_xfer_size = mea_bandwidth * (time_constraint / 1000.0)  # Convert ms to seconds
-        bandwidth_measurements.append(mea_bandwidth)
+        # mea_bandwidth = measure_bandwidth(dest)
+        # max_xfer_size = mea_bandwidth * (time_constraint / 1000.0)  # Convert ms to seconds
+        # bandwidth_measurements.append(mea_bandwidth)
         # print(f"current bandwidth is {mea_bandwidth}")
 
     # 打开dirty-track设备
@@ -1238,9 +1302,9 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
 
-    if time_constraint > 0:
-        mea_bandwidth = measure_bandwidth(dest)
-        bandwidth_measurements.append(mea_bandwidth)
+    if time_constraint > 0 and bandwidth_measurements:
+        # mea_bandwidth = measure_bandwidth(dest)
+        # bandwidth_measurements.append(mea_bandwidth)
         # Calculate average bandwidth and standard deviation
         average_bandwidth = statistics.mean(bandwidth_measurements)
         if len(bandwidth_measurements) > 1:
