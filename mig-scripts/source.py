@@ -752,7 +752,7 @@ def parse_size(size_str):
     return size
 
 #Transfer the previously created pre-dump using rsync
-def xfer_pre_dump(parent_path, dest, i, port):
+def xfer_pre_dump(cs, parent_path, dest, i, port, iter_terminate=False):
     global pre_dump_xfer_time_total
 
     # print(f"xfer PRE-DUMP {i}")
@@ -804,6 +804,11 @@ def xfer_pre_dump(parent_path, dest, i, port):
     ret = os.system(nc_cmd)
     end = time.perf_counter() * 1000
 
+    # 传输完成后发送标志
+    if iter_terminate:
+        transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{i}"})
+        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+        print(f"已发送 PRE-DUMP {i} 传输完成标志")
     print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
     if ret != 0:
         print("ret:")
@@ -916,57 +921,57 @@ def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
     transfer_thread = threading.Thread(target=transfer)
     transfer_thread.start()
 
-def xfer_final_async(image_path, dest, port, cs):
-    global dump_xfer_time
+# def xfer_final_async(image_path, dest, port, cs):
+#     global dump_xfer_time
 
-    def transfer():
-        global dump_xfer_time
-        nonlocal image_path, dest, cs
-        print(f"开始传输 DUMP 到 {dest}")
-        if compress:
-            archive_name = os.path.join(mig_base, f"dump.tar.gz")
-            cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
-        else:
-            archive_name = os.path.join(mig_base, f"dump.tar")
-            cmd_tar = f"tar -cf {archive_name} -C {image_path} ."
-        start = time.perf_counter() * 1000
-        ret = os.system(cmd_tar)
-        end = time.perf_counter() * 1000
-        print(f"DUMP 压缩时间 {(end - start):.3f} ms")
-        dump_xfer_time += end - start
-        # 传输到目标服务器
-        nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-        print(f"dump nc_cmd: {nc_cmd}")
-        start = time.perf_counter() * 1000
-        ret = os.system(nc_cmd)
-        end = time.perf_counter() * 1000
-        print(f"DUMP 传输时间 {(end - start):.3f} ms")
-        dump_xfer_time += end - start
-        if ret != 0:
-            print("dump nc error")
-            print(ret)
-            error()
+#     def transfer():
+#         global dump_xfer_time
+#         nonlocal image_path, dest, cs
+#         print(f"开始传输 DUMP 到 {dest}")
+#         if compress:
+#             archive_name = os.path.join(mig_base, f"dump.tar.gz")
+#             cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
+#         else:
+#             archive_name = os.path.join(mig_base, f"dump.tar")
+#             cmd_tar = f"tar -cf {archive_name} -C {image_path} ."
+#         start = time.perf_counter() * 1000
+#         ret = os.system(cmd_tar)
+#         end = time.perf_counter() * 1000
+#         print(f"DUMP 压缩时间 {(end - start):.3f} ms")
+#         dump_xfer_time += end - start
+#         # 传输到目标服务器
+#         nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
+#         print(f"dump nc_cmd: {nc_cmd}")
+#         start = time.perf_counter() * 1000
+#         ret = os.system(nc_cmd)
+#         end = time.perf_counter() * 1000
+#         print(f"DUMP 传输时间 {(end - start):.3f} ms")
+#         dump_xfer_time += end - start
+#         if ret != 0:
+#             print("dump nc error")
+#             print(ret)
+#             error()
 
-        # if compress:
-        #     cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
-        # else:
-        #     cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
-        # start = time.perf_counter() * 1000
-        # ret = os.system(cmd_tar)
-        # end = time.perf_counter() * 1000
-        # print(f"DUMP 传输时间 {(end - start):.3f} ms")
-        # dump_xfer_time = end - start
-        # if ret != 0:
-        #     error()
+#         # if compress:
+#         #     cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
+#         # else:
+#         #     cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
+#         # start = time.perf_counter() * 1000
+#         # ret = os.system(cmd_tar)
+#         # end = time.perf_counter() * 1000
+#         # print(f"DUMP 传输时间 {(end - start):.3f} ms")
+#         # dump_xfer_time = end - start
+#         # if ret != 0:
+#         #     error()
 
-        # 传输完成后发送标志
-        # transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
-        # cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-        # print("已发送 DUMP 传输完成标志")
-        # event.set()  # 设置事件，表示传输完成
+#         # 传输完成后发送标志
+#         # transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
+#         # cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+#         # print("已发送 DUMP 传输完成标志")
+#         # event.set()  # 设置事件，表示传输完成
 
-    transfer_thread = threading.Thread(target=transfer)
-    transfer_thread.start()
+#     transfer_thread = threading.Thread(target=transfer)
+#     transfer_thread.start()
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
@@ -1005,8 +1010,8 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             if read_max_scount(container_pids, dirtymap_path) >= 3:
                 iter_terminate = True
 
-        # xfer_pre_dump(last_path, dest, last_iter, iter_terminate)
-        xfer_pre_dump_async(last_path, dest, last_iter, port_list[last_iter], iter_terminate, cs)
+        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter], iter_terminate)
+        # xfer_pre_dump_async(last_path, dest, last_iter, port_list[last_iter], iter_terminate, cs)
 
 
         if iter_terminate:
@@ -1344,8 +1349,8 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
 
     # 传输容器剩余状态
-    # xfer_final(image_path, dest)
-    xfer_final_async(image_path, dest, port_list[-1], cs)
+    xfer_final(image_path, dest)
+    # xfer_final_async(image_path, dest, port_list[-1], cs)
     # dir_size = convert_byte(getdirsize(image_path))
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
