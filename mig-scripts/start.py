@@ -1,9 +1,9 @@
-
 import subprocess
 import sys
 import time
 import argparse
 import re
+
 
 SOURCE_IP = None
 DEST_IP = None
@@ -34,6 +34,10 @@ def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
         sys.exit(1)
     else:
         print(result.stdout)
+
+
+
+
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
     """
@@ -67,6 +71,57 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
 
         return re.sub(pattern, repl, content)
 
+    def restart_keepalived(is_remote=False, target_ip=None):
+        restart_cmd = "sudo systemctl restart keepalived"
+        status_cmd = "sudo systemctl is-active keepalived"
+
+        if is_remote:
+            if not target_ip:
+                raise ValueError("在远程执行时，必须提供目标机器的 IP 地址。")
+            # 重启远程服务
+            print(f"在远程机器 {target_ip} 重启 keepalived 服务...")
+            result = subprocess.run(
+                f"ssh {target_ip} '{restart_cmd}'",
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if result.returncode != 0:
+                print(f"远程重启 keepalived 失败: {result.stderr}")
+                return False
+
+            # 检查服务状态
+            status = subprocess.run(
+                f"ssh {target_ip} '{status_cmd}'",
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if status.returncode == 0 and status.stdout.strip() == "active":
+                print(f"远程 keepalived 服务已成功重启并处于活动状态。")
+                return True
+            else:
+                print(f"远程 keepalived 服务未能成功重启或未处于活动状态。")
+                return False
+
+        else:
+            # 重启本地服务
+            print("在本地机器重启 keepalived 服务...")
+            result = subprocess.run(
+                restart_cmd,
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if result.returncode != 0:
+                print(f"本地重启 keepalived 失败: {result.stderr}")
+                return False
+
+            # 检查服务状态
+            status = subprocess.run(
+                status_cmd,
+                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            if status.returncode == 0 and status.stdout.strip() == "active":
+                print("本地 keepalived 服务已成功重启并处于活动状态。")
+                return True
+            else:
+                print("本地 keepalived 服务未能成功重启或未处于活动状态。")
+                return False
     try:
         if is_remote:
             if not target_ip:
@@ -97,6 +152,9 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
                 print(f"远程写入配置文件失败: {write_result.stderr}")
                 return False
 
+            # 重启远程服务
+            if not restart_keepalived(is_remote=True, target_ip=target_ip):
+                return False
         else:
             # 本地读取配置文件内容
             print("从本地读取配置文件...")
@@ -111,6 +169,10 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
             print("将修改后的内容写回本地配置文件...")
             with open(config_path, 'w') as f:
                 f.write(updated_content)
+
+               # 重启本地服务
+            if not restart_keepalived(is_remote=False):
+                return False
 
         print("成功修改配置文件中的 priority 参数")
         return True
@@ -150,6 +212,8 @@ def source_clean(args):
     run_cmd(f"umount /runc/containers/{container_name}/migrate/*",ignore_error=True)
     run_cmd(f"runc kill {container_name}", ignore_error=True),  # 如果容器不存在可忽略错误
     run_cmd (f"runc delete {container_name}", ignore_error=True), # 如果容器不存在可忽略错误
+    run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
+    run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
 def destination_prepare(args):
     # 在目标节点执行准备操作
     # 有些命令可能出现非致命错误，用ignore_error=True
@@ -176,6 +240,7 @@ def destination_clean(args):
         (f"runc kill {container_name}", True),  # 如果容器不存在可忽略错误
         (f"runc delete {container_name}", True), # 如果容器不存在可忽略错误
         (f"kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null",True), # 杀死recvtty进程
+        (f"ps aux | grep 'recvtty' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9", True),
         #(f"ps aux | grep '[n]c -lp' | awk '{{print $2}}' | xargs -r kill -9", False),
         (f"ps aux | grep '[n]c -lp' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9", True)
     ]
@@ -190,9 +255,11 @@ def execute_ycsb_tests():
     run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=DEST_IP)
     run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP)
 
+
     # 还原keepalived配置
     update_keepalived_priority(100)
     update_keepalived_priority(50,True,DEST_IP)
+
 
     # 杀死之前可能未完成的run进程, 开启load
     run_remote_cmd('pkill -f "ycsb run redis"; pkill -f "site.ycsb.Client"',target_ip=CLIENT_IP,ignore_error=True)
@@ -251,42 +318,48 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         else:
             run_cmd(cmd, ignore_error=ignore_error)
 
-def configure_network():
+
+def clean_configure_network():
     # 清空网络配置
     run_cmd("sudo tc qdisc del dev ens33 root",ignore_error=True)
     run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=DEST_IP,ignore_error=True)
-   # run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP,ignore_error=True)
-    # 配置source的网络限制  source->dest  source->client
-    print(DEST_IP)
-   # print(CLIENT_IP)
-    #input()
+    if VIP_IP:
+        run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP,ignore_error=True)
+
+def configure_network():
+    source_rules = [
+    {"rate": "50mbit", "delay": "3ms", "dst": DEST_IP}
+]
+    dest_rules = [
+    {"rate": "50mbit", "delay": "3ms", "dst": SOURCE_IP}
+]
+    if VIP_IP:
+        source_rules.append({"rate": "50mbit", "delay": "6ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": "50mbit", "delay": "1ms", "dst": CLIENT_IP})
+
+  # 配置source的网络限制  source->dest  source->client
     configure_network_do(
     interface="ens33",
-    rules=[
-        {"rate": "100mbit", "delay": "3ms", "dst": DEST_IP}
-      #  {"rate": "100mbit", "delay": "4ms", "dst": CLIENT_IP}
-    ],
+    rules=source_rules,
     is_remote=False  # 本地执行
 )
-    # 配置dest的网络限制  dest->source  dest->client
+ # 配置dest的网络限制  dest->source  dest->client
     configure_network_do(
     interface="ens33",
-    rules=[
-        {"rate": "100mbit", "delay": "3ms", "dst": SOURCE_IP}
-      #  {"rate": "100mbit", "delay": "4ms", "dst": CLIENT_IP}
-    ],
+    rules=dest_rules,
     is_remote=True,  # 远程执行
     target_ip=SOURCE_IP  # 远程执行命令机器 IP
 )
     # 配置client的网络限制  client->vip
-#     configure_network_do(
-#     interface="ens33",
-#     rules=[
-#         {"rate": "100mbit", "delay": "4ms", "dst": VIP_IP}
-#     ],
-#     is_remote=True,  # 远程执行
-#     target_ip=CLIENT_IP  # 远程执行命令机器 IP
-# )
+    if VIP_IP:
+        configure_network_do(
+        interface="ens33",
+        rules=[
+            {"rate": "50mbit", "delay": "1ms", "dst": VIP_IP}
+        ],
+        is_remote=True,  # 远程执行
+        target_ip=CLIENT_IP  # 远程执行命令机器 IP
+    )
 
 # 定义实验类型与参数
 experiments = {
@@ -294,8 +367,9 @@ experiments = {
     "pre-copy-dirtymap": "-pre -d -t -s -dm",
     "post-copy": "-post -d -t -s",
     "hybrid": "-pre -post -d -t -s",
-    #"hybrid-dirtymap": "-pre -post -d -t -s -dm"
+    "hybrid-dirtymap": "-pre -post -d -t -s -dm"
 }
+
 
 # 每种实验进行三次
 runs = 3
@@ -304,18 +378,20 @@ runs = 3
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automate container migration using runc and CRIU.")
     parser.add_argument("-c", "--container", required=True, help="The name of the container to migrate.")
-    parser.add_argument("-t", "--tool", required=True, help="Specify the test tool to use.")
+    parser.add_argument("-t", "--tool", required=False, help="Specify the test tool to use.")
     parser.add_argument("-s", "--source-ip", required=True, help="IP address of the source machine.")
     parser.add_argument("-d", "--dest-ip", required=True, help="IP address of the destination machine.")
     parser.add_argument("--client-ip", required=False, help="IP address of the machine running client such as ycsb.")
     parser.add_argument("--virtual-ip", required=False, help="virtual ip ")
     args = parser.parse_args()
 
+
+
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
     VIP_IP = args.virtual_ip
-    print(DEST_IP)
+    #print(DEST_IP)
     #input()
     for exp_name, exp_args in experiments.items():
         for i in range(1, runs+1):
@@ -328,15 +404,19 @@ if __name__ == "__main__":
                 # 准备源节点的资源 (复制新的bundle、开启console.sock、启动容器)
                 source_prepare(args)
 
+
+                    # 还原keepalived配置
+                #update_keepalived_priority(100)
+                #update_keepalived_priority(50,True,DEST_IP)
                 # 开启网络资源限制
                 configure_network()
 
                 # 开启工具测试
-                execute_tests(args)
+               # execute_tests(args)
 
                 # 执行迁移
                 source_run_migration(args,exp_args)
-
+                #input()
                 print(f"======== Finished {exp_name} experiment run {i} ========")
             except Exception as e:
                 # 捕获异常并打印错误信息
@@ -344,11 +424,13 @@ if __name__ == "__main__":
             finally:
                 # 无论前面是否出错，清理源和目标节点资源
                 print("Cleaning up source and destination resources...")
-                input()
+                #input()
                 source_clean(args)
                 destination_clean(args)
-
+                clean_configure_network()
 
             print(f"======== sleep ========")
-            time.sleep(30000) #
+            # time.sleep(30000) #
+            input()
+
 

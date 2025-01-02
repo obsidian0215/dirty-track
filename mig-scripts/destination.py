@@ -48,38 +48,7 @@ def handle_pre_xfer_complete(msg):
     except Exception as e:
         print("error;",e)
     logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
-    # 等待指定迭代及之前的传输完成
 
-    for iter_num in iteration_list:
-        last_iter = int(last_iter)
-        #print("iter_num:",iter_num)
-        #print("last_iter:",last_iter)
-        if iter_num < last_iter:
-            port = INIT_PORT  + iter_num  #  -1
-            with process_lock:
-                process = transfer_processes.get(port)
-            if process:
-                logger.info(f"等待端口 {port} 的传输完成")
-                process.wait()  # 阻塞直到进程完成
-                logger.info(f"端口 {port} 的传输已完成")
-                with process_lock:
-                    del transfer_processes[port]
-        else:
-            # 对于大于last_iter的进程，终止它们
-            # 最后一次迭代不包含在iteration_list，不会被终止
-            port = INIT_PORT + iter_num - 1
-            with process_lock:
-                process = transfer_processes.get(port)
-            if process:
-                logger.info(f"终止端口 {port} 的传输进程{process}")
-                #print_transfer_processes()
-                process.terminate()  # 终止该进程
-                process.wait()  # 等待进程终止
-                with process_lock:
-                    del transfer_processes[port]
-                logger.info(f"端口 {port} 的传输进程已终止")
-
-    logger.info(f"迭代 {last_iter} 及之前的传输均已完成，并且其他进程已关闭")
 
 def prepare(base_path, image_path, parent_path):
     # parent_path为None时，仅准备image_path
@@ -446,7 +415,7 @@ def handle_restore(msg):
     """
     处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
     """
-    global last_iter, iteration_list
+    global last_iter, iteration_list, pre_xfer_complete_flag, is_precopy
     os.system('criu -V')  # 检查 CRIU 版本
     logger.info("收到 restore 指令")
 
@@ -456,9 +425,11 @@ def handle_restore(msg):
         with process_lock:
             all_transfers_complete = True
             # 检查所有传输进程是否已完成
+            print("检查所有传输进程是否已完成")
             for iter_num in iteration_list:
+                last_iter = int(last_iter)
                 if iter_num <= last_iter:
-                    port = INIT_PORT + 1 + iter_num
+                    port = INIT_PORT + iter_num -1 # -1
                     process = transfer_processes.get(port)
                     # if process and process.poll() is None:  # 如果进程尚未完成
                     #     all_transfers_complete = False
@@ -476,7 +447,7 @@ def handle_restore(msg):
             if transfer_processes:
                 last_port = port_list[-1]
                 print(f"开始检查最后一个传输进程的端口号: {last_port}")
-                print_transfer_processes()
+                # print_transfer_processes()
                 #time.sleep(2)
                 last_process = transfer_processes.get(last_port)
                 #print("last_process:",last_process)
@@ -493,6 +464,9 @@ def handle_restore(msg):
                 print("transfer_processes 字典为空，跳过最后一个传输进程的检查")
         if all_transfers_complete:
             logger.info("所有指定迭代和最后一个迭代的传输已完成，开始执行恢复操作")
+
+            #time.sleep(10)
+            print("start================")
             reply = perform_restore(msg)
             break
         else:
@@ -534,7 +508,7 @@ def migrate_server():
             reply = ""
             #Receiving from client
             data = conn.recv(1024)
-            #print(data)
+            print("data:",data)
             if not data:
                 print(111)
                 break
@@ -578,6 +552,7 @@ def migrate_server():
                         # 如果所有传输已完成，立即执行恢复
                         # 所有传输指last_iter及之前的传输，和最大端口对应的传输
                         reply = handle_restore(msg)
+                        time.sleep(3)
 
                     case _:
                         print("Unknown request: " + msg)
@@ -606,128 +581,3 @@ def migrate_server():
 
 if __name__ == '__main__':
     migrate_server()
-
-# def configure_iptables_forward():
-#     """
-#     配置iptables规则，缓存并转发请求包至source
-#     """
-#     table = iptc.Table(iptc.Table.FILTER)
-#     table.autocommit = False
-
-#     # PREROUTING链中添加TEE转发规则
-#     chain = iptc.Chain(table, "PREROUTING")
-
-#     # 创建一个新的规则
-#     rule = iptc.Rule()
-#     rule.protocol = "tcp"
-#     rule.dst = VIP
-#     rule.dport = "80"
-
-#     # 添加 TEE 目标，将流量复制到Source
-#     target = iptc.Target(rule, "TEE")
-#     target.extra = False
-#     rule.target = "TEE"
-#     rule.add_target(target)
-#     rule.parameters = {"gateway": SOURCE_IP}
-
-#     # 添加 DNAT 规则，将复制的流量目标IP改为Source的实际IP
-#     nat_table = iptc.Table(iptc.Table.NAT)
-#     nat_table.autocommit = False
-#     nat_chain = iptc.Chain(nat_table, "PREROUTING")
-
-#     nat_rule = iptc.Rule()
-#     nat_rule.protocol = "tcp"
-#     nat_rule.dst = SOURCE_IP
-#     nat_rule.dport = "80"
-#     nat_rule.target = "DNAT"
-#     nat_rule.parameters = {"to_destination": "192.168.1.101:80"}
-#     nat_chain.insert_rule(nat_rule)
-
-#     # 允许转发到Source的流量
-#     forward_table = iptc.Table(iptc.Table.FORWARD)
-#     forward_table.autocommit = False
-#     forward_chain = iptc.Chain(forward_table, "FORWARD")
-
-#     forward_rule = iptc.Rule()
-#     forward_rule.protocol = "tcp"
-#     forward_rule.dst = "192.168.1.101"
-#     forward_rule.dport = "80"
-#     forward_rule.target = "ACCEPT"
-#     forward_chain.insert_rule(forward_rule)
-
-#     # 提交更改
-#     table.commit()
-#     nat_table.commit()
-#     forward_table.commit()
-
-#     print("已配置iptables规则，开始缓存并转发请求包至source。")
-
-# def remove_iptables_forward():
-#     """
-#     移除iptables转发规则，允许destination直接响应客户端
-#     """
-#     # 移除 PREROUTING 链中的 TEE 规则
-#     table = iptc.Table(iptc.Table.FILTER)
-#     table.autocommit = False
-#     chain = iptc.Chain(table, "PREROUTING")
-
-#     for rule in chain.rules:
-#         if rule.dst == VIP and rule.protocol == "tcp" and rule.dport == "80":
-#             for target in rule.targets:
-#                 if target.name == "TEE" and target.parameters.get("gateway") == SOURCE_IP:
-#                     rule.delete_rule(target)
-#                     print("已移除iptables的TEE转发规则。")
-
-#     # 移除 NAT 表中的 DNAT 规则
-#     nat_table = iptc.Table(iptc.Table.NAT)
-#     nat_table.autocommit = False
-#     nat_chain = iptc.Chain(nat_table, "PREROUTING")
-
-#     for rule in nat_chain.rules:
-#         if rule.protocol == "tcp" and rule.dst == SOURCE_IP and rule.dport == "80":
-#             if rule.target == "DNAT" and rule.parameters.get("to_destination") == "192.168.1.101:80":
-#                 nat_chain.delete_rule(rule)
-#                 print("已移除iptables的DNAT转发规则。")
-
-#     # 移除 FORWARD 表中的 ACCEPT 规则
-#     forward_table = iptc.Table(iptc.Table.FORWARD)
-#     forward_table.autocommit = False
-#     forward_chain = iptc.Chain(forward_table, "FORWARD")
-
-#     for rule in forward_chain.rules:
-#         if rule.protocol == "tcp" and rule.dst == "192.168.1.101" and rule.dport == "80":
-#             if rule.target == "ACCEPT":
-#                 forward_chain.delete_rule(rule)
-#                 print("已移除iptables的FORWARD ACCEPT规则。")
-
-#     # 提交更改
-#     table.commit()
-#     nat_table.commit()
-#     forward_table.commit()
-
-#     print("已移除iptables规则，允许destination直接响应客户端。")
-#                     case {'pageserver':_}:
-#                         #os.system('criu -V')
-#                         postcopy = 1
-#                         mount_cmd = 'mount -t tmpfs none ' + msg['pageserver']['path']
-#                         umount_cmd = 'umount ' + msg['pageserver']['path']
-
-#                         if msg['pageserver']['iter']:
-#                             i = msg['pageserver']['iter']
-
-#                         print("start page server")
-#                         os.system(mount_cmd)
-
-#                         cmd = 'criu page-server --images-dir ' + msg['pageserver']['path']
-#                         if not i is None:
-#                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps_{}.log'.format(i)
-#                         else:
-#                             cmd += ' --port 27 --auto-dedup -v4 -o ' + msg['pageserver']['path'] + '../logs/ps.log'
-#                         print ("Running page server for pre-copy: " + cmd)
-#                         ps = subprocess.Popen(cmd, shell=True)
-#                         exitcode = ps.poll()
-#                         print(exitcode)
-#                         if exitcode is not None:
-#                             reply = 'remote criu page-server failed'
-#                         else:
-#                             continue

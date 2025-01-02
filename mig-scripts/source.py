@@ -76,7 +76,7 @@ pre_dump_xfer_time_total = 0.0  # 毫秒
 dump_time = 0.0                # 毫秒
 dump_size = 0.0                # 字节
 dump_xfer_time = 0.0        # 毫秒
-
+rst_time =0.0
 # post
 total_uffd_copy = 0.0
 rpf_handle_time = 0.0
@@ -585,13 +585,13 @@ def notify_transfer_vip(cs, inputs):
         print("can't confirm the VIP has been transfered")
         return 1
 
-def async_vip_migration(cs, input):
+def async_vip_migration(cs, inputs):
     try:
         ret = transfer_vip('30')
         if ret == 0:
             print("input:")
-            print(input)
-            ret = notify_transfer_vip(cs, inputs=input)
+            print(inputs)
+            ret = notify_transfer_vip(cs, inputs=inputs)
         if ret != 0:
             print("无法确认VIP已迁移，目标节点可能无法恢复")
         else:
@@ -621,7 +621,10 @@ def pre_dump(mig_base, container, i, dirtymap):
     cmd += ' ' + container
     if dirtymap:
         cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
-    cmd += ' --parent-path ../parent_{}'.format(i)
+    # 只有 i>1 时才加上上一次的 parent_(i-1)
+    if i > 1:
+        cmd += f' --parent-path ../parent_{i-1}'
+    # cmd += ' --parent-path ../parent_{}'.format(i)
     # print(cmd)
     # start = time.perf_counter() * 1000
     ret = os.system(cmd)
@@ -637,7 +640,7 @@ def real_dump_0(mig_base, tty, netdump):
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
-    cmd = 'runc checkpoint --image-path parent_0 --work-path parent_0_log'
+    cmd = 'runc checkpoint --image-path parent_0 --work-path pd_log_0'
 
     if tty:
         cmd += ' --shell-job'
@@ -655,7 +658,7 @@ def real_dump_0(mig_base, tty, netdump):
     directory_path = f'{mig_base}/parent_0'
     total_size = calculate_image_exclude_pages(directory_path)
     print(f"The total size of all files excluding 'pages-x.img' in {directory_path} is {total_size} bytes.")
-    stats_dump_file = os.path.join(mig_base, 'parent_0_log/stats-dump')
+    stats_dump_file = os.path.join(mig_base, 'pd_log_0/stats-dump')
     parse_stats_dump(stats_dump_file, "dump",False)
 
 
@@ -668,7 +671,7 @@ def real_dump_0(mig_base, tty, netdump):
 #The page server listens on port 27.
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, input):
+def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, inputs):
     global dump_time, dump_size, dump_xfer_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
@@ -731,7 +734,7 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
 
     # 若要迁移带TCP连接的容器，则需要将服务的IP迁移到目标节点
     if netdump:
-        vip_thread = threading.Thread(target=async_vip_migration, args=(cs, input))
+        vip_thread = threading.Thread(target=async_vip_migration, args=(cs, inputs))
         vip_thread.start()
         # ret = transfer_vip()
         # if ret == 0:
@@ -752,7 +755,7 @@ def parse_size(size_str):
     return size
 
 #Transfer the previously created pre-dump using rsync
-def xfer_pre_dump(cs, parent_path, dest, i, port, iter_terminate=False):
+def xfer_pre_dump(parent_path, dest, i, port):
     global pre_dump_xfer_time_total
 
     # print(f"xfer PRE-DUMP {i}")
@@ -804,11 +807,6 @@ def xfer_pre_dump(cs, parent_path, dest, i, port, iter_terminate=False):
     ret = os.system(nc_cmd)
     end = time.perf_counter() * 1000
 
-    # 传输完成后发送标志
-    if iter_terminate:
-        transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{i}"})
-        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-        print(f"已发送 PRE-DUMP {i} 传输完成标志")
     print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
     if ret != 0:
         print("ret:")
@@ -829,7 +827,7 @@ def xfer_final(image_path, dest, compress, port):
     # print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
     if compress:
-        cmd_tar = f"tar -czf - -C {image_path} . | nc -q 0 {dest} {port}'"
+        cmd_tar = f"tar -czf - -C {image_path} . | nc -q 0 {dest} {port}"
     else:
         cmd_tar = f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
     start = time.perf_counter() * 1000
@@ -841,137 +839,6 @@ def xfer_final(image_path, dest, compress, port):
     dump_xfer_time = end - start
     if ret != 0:
         error()
-
-def xfer_pre_dump_async(parent_path, dest, i, port, iter_terminate, cs):
-    global pre_dump_xfer_time_total
-
-    def transfer():
-        global pre_dump_xfer_time_total
-        nonlocal parent_path, dest, i, cs, port, iter_terminate
-        print(f"开始传输 PRE-DUMP {i} 到 {dest}")
-        if compress:
-            archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
-            cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
-        else:
-            archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
-            cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
-        print(cmd_tar)
-        start = time.perf_counter() * 1000
-        ret = os.system(cmd_tar)
-        end = time.perf_counter() * 1000
-        # 检查返回值
-        if ret != 0:
-            # os.system返回值是退出状态码左移8位，需要右移8位获取实际退出码
-            exit_code = ret >> 8
-            print(f"pre_dump_{i} tar命令执行失败，退出码: {exit_code}")
-            # 可根据需要处理:
-            # 1. 抛出异常
-            raise RuntimeError(f" pre_dump_{i} tar命令执行失败(退出码 {exit_code})，请检查{parent_path}目录或权限。")
-            # 或者 2. 打印警告并返回
-            # return
-
-        # 若执行成功，可检查文件是否真的存在且非空
-        if not os.path.exists(archive_name):
-            print(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
-            raise FileNotFoundError(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
-        else:
-            # 还可检查tar文件大小，若为0说明打包空目录失败
-            size = os.path.getsize(archive_name)
-            if size == 0:
-                print(f"pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
-                raise ValueError(f" pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
-            else:
-                print(f"pre_dump_{i} 打包文件 {archive_name} 大小为{size}")
-        print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
-        pre_dump_xfer_time_total += end - start
-        # 传输到目标服务器
-        nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-        if not os.path.exists(archive_name):
-            print(f"File {archive_name} does not exist!")
-        print(nc_cmd)
-
-        nc_cmd = ["nc", "-q", "0", dest, str(port)]
-        archive_path = archive_name
-
-        # start = time.perf_counter() * 1000
-        # print("start:",start)
-        # #ret = os.system(nc_cmd)
-        # end = time.perf_counter() * 1000
-        # print("end:",end)
-
-        with open(archive_path, 'rb') as f:
-            start = time.perf_counter() * 1000
-            ret = subprocess.run(nc_cmd, stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            end = time.perf_counter() * 1000
-        print(f"PRE-DUMP {i} 传输时间 {(end - start):.3f} ms")
-        if time_constraint > 0:
-            bandwidth_measurements.append(1000 * size / (end - start))
-        pre_dump_xfer_time_total += end - start
-        if ret != 0:
-            print("ret:")
-            print(ret)
-            print("xfer_pre_dump_async transfer error")
-            error()
-        # 传输完成后发送标志
-        if iter_terminate:
-            transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{i}"})
-            cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-            print(f"已发送 PRE-DUMP {i} 传输完成标志")
-
-    transfer_thread = threading.Thread(target=transfer)
-    transfer_thread.start()
-
-# def xfer_final_async(image_path, dest, port, cs):
-#     global dump_xfer_time
-
-#     def transfer():
-#         global dump_xfer_time
-#         nonlocal image_path, dest, cs
-#         print(f"开始传输 DUMP 到 {dest}")
-#         if compress:
-#             archive_name = os.path.join(mig_base, f"dump.tar.gz")
-#             cmd_tar = f"tar -czf {archive_name} -C {image_path} ."
-#         else:
-#             archive_name = os.path.join(mig_base, f"dump.tar")
-#             cmd_tar = f"tar -cf {archive_name} -C {image_path} ."
-#         start = time.perf_counter() * 1000
-#         ret = os.system(cmd_tar)
-#         end = time.perf_counter() * 1000
-#         print(f"DUMP 压缩时间 {(end - start):.3f} ms")
-#         dump_xfer_time += end - start
-#         # 传输到目标服务器
-#         nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-#         print(f"dump nc_cmd: {nc_cmd}")
-#         start = time.perf_counter() * 1000
-#         ret = os.system(nc_cmd)
-#         end = time.perf_counter() * 1000
-#         print(f"DUMP 传输时间 {(end - start):.3f} ms")
-#         dump_xfer_time += end - start
-#         if ret != 0:
-#             print("dump nc error")
-#             print(ret)
-#             error()
-
-#         # if compress:
-#         #     cmd_tar = f"tar -czf - -C {image_path} . | nc {dest} {port}"
-#         # else:
-#         #     cmd_tar = f"tar -cf - -C {image_path} . | nc {dest} {port}"
-#         # start = time.perf_counter() * 1000
-#         # ret = os.system(cmd_tar)
-#         # end = time.perf_counter() * 1000
-#         # print(f"DUMP 传输时间 {(end - start):.3f} ms")
-#         # dump_xfer_time = end - start
-#         # if ret != 0:
-#         #     error()
-
-#         # 传输完成后发送标志
-#         # transfer_complete_msg = json.dumps({"transfer_complete": "dump"})
-#         # cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-#         # print("已发送 DUMP 传输完成标志")
-#         # event.set()  # 设置事件，表示传输完成
-
-#     transfer_thread = threading.Thread(target=transfer)
-#     transfer_thread.start()
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
@@ -1001,17 +868,30 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         pre_dump(mig_base, container, last_iter, dirtymap)
 
         dir_size = getdirsize(last_path, 'pages')
+        print("parent_path:",parent_path)
+        print("last_iter:",last_iter)
         less_last_path = parent_path[last_iter - 2]  if last_iter > 1 else None
-        if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
-                    or (dir_size < 1024 * 64) or last_iter == max_iter:     #64KB
-            iter_terminate = True
+        print("less_last_path:",less_last_path)
+        # if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
+        #             or (dir_size < 1024 * 64) or last_iter == max_iter:     #64KB
+        #     iter_terminate = True
+
+        if last_iter == 1:
+            # 第一次 pre-dump 不需要比较，直接判断目录大小
+            if dir_size < 1024 * 64 or last_iter == max_iter:
+                iter_terminate = True
+        else:
+            # 否则比较两次 pre-dump 目录大小
+            less_last_path = parent_path[last_iter - 2]
+            if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
+                    or dir_size < 1024 * 64 or last_iter == max_iter:
+                iter_terminate = True
 
         if dirtymap:
             if read_max_scount(container_pids, dirtymap_path) >= 3:
                 iter_terminate = True
 
-        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter], iter_terminate)
-        # xfer_pre_dump_async(last_path, dest, last_iter, port_list[last_iter], iter_terminate, cs)
+        xfer_pre_dump(last_path, dest, last_iter, port_list[last_iter-1])
 
 
         if iter_terminate:
@@ -1218,7 +1098,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     #Connect to the migration server running on the destination to send the commands
     cs.connect((dest, 18863))
 
-    input = [cs,sys.stdin]
+    inputs = [cs,sys.stdin]
 
     if pre:
         prepare_cmd = json.dumps({
@@ -1241,7 +1121,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         })
 
     cs.send(bytes(prepare_cmd, encoding='utf-8'))
-    inputready, outputready, exceptready = select.select(input, [], [], 4)
+    inputready, outputready, exceptready = select.select(inputs, [], [], 4)
     #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
     if inputready:
         for s in inputready:
@@ -1289,6 +1169,9 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
 
         # iter pre-dump
         last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
+        transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{last_iter}"})
+        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
+        print(f"已发送 PRE-DUMP {last_iter} 传输完成标志")
         #if diskless:
         #   diskless_pre_dump(base_path, container, dest)
         #else:
@@ -1344,13 +1227,12 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
                 if post:
                     post = False
 
-    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, input)
+    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, inputs)
     # 更新 image/parent 符号链接指向最新的 parent_i
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
 
     # 传输容器剩余状态
-    xfer_final(image_path, dest)
-    # xfer_final_async(image_path, dest, port_list[-1], cs)
+    xfer_final(image_path, dest, compress, port_list[-1])
     # dir_size = convert_byte(getdirsize(image_path))
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
@@ -1381,15 +1263,14 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
 
     # post拷贝返回较慢，需要加大等待时间
     if post:
-        inputready, outputready, exceptready = select.select(input, [], [], 200)
+        inputready, outputready, exceptready = select.select(inputs, [], [], 200)
     else:
-        inputready, outputready, exceptready = select.select(input, [], [], 5)
+        inputready, outputready, exceptready = select.select(inputs, [], [], 5)
     #If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     for s in inputready:
-        ansewer = ""
         answer = s.recv(1024).decode("utf-8")
-        print(answer)
+        print("answer:",answer)
         if "runc restored" in answer:
             # 使用正则表达式提取数据
             pattern = r"runc restored .* successfully with (\d+\.\d+) ms(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
@@ -1602,11 +1483,11 @@ if __name__ == '__main__':
     ])
 
     if pre:
-        output_values.append('{:.2f}'.format(pre_dump_size_total / (1024 * 1024)))  # 预拷贝大小仍以 MB 为单位
+        output_values.append('{:.2f}'.format(pre_dump_size_total / 1024))  # 预拷贝大小以KB为单位
     else:
         output_values.append('')
 
-    output_values.append('{:.2f}'.format(dump_size))  # dump_size 已经是以 KB 为单位的浮点数
+    output_values.append('{:.2f}'.format(dump_size / 1024))  # dump_size以KB为单位
 
     output_values.extend([
         int(round(total_time)),
