@@ -81,6 +81,11 @@ rst_time =0.0
 total_uffd_copy = 0.0
 rpf_handle_time = 0.0
 
+# 预估最后一次dump的时间和各种大小
+esti_dump_time = 0.0
+esti_dump_size_pre = 0.0
+esti_dump_size_post = 0.0
+
 PAGE_SIZE = 4096  # 每页大小为4KB
 
 # 初始化迭代和处理过的dirtymap文件
@@ -601,11 +606,14 @@ def async_vip_migration(cs, inputs):
         print(f"VIP迁移过程中发生异常: {e}")
 
 # 计算image目录下除pages-x.img外的文件总大小
-def calculate_image_exclude_pages(directory):
+def calculate_image(directory, exclude_pages=False):
     total_size = 0
     for root, dirs, files in os.walk(directory):
         for file in files:
-            if not file.startswith("pages-") or not file.endswith(".img"):
+            if exclude_pages and file.startswith("pages-") and file.endswith(".img"):
+                continue
+            # if not file.startswith("pages-") or not file.endswith(".img"):
+            else:
                 file_path = os.path.join(root, file)
                 total_size += os.path.getsize(file_path)
     return total_size
@@ -636,7 +644,7 @@ def pre_dump(mig_base, container, i, dirtymap):
         error()
 
 def real_dump_0(mig_base, tty, netdump):
-    global dump_time, dump_size, dump_xfer_time
+    global esti_dump_time, esti_dump_size_pre, esti_dump_size_post
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -656,10 +664,12 @@ def real_dump_0(mig_base, tty, netdump):
     if ret != 0:
         error()
     directory_path = f'{mig_base}/parent_0'
-    total_size = calculate_image_exclude_pages(directory_path)
-    print(f"The total size of all files excluding 'pages-x.img' in {directory_path} is {total_size} bytes.")
+    esti_dump_size_post = calculate_image(directory_path, False)
+    esti_dump_size_pre = calculate_image(directory_path, True)
+    print(f"The total size of all files excluding 'pages-x.img' in {directory_path} is {esti_dump_size_post} bytes.")
+    print(f"The total size of all files including 'pages-x.img' in {directory_path} is {esti_dump_size_pre} bytes.")
     stats_dump_file = os.path.join(mig_base, 'pd_log_0/stats-dump')
-    parse_stats_dump(stats_dump_file, "dump",False)
+    parse_stats_dump(stats_dump_file, "dump", False)
 
 
 #create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
@@ -907,7 +917,7 @@ def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
     :param log_type: 日志类型，'pre_dump' 或 'dump'
     :param accumulate: 布尔值，指定是否进行时间累加，默认为True
     """
-    global pre_dump_time_total, dump_time
+    global pre_dump_time_total, dump_time, esti_dump_time
 
     try:
         # 执行 'crit decode' 命令并获取输出
@@ -935,9 +945,15 @@ def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
             if accumulate:  # 只有当accumulate为True时，才执行累加
                 if log_type == 'pre_dump':
                     pre_dump_time_total += total_time / 1000
+                    print(f"stats-dump total_time for pre-dump: {total_time}ms")
                 elif log_type == 'dump':
                     dump_time += total_time / 1000
-        print(f"stats-dump total_time:{total_time}")
+                    print(f"stats-dump total_time for dump: {total_time}ms")
+            else:
+                esti_dump_time = total_time / 1000
+                print(f"stats-dump total_time for first-dump: {total_time}ms")
+
+
     except subprocess.CalledProcessError as e:
         print(f"执行 crit decode 时出错: {e.stderr}")
     except json.JSONDecodeError as e:
@@ -1191,9 +1207,12 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         start_dirty_track(device_fd)
 
     if time_constraint > 0 and bandwidth_measurements:
-        # mea_bandwidth = measure_bandwidth(dest)
-        # bandwidth_measurements.append(mea_bandwidth)
-        # Calculate average bandwidth and standard deviation
+        # 如果时间约束低于criu C/R时间之和，则表明无法热迁移
+        if time_constraint < 2 * esti_dump_time:
+            print(f"Time constraint {time_constraint} is too strict to perform live-migration")
+            error()
+
+        # 计算迁移可用带宽
         average_bandwidth = statistics.mean(bandwidth_measurements)
         if len(bandwidth_measurements) > 1:
             bandwidth_stddev = statistics.stdev(bandwidth_measurements)
@@ -1202,22 +1221,16 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         print(f"Average bandwidth: {average_bandwidth:.2f} Bytes/s")
         print(f"Bandwidth standard deviation: {bandwidth_stddev:.2f} Bytes/s")
 
-        # Update max_xfer_size based on average_bandwidth and time_constraint
-        max_xfer_size = (average_bandwidth - bandwidth_stddev - 0.4) * (time_constraint / 1000.0)  # Convert ms to seconds
+        # 可用于传输的时间=时间约束-2*C/R时间
+        max_xfer_size = abs(average_bandwidth - bandwidth_stddev) * ((time_constraint - 2 * esti_dump_time) / 1000.0)  # Convert ms to seconds
         print(f"Max_transfer_size: {max_xfer_size:.2f} Bytes based on average bandwidth and time constraint")
 
-        # 获取容器尚未传输的内存状态大小，判断是否post-copy
-        # 读取timestamp_list.pid文件，获取最新的dirty-map
-        # 读取dirty-map中的被跳过温页和热页
-        # 读取candidate_list.pid文件维护的候选页
-        # 将两者累计并预计最终传输的内存状态大小(*4KB)
-        if dirtymap:
-            # 计算传输大小
-            total_transfer_size = container_may_dump_size(container_pids, dirtymap_path)
-            print(f"Container may dump {total_transfer_size} bytes of memory")
-
-            # 步骤6: 与max_xfer_size比较
-            if total_transfer_size > 0.95 * max_xfer_size:
+        # 步骤6: 与max_xfer_size比较
+        if esti_dump_size_post >= 0.95 * max_xfer_size:
+            print(f"Time constraint {time_constraint} is too strict to perform live-migration")
+            error()
+        else:
+            if esti_dump_size_pre >= 0.95 * max_xfer_size:
                 print(f"Exceed max_xfer_size {max_xfer_size}, post-copy is needed")
                 if not post:
                     # print("[Warning]post-copy is not enabled, pre-copy may failed")
