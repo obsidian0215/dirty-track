@@ -767,7 +767,7 @@ if __name__ == '__main__':
         parser.error("Post-copy conflicted with replay.")
 
     if args.pre and not args.iter:
-        max_iter = 5
+        max_iter = 8
     else:
         max_iter = args.iter
 
