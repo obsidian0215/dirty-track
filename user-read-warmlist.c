@@ -6,7 +6,7 @@
 // 脏页信息(8 + 1 = 9 Btyes)
 struct __attribute__((__packed__)) warm_page{
 	unsigned long address;
-    unsigned char scount;
+    char scount;
 };
 
 int main(int argc, char *argv[]) {
