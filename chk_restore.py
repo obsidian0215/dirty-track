@@ -206,7 +206,7 @@ def prepare(base_path, image_path, parent_path, work_path):
                     shutil.rmtree(entry_path)
                 elif os.path.isdir(entry_path) and entry.startswith('pd_log'):
                     shutil.rmtree(entry_path)
-        except:     
+        except:
             pass
     else:
         os.mkdir(base_path)
@@ -225,7 +225,7 @@ def getdirsize(path, pattern=None):
     tsize = 0
     if not os.path.exists(path):
         return tsize
-    
+
     #skip soft link file
     if os.path.islink(path):
         return tsize
@@ -236,7 +236,7 @@ def getdirsize(path, pattern=None):
         if pattern:
             if pattern not in path:
                 return 0
-        
+
         return tsize
 
     if os.path.isdir(path):
@@ -262,7 +262,7 @@ def getdirsize(path, pattern=None):
         # else:
         #     print('the total size of {} is {}'.format(path, tsize))
         return tsize
-    
+
 def convert_byte(tsize):
     if tsize < 1024:
         return(round(tsize,2),'Byte')
@@ -282,7 +282,7 @@ def measure_bandwidth(dest_ip):
     print(f"开始测量到{dest_ip}的带宽")
     try:
         # 使用 iperf3 进行短时间带宽测量
-        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'], 
+        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode != 0:
             print("带宽测量失败:", result.stderr)
@@ -294,8 +294,71 @@ def measure_bandwidth(dest_ip):
     except Exception as e:
         print("带宽测量异常:", e)
         return 0
-    
 
+def read_warmlist(file_path):
+    """
+    读取warmlist文件，返回其中选择次数(uchar)最大的脏页地址(ulong)和选择次数
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+
+            # 每个条目的大小
+            entry_size = 9  # sizeof(unsigned long) + sizeof(unsigned char)
+
+            # 验证文件长度是否有效
+            if len(data) % entry_size != 0:
+                print(f"Invalid warmlist file size: {len(data)} bytes")
+                return None, None
+
+            count = len(data) // entry_size
+            max_address = None
+            max_s_count = 0  # 初始化最大选择次数
+
+            for i in range(count):
+                # 解析单个条目
+                entry = data[i*entry_size:(i+1)*entry_size]
+                address, s_count = struct.unpack('<QB', entry)  # Q: unsigned long, B: unsigned char
+
+                # 更新最大值
+                if s_count > max_s_count:
+                    max_address = address
+                    max_s_count = s_count
+
+            return max_address, max_s_count
+    except Exception as e:
+        print(f"Error reading warmlist file {file_path}: {e}")
+        return None, None
+
+def read_max_scount(container_pids, dirtymap_path):
+    """
+    遍历container_pids, 遍历每个pid的温页列表, 找到其中最大的选择次数
+
+    参数:
+    - container_pids: 包含容器的 PID 列表
+    - dirtymap_path: 存放 warm_list.pid 文件的目录路径
+
+    返回:
+    - max_scount: 所有温页列表中最大的选择次数
+    """
+    max_scount = 0  # 初始化最大选择次数
+
+    for pid in container_pids:
+        # 拼接文件路径
+        warm_list_file = os.path.join(dirtymap_path, f"warm_list.{pid}")
+
+        # 调用 read_warmlist 函数读取温页列表
+        max_address, max_scount_pid = read_warmlist(warm_list_file)
+
+        if max_address is None or max_scount_pid is None:
+            print(f"No valid data found for pid {pid}. Skipping.")
+            continue
+
+        # 更新全局最大选择次数
+        if max_scount_pid > max_scount:
+            max_scount = max_scount_pid
+
+    return max_scount
 
 def restore(container_path, tty, netdump, post):
     global rst_time
@@ -334,7 +397,7 @@ def restore(container_path, tty, netdump, post):
     print("%s finished after %.3fms with %d" % (cmd, end - start, ret))
     rst_time += end - start
     os.chdir(old_cwd)
-    
+
 
 #create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 #pre-dump contains the entire content of the container virtual memory
@@ -370,10 +433,10 @@ def pre_dump(mig_base, container, i, dirtymap):
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
 def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay):
-    global chk_time    
+    global chk_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    
+
     #cmd = 'runc checkpoint --image-path image --leave-running'
     cmd = 'runc checkpoint --image-path image --work-path d_log'
 
@@ -460,9 +523,14 @@ def iterate_predump(mig_base, parent_path, max_iter, dirtymap):
         #     break
         if last_iter > 0:
             less_last_path = parent_path[last_iter - 1]
-            if abs(getdirsize(last_path, 'pages') - getdirsize(less_last_path, 'pages')) < 102400 \
-                    or (getdirsize(last_path, 'pages') < 102400):     #100KB
+            if abs(getdirsize(last_path, 'pages') - getdirsize(less_last_path, 'pages')) < 64 * 1024 \
+                    or (getdirsize(last_path, 'pages') < 64 * 1024):     #64KB
+                print("iteration convergence")
                 break
+            if dirtymap:
+                if read_max_scount(container_pids, dirtymap_path) >= 3:
+                    print("get max_scount")
+                    break
         last_iter += 1
         if last_iter >= max_iter:
             last_iter = max_iter - 1
@@ -504,7 +572,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
         except FileNotFoundError:
             print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
             sys.exit(1)
-        
+
         # 迁移开始前配置dirty-map目录
         set_dirty_map_path(device_fd, dirtymap_path)
 
@@ -546,7 +614,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     #     search_cmd = 'runc list | grep ' + container
     #     container_exist = subprocess.getstatusoutput(search_cmd)
     #     #(0, 'redis-test   7289        running     /runc/containers/redis-test   2024-04-21T07:13:10.98300754Z   root')
-        
+
     #     #if the container is already running on the source, then we can transfer the rootfs
     #     #if the container is not running, then the script will exit
     #     if container_exist[0]:
@@ -559,18 +627,18 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
         # print("initial ROOTFS transfer time %.3f ms" % (end - start))
         # if ret != 0:
         #     error()
-        
+
         # #infinite sync loop
         # f = open("logs/rootfs_sync_progress.logs", 'w')
         # sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
         # p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
-    
+
     if pre:
         if diskless:
             for i in range(0, max_iter):
                 mount_cmd = 'mount -t tmpfs none '+ parent_path[i]
                 ret = os.system(mount_cmd)
-                if ret != 0:   
+                if ret != 0:
                     error()
 
         # iter pre-dump
@@ -586,9 +654,9 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     if diskless:
         mount_cmd = 'mount -t tmpfs none '+ image_path
         ret = os.system(mount_cmd)
-        if ret != 0:   
+        if ret != 0:
             error()
-            
+
     if dirtymap and not pre:
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
@@ -601,14 +669,14 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     #     # 确认VIP漂移后再恢复
     #     if ret == 0:
     #         # todo: 创建转发路由
-            
+
     #         # 最后传输容器剩余状态
     #         xfer_final(image_path, dest, mig_base)
     #         dir_size = convert_byte(getdirsize(image_path))
     #         print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
     #         #send the restore command
-    #         restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path 
+    #         restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
     #         restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
     #         cs.send(bytes(restore_cmd, encoding='utf-8'))
 
@@ -635,7 +703,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     # if rootfs:
     #     p.terminate()
     #     f.close()
-    
+
     if dirtymap:
         device_fd.close()
 
@@ -650,7 +718,7 @@ def post_process(max_iter):
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:
             pass
-    
+
     try:
         umount_cmd = 'umount ' + mig_base + '/image'
         subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
@@ -678,7 +746,7 @@ args = parser.parse_args()
 if __name__ == '__main__':
 
     runc_base = "/runc/containers/"
-    
+
     pre = False
     post = False
     diskless = False
@@ -694,7 +762,7 @@ if __name__ == '__main__':
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
-    
+
     if args.replay and args.post:
         parser.error("Post-copy conflicted with replay.")
 
@@ -703,7 +771,7 @@ if __name__ == '__main__':
     else:
         max_iter = args.iter
 
-    
+
     #The name of the container is the first argument
     #NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
     container = args.container
@@ -744,7 +812,7 @@ if __name__ == '__main__':
     rsync_opts = "-haz"
 
     # 开始热迁移
-    migrate(container, pre, post, replay, tty, netdump, rootfs, 
+    migrate(container, pre, post, replay, tty, netdump, rootfs,
                     max_iter, dirtymap, time_constraint)
 
     if diskless:
