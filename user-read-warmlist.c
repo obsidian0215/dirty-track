@@ -37,7 +37,7 @@ int main(int argc, char *argv[]) {
 
         // 读取结构体数据, 打印出地址和写入次数
         printf("Warm-Page address: 0x%lx, scount: %d\n",
-                   dirty_page.address, dirty_page.write_count);
+                   warm_page.address, warm_page.scount);
         index++;
     }
     if (ferror(file)) {
