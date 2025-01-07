@@ -1406,7 +1406,7 @@ if __name__ == '__main__':
         if args.iter:
             max_iter = args.iter
         else:
-            max_iter = 5
+            max_iter = 8
     else:
         max_iter = 0  # 当未启用预拷贝时，将 max_iter 设为 0
 
@@ -1480,12 +1480,14 @@ if __name__ == '__main__':
 
     stop_time = dump_time + dump_xfer_time + rst_time
 
-    print(f"total migrate time: {total_time:.0f} ms",)
-    print(f"down time: {stop_time:.0f} ms" )
+    print(f"total migrate time: {total_time:.0f} ms")
+    print(f"down time: {stop_time:.0f} ms")
 
     if post:
         print('Faulted pages transfer time（ms）: {:.0f} ms'.format(rpf_handle_time))
         print('Faulted pages size(KB): {:.2f} KB'.format(total_uffd_copy))
+    total_size = dump_size / 1024 + pre_dump_size_total / 1024 + total_uffd_copy
+    print('total migrate size: {total_size:.3f} KB')
 
     #input()
     # 迁移完成后，执行后处理
@@ -1523,6 +1525,8 @@ if __name__ == '__main__':
             '{:.2f}'.format(total_uffd_copy),
             int(round(rpf_handle_time))
         ])
+
+    output_values.append(int(round(total_size)))
 
     print('\t'.join(map(str, output_values)))
 
