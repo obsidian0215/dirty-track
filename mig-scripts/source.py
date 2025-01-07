@@ -665,9 +665,9 @@ def real_dump_0(mig_base, tty, netdump):
         error()
     directory_path = f'{mig_base}/parent_0'
     esti_dump_size_post = calculate_image(directory_path, False)
-    esti_dump_size_pre = calculate_image(directory_path, True)
+    # esti_dump_size_pre = calculate_image(directory_path, True)
     print(f"The total size of all files excluding 'pages-x.img' in {directory_path} is {esti_dump_size_post} bytes.")
-    print(f"The total size of all files including 'pages-x.img' in {directory_path} is {esti_dump_size_pre} bytes.")
+    # print(f"The total size of all files including 'pages-x.img' in {directory_path} is {esti_dump_size_pre} bytes.")
     stats_dump_file = os.path.join(mig_base, 'pd_log_0/stats-dump')
     parse_stats_dump(stats_dump_file, "dump", False)
 
@@ -1224,6 +1224,17 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         # 可用于传输的时间=时间约束-2*C/R时间
         max_xfer_size = abs(average_bandwidth - bandwidth_stddev) * ((time_constraint - 2 * esti_dump_time) / 1000.0)  # Convert ms to seconds
         print(f"Max_transfer_size: {max_xfer_size:.2f} Bytes based on average bandwidth and time constraint")
+
+        # 获取容器尚未传输的内存状态大小，判断是否post-copy
+        # 读取timestamp_list.pid文件，获取最新的dirty-map
+        # 读取dirty-map中的被跳过温页和热页
+        # 读取candidate_list.pid文件维护的候选页
+        # 将两者累计并预计最终传输的内存状态大小(*4KB)
+        if dirtymap:
+            # 计算传输大小
+            esti_dump_page = container_may_dump_size(container_pids, dirtymap_path)
+            esti_dump_size_pre = esti_dump_page + esti_dump_size_post
+            print(f"Container may dump {esti_dump_page} bytes of memory pages")
 
         # 步骤6: 与max_xfer_size比较
         if esti_dump_size_post >= 0.95 * max_xfer_size:
