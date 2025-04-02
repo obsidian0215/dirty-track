@@ -1222,7 +1222,7 @@ static void __exit lkm_exit(void) {
         // 剩余的清理任务委托给异步工作队列
         sw = kzalloc(sizeof(*sw), GFP_KERNEL);
         if (!sw) {
-            return -ENOMEM;
+            return;
         }
         sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
         sw->dti = dti;
