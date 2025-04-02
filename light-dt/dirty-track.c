@@ -1205,6 +1205,7 @@ static int __init lkm_init(void) {
 // 模块卸载
 static void __exit lkm_exit(void) {
     dirty_track_t *dti, *tmp;
+    nbstop_kthread_t *sw;
 
     // 停止所有脏页追踪实例
     write_lock(&dirty_track_rwlock);
