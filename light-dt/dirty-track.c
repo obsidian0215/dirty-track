@@ -618,8 +618,8 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long start, unsigned long 
 {
 	int err;
 
-	if (is_vm_hugetlb_page(vma) ||
-            (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
+    if (is_vm_hugetlb_page(vma)) {
+	// if (is_vm_hugetlb_page(vma) || (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
         err = 0;
 	} else {
 		err = walk_clear_wp_pgd_range(dti, start, end, vma);
@@ -848,7 +848,7 @@ static int wp_fault_track(void *data) {
                     // 每2s统计一次平均执行时间
                     i++;
                     total_ns += delta_ns;
-                    if (total_ns >= 2000000000) {
+                    if (total_ns >= 2000000000 || i >=200) {
                         printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / i);
                         total_ns = 0;
                         i = 1;
