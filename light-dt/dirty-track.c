@@ -1212,40 +1212,23 @@ static void __exit lkm_exit(void) {
         list_del(&dti->list);
         write_unlock(&dirty_track_rwlock);
 
-        // 分配工作队列完成通知结构体
-        wqtask_completion_t *wqtc = kzalloc(sizeof(*wqtc), GFP_KERNEL);
-        if (!wqtc) {
-            printk(KERN_ERR "Failed to allocate wqtask_completion_t during exit\n");
-            // 继续尝试清理其他实例
-            write_lock(&dirty_track_rwlock);
-            continue;
-        }
-        init_completion(&wqtc->wq_comp);
+        dti->stop_requested = true;
+        wake_up_interruptible(&dti->stop_wq); // 唤醒内核线程
+        wait_for_completion(&dti->stop_completed);
+        // end_time = ktime_get();  // 获取结束时间
+        // delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
+        // printk(KERN_INFO "wait_for_completion executed in %lld ns\n", delta_ns);
 
-        // 分配并初始化工作队列任务结构体
-        nbstop_kthread_t *sw = kzalloc(sizeof(*sw), GFP_KERNEL);
+        // 剩余的清理任务委托给异步工作队列
+        sw = kzalloc(sizeof(*sw), GFP_KERNEL);
         if (!sw) {
-            printk(KERN_ERR "Failed to allocate nbstop_kthread_t during exit\n");
-            kfree(wqtc);
-            write_lock(&dirty_track_rwlock);
-            continue;
+            return -ENOMEM;
         }
+        sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
         sw->dti = dti;
-        sw->wq_comp = wqtc;
+        // start_time = ktime_get();  // 获取开始时间
         INIT_WORK(&sw->work, nbstop_kthread_fn);
-
-        // 将完成通知结构体添加到任务完成链表
-        list_add_tail(&wqtc->list, &wqtask_completion_list);
-
-        // 将工作队列任务推送到工作队列
         queue_work(nbstop_kthread_wq, &sw->work);
-
-        // 等待工作队列任务完成
-        wait_for_completion(&wqtc->wq_comp);
-
-        // 移除完成通知结构体并释放内存
-        list_del(&wqtc->list);
-        kfree(wqtc);
 
         // 减少跟踪进程计数
         atomic_dec(&tracked_processes);
