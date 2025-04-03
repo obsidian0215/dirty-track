@@ -618,8 +618,8 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long start, unsigned long 
 {
 	int err;
 
-    if (is_vm_hugetlb_page(vma)) {
-	// if (is_vm_hugetlb_page(vma) || (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
+    // if (is_vm_hugetlb_page(vma)) {
+	if (is_vm_hugetlb_page(vma) || (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
         err = 0;
 	} else {
 		err = walk_clear_wp_pgd_range(dti, start, end, vma);
