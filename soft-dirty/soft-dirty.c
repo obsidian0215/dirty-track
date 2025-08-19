@@ -138,13 +138,14 @@ void add_or_update_dirty_page(unsigned long address) {
 
 // 释放平衡树的节点
 void free_dirty_page(void *nodep) {
-    dirty_page_t *page = *(dirty_page_t **)nodep;
+    dirty_page_t *page = (dirty_page_t *)nodep;
     free(page);
 }
 
 // 释放平衡树
 void free_dirty_pages_tree() {
     tdestroy(root, free_dirty_page);
+    root = NULL;
 }
 
 // 启用 soft-dirty tracking（清除 soft-dirty 位）
