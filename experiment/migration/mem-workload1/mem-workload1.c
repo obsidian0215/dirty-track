@@ -14,7 +14,7 @@
 #define PAGE_SIZE 4096
 #define HOT_SPOT_RATIO 0.1                     // 热区比例
 #define COLD_ACCESS_RATIO 0.05                 // 冷区访问比例
-#define SIMULTANEOUS_THREADS 4                 // 并发线程数
+#define SIMULTANEOUS_THREADS 2                 // 并发线程数
 
 // 全局测试状态
 volatile sig_atomic_t running = 1;
@@ -40,6 +40,7 @@ typedef struct {
     unsigned long hot_spot_pages;
     unsigned long hot_spot_start;
     unsigned long hot_spot_end;
+    size_t memory_pool_size;
 } memory_zone_t;
 
 // 线程工作函数类型
@@ -51,21 +52,24 @@ void signal_handler(int sig) {
 }
 
 // 初始化内存区域
-int init_memory_zone(memory_zone_t *zone) {
+int init_memory_zone(memory_zone_t *zone, size_t memory_pool_size_mb) {
     if (!zone) {
         fprintf(stderr, "Invalid zone pointer\n");
         return -1;
     }
 
+    // 计算内存池大小（MB到字节）
+    zone->memory_pool_size = memory_pool_size_mb * 1024 * 1024;
+
     // 分配大的内存池
-    zone->memory_pool = mmap(NULL, MEMORY_POOL_SIZE, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    zone->memory_pool = mmap(NULL, zone->memory_pool_size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
     if (zone->memory_pool == MAP_FAILED) {
         perror("Failed to allocate memory pool");
         return -1;
     }
 
-    zone->total_pages = MEMORY_POOL_SIZE / PAGE_SIZE;
+    zone->total_pages = zone->memory_pool_size / PAGE_SIZE;
     zone->hot_spot_pages = (unsigned long)(zone->total_pages * HOT_SPOT_RATIO);
 
     // 确保热区页面数量合理
@@ -83,15 +87,15 @@ int init_memory_zone(memory_zone_t *zone) {
     zone->access_pattern_map = calloc(zone->total_pages, 1);
     if (!zone->access_pattern_map) {
         perror("Failed to allocate access pattern map");
-        munmap(zone->memory_pool, MEMORY_POOL_SIZE);
+        munmap(zone->memory_pool, zone->memory_pool_size);
         return -1;
     }
 
     // 初始化内存内容
-    memset(zone->memory_pool, 0, MEMORY_POOL_SIZE);
+    memset(zone->memory_pool, 0, zone->memory_pool_size);
 
-    printf("Initialized memory zone: %lu MB, %lu pages, hot spot: %lu pages\n",
-           MEMORY_POOL_SIZE / (1024*1024), zone->total_pages, zone->hot_spot_pages);
+    printf("Initialized memory zone: %zu MB, %lu pages, hot spot: %lu pages\n",
+           zone->memory_pool_size / (1024*1024), zone->total_pages, zone->hot_spot_pages);
 
     return 0;
 }
@@ -99,7 +103,7 @@ int init_memory_zone(memory_zone_t *zone) {
 // 释放内存区域
 void cleanup_memory_zone(memory_zone_t *zone) {
     if (zone->memory_pool) {
-        munmap(zone->memory_pool, MEMORY_POOL_SIZE);
+        munmap(zone->memory_pool, zone->memory_pool_size);
     }
     if (zone->access_pattern_map) {
         free(zone->access_pattern_map);
@@ -361,18 +365,34 @@ int main(int argc, char *argv[]) {
     int thread_count = 0;
 
     // 解析命令行参数
-    if (argc < 2) {
-        printf("Usage: %s <test_type>\n", argv[0]);
-        printf("  0: Hot spot intensive\n");
-        printf("  1: Cold area sparse\n");
-        printf("  2: Mixed access\n");
+    int memory_size_mb = MEMORY_POOL_SIZE / (1024 * 1024);  // 默认300MB
+    int test_type = 0;
+
+    if (argc == 2) {
+        // 只提供了一个参数
+        test_type = atoi(argv[1]);
+        printf("使用默认大小300MB，\n");
+    } else if (argc >= 3) {
+        memory_size_mb = atoi(argv[1]);
+        test_type = atoi(argv[2]);
+    } else {
+        printf("Usage: %s <memory_size_mb> <test_type>\n", argv[0]);
+        printf("Or for backward compatibility: %s <test_type>\n", argv[0]);
+        printf("  memory_size_mb: 内存大小(MB), 默认: %d\n", memory_size_mb);
+        printf("  test_type:\n");
+        printf("    0: Hot spot intensive\n");
+        printf("    1: Cold area sparse\n");
+        printf("    2: Mixed access\n");
         return 1;
     }
 
-    int test_type = atoi(argv[1]);
+    if (memory_size_mb <= 0) {
+        fprintf(stderr, "Error: memory_size_mb must be greater than 0\n");
+        return 1;
+    }
 
     printf("=== CRIU阈值算法测试程序 ===\n");
-    printf("内存池大小: %d MB\n", MEMORY_POOL_SIZE / (1024*1024));
+    printf("内存池大小: %d MB\n", memory_size_mb);
     printf("并发线程数: %d\n", SIMULTANEOUS_THREADS);
     printf("测试类型: %d\n\n", test_type);
 
@@ -388,7 +408,7 @@ int main(int argc, char *argv[]) {
     pthread_barrier_init(&barrier, NULL, SIMULTANEOUS_THREADS + 2);
 
     // 初始化内存区域
-    if (init_memory_zone(&zone) != 0) {
+    if (init_memory_zone(&zone, memory_size_mb) != 0) {
         fprintf(stderr, "Failed to initialize memory zone\n");
         return 1;
     }

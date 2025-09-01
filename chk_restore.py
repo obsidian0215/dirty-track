@@ -14,12 +14,6 @@ from fcntl import ioctl
 import psutil
 import struct
 import fcntl
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field
-import statistics
-import math
-import bisect
-import re
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -360,7 +354,7 @@ def read_max_scount(container_pids, dirtymap_path):
 
     return max_scount
 
-def restore(container_path, tty, netdump, post):
+def restore(container_path, post, runc_args):
     global rst_time
     old_cwd = os.getcwd()
     os.chdir(container_path)
@@ -371,16 +365,19 @@ def restore(container_path, tty, netdump, post):
         cmd = 'runc restore'
     cmd += ' --image-path migrate/image'
     cmd += ' --work-path migrate/r_log'
-    if tty:
-        cmd += ' --shell-job'
-    if netdump:
-        cmd += ' --tcp-established'
+
+    # Add any additional runc arguments
+    if runc_args:
+        cmd += ' ' + ' '.join(runc_args)
+
     if post:
         cmd += ' --lazy-pages'
     #In case of a post-copy phase in the migration technique, the restore command restores the process without filling out the entire memory contents.
     #When the --lazy-pages option is used, restore registers the lazy virtual memory areas (VMAs) with the userfaultfd mechanism. The lazy pages are completely handled by dedicated lazy-pages daemon.
     #The daemon receives userfault file descriptors from restore via UNIX socket.
     cmd += ' ' + container
+
+
     # print("Running " +  cmd)
     start = time.perf_counter() * 1000
     p = subprocess.Popen(cmd, shell=True)
@@ -432,7 +429,7 @@ def pre_dump(mig_base, container, i, dirtymap):
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay):
+def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, runc_args):
     global chk_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
@@ -440,10 +437,8 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     #cmd = 'runc checkpoint --image-path image --leave-running'
     cmd = 'runc checkpoint --image-path image --work-path d_log'
 
-    if tty:
-        cmd += ' --shell-job'
-    if netdump:
-        cmd += ' --tcp-established'
+    if runc_args:
+        cmd += ' ' + ' '.join(runc_args)
     if precopy:
         cmd += ' --parent-path ../parent_{}'.format(last_iter)
     # if diskless:
@@ -472,6 +467,9 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
         cmd += ' --leave-running'
 
     cmd += ' ' + container
+
+    # Add any additional runc arguments
+
     start = time.perf_counter() * 1000
     print(cmd)
     if postcopy:
@@ -537,7 +535,7 @@ def iterate_predump(mig_base, parent_path, max_iter, dirtymap):
             break
     return last_iter
 
-def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtymap, time_constraint):
+def migrate(container, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args):
     global rst_time
     base_path = runc_base + container
     mig_base = base_path + "/migrate"
@@ -661,7 +659,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
     # print(dirtymap)
-    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay)
+    real_dump(mig_base, pre, post, last_iter, dirtymap, replay, runc_args)
     # if replay:
     #     ret = transfer_vip()
     #     if ret == 0:
@@ -698,7 +696,7 @@ def migrate(container, pre, post, replay, tty, netdump, rootfs, max_iter, dirtym
     #                 rst_time = float(answer_list[-2])
     #     else:
     #         print("can't confirm VIP has been transfered, can't restore on destination")
-    restore(base_path, tty, netdump, post)
+    restore(base_path, post, runc_args)
     #after migration, rootfs sync process and opened files will be closed
     # if rootfs:
     #     p.terminate()
@@ -734,14 +732,48 @@ parser.add_argument('container', help="container's name(identical to bundle name
 parser.add_argument('-pre', '--pre-copy', dest='pre', action='store_true', help="enable per-copy migration")
 parser.add_argument('-post', '--post-copy', dest='post', action='store_true', help="enable post-copy migration")
 parser.add_argument('-d', '--disk-less', dest='diskless', action='store_true', help="enable disk-less migration(page-server, only effect pre-copy)")
-parser.add_argument('-t', '--tcp-established', dest='netdump', action='store_true', help="dump and restore the established connection")
-parser.add_argument('-s', '--shell-job', dest='tty', action='store_true', help="dump and restore the tty device(opened shell job)")
 parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="avoid the synchronization of rootfs")
 parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
-args = parser.parse_args()
+# 使用简化方案：所有剩余参数都传递给 runc
+args, remaining = parser.parse_known_args()
+
+# 处理容器名：找到第一个非-开头的参数作为容器名
+container_name = None
+runc_args = []
+
+for arg in remaining:
+    if not arg.startswith('-'):
+        if not container_name:
+            container_name = arg
+        else:
+            # 如果找到第二个非-参数，也当作 runc 参数（兼容性）
+            runc_args.append(arg)
+    else:
+        # 将所有剩余的参数（包括有-的参数）都作为 runc 参数
+        # 但是跳过 --runc-args 参数（已废弃）
+        if arg != '--runc-args':
+            runc_args.append(arg)
+
+# 如果没有找到容器名，则从原始 sys.argv 中查找
+if not container_name:
+    for arg in sys.argv[1:]:
+        if not arg.startswith('-'):
+            container_name = arg
+            # 从 runc_args 中移除容器名（如果它在那里）
+            if container_name in runc_args:
+                runc_args.remove(container_name)
+            break
+
+if not container_name:
+    parser.error("container name is required")
+
+print(f"Debug: container_name = '{container_name}'")
+print(f"Debug: runc_args = {runc_args}")
+
+# 现在参数解析已经完成
 
 if __name__ == '__main__':
 
@@ -750,12 +782,11 @@ if __name__ == '__main__':
     pre = False
     post = False
     diskless = False
-    tty = False
-    netdump = False
     replay = False
     rootfs = True
     dirtymap = False
-    if args.time_constraint:
+    # runc_args 已经在 parse_custom_args 中获得，不需要再从 args 对象获取
+    if hasattr(args, 'time_constraint') and args.time_constraint:
         time_constraint = args.time_constraint
     else:
         time_constraint = 2000
@@ -774,7 +805,7 @@ if __name__ == '__main__':
 
     #The name of the container is the first argument
     #NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
-    container = args.container
+    container = container_name
     #destination IP is the second argument
     #the Pre and Lazy flags, which are used to determine the migration techniques as follows:
     #Cold = False False
@@ -790,10 +821,6 @@ if __name__ == '__main__':
     diskless = args.diskless
     if diskless and not (pre or post):
         parser.error("Diskless only supported to used in pre/post-copy")
-
-    #enable CRIU's --shell-job and --tcp-established flag to dump tty device and socket
-    tty = args.tty
-    netdump = args.netdump
 
     #rootfs_sync flag, which is used to enable synchronization of container's rootfs
     if args.norootfs:
@@ -812,8 +839,8 @@ if __name__ == '__main__':
     rsync_opts = "-haz"
 
     # 开始热迁移
-    migrate(container, pre, post, replay, tty, netdump, rootfs,
-                    max_iter, dirtymap, time_constraint)
+    migrate(container, pre, post, replay, rootfs,
+                    max_iter, dirtymap, time_constraint, runc_args)
 
     if diskless:
         print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))

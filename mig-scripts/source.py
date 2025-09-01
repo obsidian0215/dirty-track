@@ -14,11 +14,7 @@ from fcntl import ioctl
 import psutil
 import struct
 import fcntl
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field
 import statistics
-import math
-import bisect
 import re
 import threading
 
@@ -658,17 +654,16 @@ def pre_dump(mig_base, container, i, dirtymap):
     if ret != 0:
         error()
 
-def real_dump_0(mig_base, tty, netdump):
+def real_dump_0(mig_base, runc_args=None):
     global esti_dump_time, esti_dump_size_pre, esti_dump_size_post
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
     cmd = 'runc checkpoint --image-path parent_0 --work-path pd_log_0'
 
-    if tty:
-        cmd += ' --shell-job'
-    if netdump:
-        cmd += ' --tcp-established'
+    if runc_args:
+        cmd += ' ' + ' '.join(runc_args)
+
     cmd += ' --leave-running'
     cmd += ' ' + container
 
@@ -696,7 +691,7 @@ def real_dump_0(mig_base, tty, netdump):
 #The page server listens on port 27.
 #Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
 #Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
-def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, replay, cs, inputs):
+def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inputs, runc_args=None):
     global dump_time, dump_size, dump_xfer_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
@@ -704,10 +699,8 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     #cmd = 'runc checkpoint --image-path image --leave-running'
     cmd = 'runc checkpoint --image-path image --work-path d_log'
 
-    if tty:
-        cmd += ' --shell-job'
-    if netdump:
-        cmd += ' --tcp-established'
+    if runc_args:
+        cmd += ' ' + ' '.join(runc_args)
     if precopy:
         cmd += ' --parent-path ../parent_{}'.format(last_iter)
     # if diskless:
@@ -757,17 +750,10 @@ def real_dump(mig_base, precopy, postcopy, tty, netdump, last_iter, dirtymap, re
     if ret != 0:
         error()
 
-    # 若要迁移带TCP连接的容器，则需要将服务的IP迁移到目标节点
-    if netdump:
+    # '--tcp-established'迁移TCP连接
+    if runc_args and '--tcp-established' in ' '.join(runc_args):
         vip_thread = threading.Thread(target=async_vip_migration, args=(cs, inputs))
         vip_thread.start()
-        # ret = transfer_vip()
-        # if ret == 0:
-        #     ret = notify_transfer_vip(cs, inputs=input)
-        # # 确认VIP漂移后再恢复
-        # if ret != 0:
-        #     print("can't confirm VIP has been transfered, can't restore on destination")
-        #     error()
 
 # 解析大小字符串，转换为以Byte为单位
 def parse_size(size_str):
@@ -1070,8 +1056,8 @@ def update_image_parent(mig_base: str, latest_parent: str):
         error()
 
 
-def migrate(container, dest, pre, post, replay, tty, netdump,
-            rootfs, max_iter, dirtymap, time_constraint):
+def migrate(container, dest, pre, post, replay,
+            rootfs, max_iter, dirtymap, time_constraint, runc_args):
     global rst_time, dirtymap_path, device_fd
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
@@ -1097,7 +1083,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
     print(parent_path)
     prepare(mig_base, image_path, parent_path, work_path)
 
-    real_dump_0(mig_base, tty, netdump)
+    real_dump_0(mig_base, runc_args=runc_args)
 
     #time.sleep(100000)
     # 测量初始带宽和状态传输最大值(Bytes)
@@ -1266,7 +1252,7 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
                 if post:
                     post = False
 
-    real_dump(mig_base, pre, post, tty, netdump, last_iter, dirtymap, replay, cs, inputs)
+    real_dump(mig_base, pre, post, last_iter, dirtymap, replay, cs, inputs, runc_args)
     # 更新 image/parent 符号链接指向最新的 parent_i
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
 
@@ -1279,32 +1265,31 @@ def migrate(container, dest, pre, post, replay, tty, netdump,
         # todo: 创建转发路由
 
     # one-shot restore with post-copy
+    # Build runc_args string for restore command
+    runc_args_str = ' '.join(runc_args) if runc_args else ""
+
     restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
-    restore_cmd += '" , "lazy" : "' + str(post) + '" , "shell-job" : "' + str(tty) + '" , "tcp-established" : "' + str(netdump) + '" , "pre" : "' + str(pre) + '" } }'
+    restore_cmd += '" , "lazy" : "' + str(post) + '" , "runc_args" : "' + runc_args_str.replace('"', '\\"') + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
-    # while True:
-    #     #select.select calls the Unix select() system call
-    #     #the first three arguments are three waitable objects (a read list, a write list, and an exception list). The fourth argument is a timeout
-    #     #After the timeout, select() returns the triple of lists of objects that are ready (subset of the three arguments)... or empty if not ready
-    #     inputready, outputready, exceptready = select.select(input, [], [], 5)
+    # 等待恢复完成
+    print("等待destination恢复完成...")
+    max_wait_time = 200 if post else 30  # post-copy使用更长的等待时间
+    time_left = max_wait_time
+    polling_interval = 5  # 每5秒检测一次，防止占用过多CPU
 
-    #     #If after 5 seconds there is nothing to read, then exit
-    #     if not inputready:
-    #         break
+    while time_left > 0:
+        wait_time = min(polling_interval, time_left)
+        inputready, outputready, exceptready = select.select(inputs, [], [], wait_time)
 
-    #     #If there is something in input to read (e.g., from the socket), then print it
-    #     for s in inputready:
-    #         answer = s.recv(1024).decode("utf-8")
-    #         print("answer is here:",answer)
-    #         answer_list = answer.split()
-    #         rst_time = float(answer_list[-2])
+        if inputready:
+            break  # 收到数据，跳出等待循环
 
-    # post拷贝返回较慢，需要加大等待时间
-    if post:
-        inputready, outputready, exceptready = select.select(inputs, [], [], 200)
-    else:
-        inputready, outputready, exceptready = select.select(inputs, [], [], 5)
+        time_left -= polling_interval
+        print(f"等待恢复完成，还需等待 {time_left} 秒...")
+
+        if time_left <= 0:
+            print(f"警告：超过 {max_wait_time} 秒未收到恢复确认信息，可能迁移已完成或出现问题")
     #If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     for s in inputready:
@@ -1379,15 +1364,46 @@ parser.add_argument('dest', help="IP address of destination")
 parser.add_argument('-pre', '--pre-copy', dest='pre', action='store_true', help="enable per-copy migration")
 parser.add_argument('-post', '--post-copy', dest='post', action='store_true', help="enable post-copy migration")
 parser.add_argument('-d', '--disk-less', dest='diskless', action='store_true', help="enable disk-less migration(page-server, only effect pre-copy)")
-parser.add_argument('-t', '--tcp-established', dest='netdump', action='store_true', help="dump and restore the established connection")
-parser.add_argument('-s', '--shell-job', dest='tty', action='store_true', help="dump and restore the tty device(opened shell job)")
 parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="avoid the synchronization of rootfs")
 parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
 parser.add_argument('-z', '--compress', dest='compress', action='store_true', help="enable compression")
-args = parser.parse_args()
+# 区分脚本参数和criu使用的参数
+args, remaining = parser.parse_known_args()
+
+# 处理容器名：找到第一个非-开头的参数作为容器名
+container_name = None
+# criu使用的参数
+runc_args = []
+
+for arg in remaining:
+    if not arg.startswith('-'):
+        if not container_name:
+            container_name = arg
+        else:
+            # 如果找到第二个非-参数，也当作 runc 参数（兼容性）
+            runc_args.append(arg)
+    else:
+        # 将所有剩余的参数（包括有-的参数）都作为 runc 参数
+        runc_args.append(arg)
+
+# 如果没有找到容器名，则从原始 sys.argv 中查找
+if not container_name:
+    for arg in sys.argv[1:]:
+        if not arg.startswith('-'):
+            container_name = arg
+            # 从 runc_args 中移除容器名（如果它在那里）
+            if container_name in runc_args:
+                runc_args.remove(container_name)
+            break
+
+if not container_name:
+    parser.error("container name is required")
+
+print(f"Debug: container_name = '{container_name}'")
+print(f"Debug: runc_args = {runc_args}")
 
 if __name__ == '__main__':
 
@@ -1396,8 +1412,6 @@ if __name__ == '__main__':
     pre = False
     post = False
     diskless = False
-    tty = False
-    netdump = False
     replay = False
     rootfs = True
     dirtymap = False
@@ -1427,7 +1441,7 @@ if __name__ == '__main__':
 
     #The name of the container is the first argument
     #NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
-    container = args.container
+    container = container_name
     #destination IP is the second argument
     dest = args.dest
     #the Pre and Lazy flags, which are used to determine the migration techniques as follows:
@@ -1445,10 +1459,6 @@ if __name__ == '__main__':
     if diskless and not (pre or post):
         parser.error("Diskless only supported to used in pre/post-copy")
 
-    #enable CRIU's --shell-job and --tcp-established flag to dump tty device and socket
-    tty = args.tty
-    netdump = args.netdump
-
     #rootfs_sync flag, which is used to enable synchronization of container's rootfs
     if args.norootfs:
         rootfs = False
@@ -1465,8 +1475,8 @@ if __name__ == '__main__':
     ssh_opts = "-o TCPWindowSize=65536 -o SSHBufferSize=65536 -c aes128-ctr"
 
     # 开始热迁移
-    migrate(container, dest, pre, post, replay, tty, netdump, rootfs,
-                    max_iter, dirtymap, time_constraint)
+    migrate(container, dest, pre, post, replay, rootfs,
+                    max_iter, dirtymap, time_constraint, runc_args)
 
 
     print("-----------------------statistics---------------")

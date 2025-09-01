@@ -330,10 +330,12 @@ def get_rpf_handle_time(lp_log_file):
 def perform_restore(msg):
     try:
         lazy = bool(distutils.util.strtobool(msg['restore']['lazy']))
-        tty = bool(distutils.util.strtobool(msg['restore']['shell-job']))
-        netdump = bool(distutils.util.strtobool(msg['restore']['tcp-established']))
-    except:
+        # 获取runc_args，如果不存在则为空字符串
+        runc_args_str = msg['restore'].get('runc_args', '')
+    except Exception as e:
+        print(f"Error parsing restore parameters: {e}")
         lazy = False
+        runc_args_str = ''
 
     old_cwd = os.getcwd()
     os.chdir(msg['restore']['path'])
@@ -342,10 +344,11 @@ def perform_restore(msg):
     cmd = 'time -p runc restore --console-socket ' + msg['restore']['path']
     cmd += '/console.sock -d  --image-path ' + msg['restore']['image_path']
     cmd += ' --work-path ' + msg['restore']['path'] + "/migrate/r_log"
-    if tty:
-        cmd += ' --shell-job'
-    if netdump:
-        cmd += ' --tcp-established'
+
+    # 添加runc_args参数
+    if runc_args_str:
+        cmd += ' ' + runc_args_str
+
     if lazy:
         cmd += ' --lazy-pages'
     cmd += ' ' + msg['restore']['name']
@@ -362,7 +365,7 @@ def perform_restore(msg):
         # 启动 lazy-pages 守护进程
         lp = subprocess.Popen(lazy_cmd, shell=True)
         # 为了确保 lazy-pages.socket 已经创建，等待片刻
-        time.sleep(0.1)  # 等待0.1秒，可根据需要调整时间
+        time.sleep(0.07)  # 等待0.07秒，可根据需要调整时间
 
     # 现在启动 runc restore 命令
     # print("Running restore command...")
