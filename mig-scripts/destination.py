@@ -30,12 +30,9 @@ port_list: List[int] = [INIT_PORT]
 transfer_processes: Dict[int, subprocess.Popen] = {}
 last_iter = 0
 
-# Lock 以确保线程安全
+# 确保线程安全
 process_lock = threading.Lock()
-
-
 VIP = "192.168.2.100"
-
 rst_time = 0.0
 
 def handle_pre_xfer_complete(msg):

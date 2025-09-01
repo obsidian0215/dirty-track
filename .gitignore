@@ -6,3 +6,8 @@ dirty_map/
 *.o
 *.symvers
 modules.order
+AGENTS.md
+port-forwarding/container_network_config.py
+port-forwarding/container_forwarding_guide.md
+port-forwarding/container_forward_manager.sh
+experiment/light-dt-ro/MEMORY-TEST-README.md

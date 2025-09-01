@@ -98,12 +98,16 @@ typedef struct dirty_track {
     // s64 track_duration_ns;         // 累计持续时间（纳秒）
 } dirty_track_t;
 
-// 保存单个页的修改历史
+// 保存单个页的修改历史，均按4KB页处理 (2MB页认为是连续数个相同脏统计的4KB页)
 typedef struct dirty_address {
-    /* unsigned long address;       // 本次写错误的地址，已被xarray索引替代 */
-    unsigned int write_count;       // 写入错误次数
-    unsigned char page_type;        // 页类型
+    unsigned int write_count;
 } dirty_address_t;
+// typedef struct __packed dirty_address {
+//     /* unsigned long address;       // 本次写错误的地址，已被xarray索引替代 */
+//     unsigned int write_count:24;    // 支持1677万计数
+//     unsigned char page_type:4;      // 4位足以表示页类型
+//     unsigned char reserved:4;       // 预留位用于未来扩展
+// } dirty_address_t;
 
 // 脏页追踪线程的双向链表头
 static LIST_HEAD(dirty_track_list);
@@ -166,14 +170,10 @@ static inline void dirty_map_to_file(dirty_track_t *dti, struct file *file, loff
 
     printk(KERN_INFO "[PID %d] Total dirty-track duration: %lld ns\n", dti->pid, total_duration_ns);
     // 写入追踪持续时间
-    // kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), &file->f_pos);
     kernel_write(file, (char *)&total_duration_le, sizeof(total_duration_le), pos);
-    // 遍历xarray，输出索引（页地址）和脏页统计数据
+    // 遍历xarray，向文件分别写入索引（页地址）和页修改计数
     xa_for_each(xarray, address, entry) {
-        // 先写入页地址（索引）
         kernel_write(file, (char *)&address, sizeof(address), pos);
-
-        // 再写入脏页统计数据
         kernel_write(file, (char *)&entry->write_count, sizeof(entry->write_count), pos);
     }
 }

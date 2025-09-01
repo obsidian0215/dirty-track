@@ -499,11 +499,8 @@ def measure_bandwidth(dest_ip):
         print("带宽测量异常:", e)
         return 0
 
-# 流量控制函数
+# 降低source的优先级以触发VIP迁移到dest
 def transfer_vip(new_prior):
-    """
-    降低源节点的优先级并触发 VIP 迁移到目标节点
-    """
     try:
         # 定义 Keepalived 配置文件路径和备份路径
         config_path = '/etc/keepalived/keepalived.conf'
@@ -566,7 +563,7 @@ def transfer_vip(new_prior):
         print(f"发生错误：{e}")
         return 1
 
-# 向dest发送提升优先级的通知
+# 通知dest提升优先级
 def notify_transfer_vip(cs, inputs):
     # vip_cmd = '{"transfer_vip"}'
     vip_cmd = json.dumps({"transfer_vip": True})
@@ -581,29 +578,47 @@ def notify_transfer_vip(cs, inputs):
             answer = answer_bytes.decode('utf-8').strip()
             print(answer)
             if answer == 'OK':
-                print("okkkkkk")
+                # print("okkkkkk")
                 return 0
             else:
-                print("notok")
+                # print("notok")
                 return 1
     else:
         print("can't confirm the VIP has been transfered")
         return 1
 
+# 异步VIP迁移
 def async_vip_migration(cs, inputs):
+    """
+    1. 降低优先级到30（低于目标节点任何配置）
+    2. 通知目标节点接管VIP
+    3. 验证迁移成功，异常时自动恢复
+    """
+    migration_start = time.time()
+
     try:
         ret = transfer_vip('30')
+
         if ret == 0:
-            print("input:")
-            print(inputs)
-            ret = notify_transfer_vip(cs, inputs=inputs)
-        if ret != 0:
-            print("无法确认VIP已迁移，目标节点可能无法恢复")
+            time.sleep(0.02)
+
+            ret = notify_transfer_vip(cs, inputs)
+            if ret == 0:
+                # 记录迁移时间
+                migration_time = time.time() - migration_start
+                print(f"VIP迁移成功，耗时: {migration_time:.2f}秒")
+                return
+            else:
+                print("VIP通知确认失败，恢复优先级")
+                transfer_vip('100')  # 恢复到原优先级
+                return
         else:
-            # 调整至目标节点原先的权重
-            transfer_vip('50')
+            print("VIP优先级设置失败，迁移终止")
+            return
+
     except Exception as e:
-        print(f"VIP迁移过程中发生异常: {e}")
+        print(f"VIP迁移过程中发生异常: {e}，恢复优先级")
+        transfer_vip('100')  # 恢复到原优先级
 
 # 计算image目录下除pages-x.img外的文件总大小
 def calculate_image(directory, exclude_pages=False):
