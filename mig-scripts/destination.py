@@ -34,6 +34,7 @@ last_iter = 0
 process_lock = threading.Lock()
 VIP = "192.168.2.100"
 rst_time = 0.0
+vip_transfer_complete = False  # 标记VIP转移是否完成
 
 def handle_pre_xfer_complete(msg):
     """
@@ -118,9 +119,9 @@ def handle_prepare(prepare_info):
             # 启动 ncat 监听并解压的管道命令
             # 命令: nc -l {port} | tar -xzf - -C {extract_path}
             if compress:
-                cmd = f"nc -lp {port} | tar -xzf - -C {extract_path}"
+                cmd = f"nc -lp {port} -q 1 | tar -xzf - -C {extract_path}"
             else:
-                cmd = f"nc -lp {port} | tar -xf - -C {extract_path}"
+                cmd = f"nc -lp {port} -q 1 | tar -xf - -C {extract_path}"
             logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             #print("process id:",process)
@@ -134,9 +135,9 @@ def handle_prepare(prepare_info):
             # os.makedirs(image_path, exist_ok=True)
             extract_path = image_path
             if compress:
-                cmd = f"nc -lp {last_port} | tar -xzf - -C {extract_path}"
+                cmd = f"nc -lp {last_port} -q 1 | tar -xzf - -C {extract_path}"
             else:
-                cmd = f"nc -lp {last_port} | tar -xf - -C {extract_path}"
+                cmd = f"nc -lp {last_port} -q 1 | tar -xf - -C {extract_path}"
                 #cmd = f"nc -lp {last_port} "
                 #cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
             logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
@@ -463,10 +464,24 @@ def handle_restore(msg):
             else:
                 print("transfer_processes 字典为空，跳过最后一个传输进程的检查")
         if all_transfers_complete:
+            # 检查是否启用了TCP连接迁移，若启用且VIP未迁移则主动迁移
+            runc_args_str = msg['restore'].get('runc_args', '')
+            needs_vip_transfer = '--tcp-established' in runc_args_str
+
+            if needs_vip_transfer:
+                global vip_transfer_complete
+                if not vip_transfer_complete:
+                    logger.info("VIP未迁移但状态传输完成，提前执行VIP转移")
+                    ret_code = transfer_vip()
+                    vip_transfer_complete = (ret_code == 0)
+                    logger.info(f"VIP已前提迁移")
+                else:
+                    logger.info("VIP已迁移")
+
             logger.info("所有指定迭代和最后一个迭代的传输已完成，开始执行恢复操作")
 
             #time.sleep(10)
-            print("start================")
+            # print("start================")
             reply = perform_restore(msg)
             break
         else:
@@ -532,13 +547,19 @@ def migrate_server():
 
                 match msg:
                     case {'transfer_vip':_}:
-                        # print(1111)
-                        ret = transfer_vip()
-                        # print(2222)
-                        if ret == 0:
+                        # 检查并设置VIP转移完成状态
+                        global vip_transfer_complete
+                        if vip_transfer_complete:
+                            logger.info("VIP已迁移，通知source")
                             reply = 'OK'
                         else:
-                            reply = 'Error'
+                            ret = transfer_vip()
+                            vip_transfer_complete = (ret == 0)
+                            if ret == 0:
+                                logger.info("VIP完成迁移，通知source")
+                                reply = 'OK'
+                            else:
+                                reply = 'Error'
 
                     case {'pre_xfer_complete':_}:
                         # 只需等待该次及之前迭代以及最后一次迭代的传输完成

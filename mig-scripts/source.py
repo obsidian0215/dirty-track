@@ -17,6 +17,8 @@ import fcntl
 import statistics
 import re
 import threading
+import signal
+import atexit
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -63,6 +65,74 @@ IOCTL_GET_DIRTY_MAP_PATH = _IOR(DIRTY_TRACK_MAGIC, 5, 256)
 # 定义容器进程树的 pid 列表
 container_pids = []
 
+# 全局变量用于跟踪 sync_rootfs 进程
+sync_rootfs_process = None
+sync_rootfs_log_file = None
+
+# 停止 sync_rootfs 进程的函数
+def stop_sync_rootfs():
+    """停止 sync_rootfs 进程及其所有子进程（包括rsync进程和后台定时器）"""
+    global sync_rootfs_process, sync_rootfs_log_file
+
+    if sync_rootfs_process:
+        try:
+            print("正在停止 sync_rootfs 进程及其所有子进程...")
+
+            # 终止主进程
+            sync_rootfs_process.terminate()
+
+            # 等待进程终止，最多等待5秒
+            sync_rootfs_process.wait(timeout=5.0)
+            print("sync_rootfs 主进程已终止")
+
+            # 使用系统命令清理残留的子进程
+            try:
+                # 获取父进程PID并查找所有子进程
+                if hasattr(sync_rootfs_process, 'pid') and sync_rootfs_process.pid:
+                    pid = sync_rootfs_process.pid
+                    # 查找并终止所有相关进程（ps -列出进程，grep -筛选，awk -提取PID，xargs -传递PID给kill）
+                    kill_proc = subprocess.run(f'pkill -P {pid} || true', shell=True,
+                                             capture_output=True, text=True)
+                    print("已清理 sync_rootfs.sh 的所有子进程")
+            except Exception as e:
+                print(f"清理子进程时出现警告（这通常没有问题）: {e}")
+
+        except subprocess.TimeoutExpired:
+            print("警告：sync_rootfs 进程无法正常终止，强制杀死")
+            try:
+                sync_rootfs_process.kill()
+                sync_rootfs_process.wait(timeout=2.0)
+                print("sync_rootfs 主进程已被强制杀死")
+
+                # 再次尝试清理子进程
+                if hasattr(sync_rootfs_process, 'pid') and sync_rootfs_process.pid:
+                    kill_proc = subprocess.run(f'pkill -P {sync_rootfs_process.pid} || true',
+                                             shell=True, capture_output=True, text=True)
+            except subprocess.TimeoutExpired:
+                print("错误：无法杀死 sync_rootfs 进程的所有子进程")
+
+        except Exception as e:
+            print(f"停止 sync_rootfs 进程时发生错误: {e}")
+
+        finally:
+            sync_rootfs_process = None
+
+    if sync_rootfs_log_file:
+        try:
+            sync_rootfs_log_file.close()
+            print("sync_rootfs 日志文件已关闭")
+        except Exception as e:
+            print(f"关闭 sync_rootfs 日志文件时发生错误: {e}")
+        finally:
+            sync_rootfs_log_file = None
+
+# 信号处理器函数
+def signal_handler(signum, frame):
+    """处理 сигнал终止"""
+    print(f"\n接收到信号 {signum}，正在清理并退出...")
+    stop_sync_rootfs()
+    sys.exit(0)
+
 # [tang change]定义全局变量用于累计预拷贝时间和大小
 pre_dump_time_total = 0.0  # 毫秒
 pre_dump_size_total = 0.0  # 字节
@@ -81,6 +151,7 @@ rpf_handle_time = 0.0
 esti_dump_time = 0.0
 esti_dump_size_pre = 0.0
 esti_dump_size_post = 0.0
+max_predump_size = 0.0  # 跟踪predump的最大大小
 
 PAGE_SIZE = 4096  # 每页大小为4KB
 
@@ -152,6 +223,9 @@ def get_runc_container_pidtree(container_name):
 
 def error():
     print("Something did not work. Exiting!")
+    # 确保在程序终止时停止 sync_rootfs 进程
+    stop_sync_rootfs()
+
     if diskless:
         post_process(max_iter)
     sys.exit(-1)
@@ -565,8 +639,8 @@ def notify_transfer_vip(cs, inputs):
     vip_cmd = json.dumps({"transfer_vip": True})
     cs.send(bytes(vip_cmd, encoding='utf-8'))
     print("send notify_transfer_vip")
-    inputready, outputready, exceptready = select.select(inputs, [], [], 3)
-    print(inputs)
+    inputready, outputready, exceptready = select.select(inputs, [], [], 5)
+    # print(inputs)
 
     if inputready:
         for s in inputready:
@@ -752,7 +826,10 @@ def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inpu
 
     # '--tcp-established'迁移TCP连接
     if runc_args and '--tcp-established' in ' '.join(runc_args):
-        vip_thread = threading.Thread(target=async_vip_migration, args=(cs, inputs))
+        # VIP线程独立处理，不要共享inputs列表
+        vip_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        vip_socket.connect((dest, 18863))
+        vip_thread = threading.Thread(target=async_vip_migration, args=(vip_socket, [vip_socket]))
         vip_thread.start()
 
 # 解析大小字符串，转换为以Byte为单位
@@ -806,7 +883,10 @@ def xfer_pre_dump(parent_path, dest, i, port):
             raise ValueError(f" pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
         else:
             print(f"pre_dump_{i} 打包文件 {archive_name} 大小为{size}")
-    print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
+    if compress:
+        print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
+    else:
+        print(f"PRE-DUMP {i} 打包时间 {(end - start):.3f} ms")
     pre_dump_xfer_time_total += end - start
     # 传输到目标服务器
     nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
@@ -883,6 +963,11 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         print("last_iter:",last_iter)
         less_last_path = parent_path[last_iter - 2]  if last_iter > 1 else None
         print("less_last_path:",less_last_path)
+
+        # 更新最大predump大小
+        global max_predump_size
+        if dir_size > max_predump_size:
+            max_predump_size = dir_size
         # if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
         #             or (dir_size < 1024 * 64) or last_iter == max_iter:     #64KB
         #     iter_terminate = True
@@ -1058,7 +1143,16 @@ def update_image_parent(mig_base: str, latest_parent: str):
 
 def migrate(container, dest, pre, post, replay,
             rootfs, max_iter, dirtymap, time_constraint, runc_args):
-    global rst_time, dirtymap_path, device_fd
+    global rst_time, dirtymap_path, device_fd, sync_rootfs_process, sync_rootfs_log_file
+
+    # 注册退出处理器和信号处理器
+    atexit.register(stop_sync_rootfs)
+
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    print("已注册退出处理器，确保 sync_rootfs 进程会被正确停止")
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
     mig_base = base_path + "/migrate"
@@ -1172,9 +1266,14 @@ def migrate(container, dest, pre, post, replay,
         # 确保脚本有执行权限
         if not os.access('./sync_rootfs.sh', os.X_OK):  # 检查是否有执行权限
             os.chmod('./sync_rootfs.sh', 0o755)        # 添加执行权限
-        f = open(mig_base + "/d_log/sync_rootfs.log", 'w')
+
+        # 保存日志文件句柄到全局变量
+        sync_rootfs_log_file = open(mig_base + "/d_log/sync_rootfs.log", 'w')
         sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
-        p = subprocess.Popen(sync_cmd, shell=True, stdout=f, stderr=f)
+
+        # 保存进程对象到全局变量
+        sync_rootfs_process = subprocess.Popen(sync_cmd, shell=True, stdout=sync_rootfs_log_file, stderr=sync_rootfs_log_file)
+        print(f"已启动 sync_rootfs 进程 (PID: {sync_rootfs_process.pid})")
 
     if pre:
         if diskless:
@@ -1236,6 +1335,11 @@ def migrate(container, dest, pre, post, replay,
             esti_dump_page = container_may_dump_size(container_pids, dirtymap_path)
             esti_dump_size_pre = esti_dump_page + esti_dump_size_post
             print(f"Container may dump {esti_dump_page} bytes of memory pages")
+        else:
+            # 没有启用dirty-map时，使用最大predump大小进行估算
+            global max_predump_size
+            esti_dump_size_pre = max_predump_size + esti_dump_size_post
+            print(f"Estimated dump size from max predump: {esti_dump_size_pre} bytes")
 
         # 步骤6: 与max_xfer_size比较
         if esti_dump_size_post >= 0.95 * max_xfer_size:
@@ -1319,8 +1423,7 @@ def migrate(container, dest, pre, post, replay,
 
     #after migration, rootfs sync process and opened files will be closed
     if rootfs:
-        p.terminate()
-        f.close()
+        stop_sync_rootfs()
 
     if dirtymap:
         device_file.close()
@@ -1370,33 +1473,73 @@ parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_tru
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
 parser.add_argument('-z', '--compress', dest='compress', action='store_true', help="enable compression")
-# 区分脚本参数和criu使用的参数
+
+# 处理 --tcp-established 和 --shell-job 等criu参数
+# 将这些参数排除在脚本参数解析之外
 args, remaining = parser.parse_known_args()
 
-# 处理容器名：找到第一个非-开头的参数作为容器名
+# 调试信息：显示解析结果
+if len(remaining) > 0:
+    print(f"Debug: 解析剩余参数: {remaining}")
+
+# 处理容器名：需要更智能地找到位置参数
+def extract_positional_args():
+    """智能提取位置参数（container名）和目标IP，从原始命令行中"""
+
+    # 定义所有已知的可带数值参数
+    value_params = {'-tc', '--time-constraint', '-i', '--iter'}
+
+    i = 1  # 跳过脚本名称
+    positional_args = []
+
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+
+        if arg.startswith('-'):
+            if arg in value_params:
+                # 跳过参数名和它的值
+                i += 2
+                continue
+            elif arg.startswith('--'):
+                # 长选项，如果占用参数则跳过
+                i += 1
+                continue
+        else:
+            # 这是一个位置参数
+            positional_args.append(arg)
+
+        i += 1
+
+    return positional_args
+
+# 获取位置参数
+positional = extract_positional_args()
 container_name = None
-# criu使用的参数
 runc_args = []
 
+# 第一步：从remaining中提取criu参数
 for arg in remaining:
-    if not arg.startswith('-'):
-        if not container_name:
-            container_name = arg
-        else:
-            # 如果找到第二个非-参数，也当作 runc 参数（兼容性）
-            runc_args.append(arg)
-    else:
-        # 将所有剩余的参数（包括有-的参数）都作为 runc 参数
+    if arg.startswith('--') or arg.startswith('-'):
+        # criu/runc 参数
         runc_args.append(arg)
+    else:
+        # 可能是位置参数，但我们基于原始命令行提取更好
+        continue
 
-# 如果没有找到容器名，则从原始 sys.argv 中查找
+# 第二步：从智能解析的positional参数中提取容器名
+if len(positional) > 0:
+    container_name = positional[0]  # 第一个位置参数是container名
+    if len(positional) > 1 and positional[1] != args.dest:
+        # 如果有其他位置参数，作为runc参数（IP地址等不应在这里）
+        for extra_arg in positional[1:]:
+            if extra_arg not in runc_args:
+                runc_args.append(extra_arg)
+
+# 如果仍然没找到，使用备用方法
 if not container_name:
     for arg in sys.argv[1:]:
-        if not arg.startswith('-'):
+        if not arg.startswith('-') and arg != args.dest:
             container_name = arg
-            # 从 runc_args 中移除容器名（如果它在那里）
-            if container_name in runc_args:
-                runc_args.remove(container_name)
             break
 
 if not container_name:
@@ -1420,10 +1563,11 @@ if __name__ == '__main__':
     if args.compress:
         compress = True
 
-    if args.time_constraint:
+    # 检查用户是否确实提供了时间约束参数
+    if '--time-constraint' in sys.argv or '-tc' in sys.argv:
         time_constraint = args.time_constraint
     else:
-        time_constraint = -1  # 5s
+        time_constraint = -1  # 用户没有提供时间约束，禁用时间约束检查
 
     if args.iter and not args.pre:
         parser.error("Pre-copy is required when max_iter is provided.")
@@ -1511,8 +1655,10 @@ if __name__ == '__main__':
     if post:
         print('Faulted pages transfer time（ms）: {:.0f} ms'.format(rpf_handle_time))
         print('Faulted pages size(KB): {:.2f} KB'.format(total_uffd_copy))
-    total_size = dump_size / 1024 + pre_dump_size_total / 1024 + total_uffd_copy
-    print('total migrate size: {total_size:.3f} KB')
+        total_size = dump_size / 1024 + pre_dump_size_total / 1024 + total_uffd_copy
+    else:
+        total_size = dump_size / 1024 + pre_dump_size_total / 1024
+    print('total migrate size: {:.3f} KB'.format(total_size))
 
     #input()
     # 迁移完成后，执行后处理
