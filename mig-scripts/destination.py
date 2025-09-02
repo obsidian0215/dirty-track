@@ -15,6 +15,7 @@ import logging
 from collections import deque
 import threading
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, Future
 
 compress = False
 restore_info = None
@@ -32,21 +33,9 @@ last_iter = 0
 
 # 确保线程安全
 process_lock = threading.Lock()
-VIP = "192.168.2.100"
+VIP = "192.168.15.100"
 rst_time = 0.0
 vip_transfer_complete = False  # 标记VIP转移是否完成
-
-def handle_pre_xfer_complete(msg):
-    """
-    处理 pre_xfer_complete 命令，等待指定迭代及之前的传输完成。
-    """
-    global last_iter, iteration_list
-    try:
-        last_iter = msg["pre_xfer_complete"]
-    except Exception as e:
-        print("error;",e)
-    logger.info(f"收到 pre_xfer_complete，等待迭代 {last_iter} 及之前的传输完成")
-
 
 def prepare(base_path, image_path, parent_path):
     # parent_path为None时，仅准备image_path
@@ -83,7 +72,6 @@ def prepare(base_path, image_path, parent_path):
 
 def handle_prepare(prepare_info):
     global compress, iteration_list, port_list
-    print("port_list:",port_list)
 
     path = prepare_info['path']
     image_path = prepare_info['image_path']
@@ -102,7 +90,7 @@ def handle_prepare(prepare_info):
         iteration_list.append(iter_num)
         port = INIT_PORT + iter_num
         port_list.append(port)
-        #print(port_list)
+    print("port_list:",port_list)
     #input()
     path_exist = os.path.exists(path)
     if not path_exist and not os.path.exists(os.path.dirname(path)):
@@ -112,17 +100,17 @@ def handle_prepare(prepare_info):
         prepare(path, image_path, parent_paths)
 
         # 根据端口和迭代列表，启动ncat进程监听
-        print(port_list)
         for parent, iter_num, port in zip(parent_paths, iteration_list, port_list):
             # 定义解压路径
             extract_path = parent
             # 启动 ncat 监听并解压的管道命令
-            # 命令: nc -l {port} | tar -xzf - -C {extract_path}
+            # 命令: nc -lp {port} -q 1 -w 10 | tar -xzf - -C {extract_path}
+            # 添加 -w 10 超时，-q 1 在输入结束后退出
             if compress:
-                cmd = f"nc -lp {port} -q 1 | tar -xzf - -C {extract_path}"
+                cmd = f"nc -lp {port} -q 1 -w 300 | tar -xzf - -C {extract_path}"
             else:
-                cmd = f"nc -lp {port} -q 1 | tar -xf - -C {extract_path}"
-            logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
+                cmd = f"nc -lp {port} -q 1 -w 300 | tar -xf - -C {extract_path}"
+            # logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             #print("process id:",process)
             # 将进程记录到字典中
@@ -135,12 +123,12 @@ def handle_prepare(prepare_info):
             # os.makedirs(image_path, exist_ok=True)
             extract_path = image_path
             if compress:
-                cmd = f"nc -lp {last_port} -q 1 | tar -xzf - -C {extract_path}"
+                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xzf - -C {extract_path}"
             else:
-                cmd = f"nc -lp {last_port} -q 1 | tar -xf - -C {extract_path}"
+                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
                 #cmd = f"nc -lp {last_port} "
                 #cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
-            logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
+            # logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             with process_lock:
                 transfer_processes[last_port] = process
@@ -414,82 +402,65 @@ def print_transfer_processes():
 
 def handle_restore(msg):
     """
-    处理 restore 命令，持续等待最后一个迭代传输和指定及其之前迭代传输都完成后再执行恢复操作。
+    处理 restore 命令，由于使用同步传输，传输在迁移过程中已完成，直接执行恢复操作。
     """
-    global last_iter, iteration_list, pre_xfer_complete_flag, is_precopy
-    os.system('criu -V')  # 检查 CRIU 版本
-    logger.info("收到 restore 指令")
+    # 检查是否启用了TCP连接迁移，若启用且VIP未迁移则主动迁移
+    runc_args_str = msg['restore'].get('runc_args', '')
+    needs_vip_transfer = '--tcp-established' in runc_args_str
 
-    # 持续等待最后一个迭代传输及指定迭代及之前的传输完成
-    while True:
-        print_transfer_processes()
-        with process_lock:
-            all_transfers_complete = True
-            # 检查所有传输进程是否已完成
-            print("检查所有传输进程是否已完成")
-            for iter_num in iteration_list:
-                last_iter = int(last_iter)
-                if iter_num <= last_iter:
-                    port = INIT_PORT + iter_num -1 # -1
-                    process = transfer_processes.get(port)
-                    # if process and process.poll() is None:  # 如果进程尚未完成
-                    #     all_transfers_complete = False
-                    #     break
-                    if process:
-                        status = process.poll()
-                        print(f"端口 {port} 对应的进程状态: {'运行中' if status is None else '已结束'}")
-                    else:
-                        print(f"端口 {port} 没有对应的传输进程")
-                    if process and process.poll() is None:  # 如果进程尚未完成
-                        print(f"发现端口 {port} 的传输进程仍在运行，设置 all_transfers_complete = False")
-                        all_transfers_complete = False
-                        break
-            # 检查最后一个传输进程是否已完成
-            if transfer_processes:
-                last_port = port_list[-1]
-                print(f"开始检查最后一个传输进程的端口号: {last_port}")
-                # print_transfer_processes()
-                #time.sleep(2)
-                last_process = transfer_processes.get(last_port)
-                #print("last_process:",last_process)
-                if last_process:
-                    last_status = last_process.poll()
-                    print(f"最后一个端口 {last_port} 对应的进程状态: {'运行中' if last_status is None else '已结束'}")
-                else:
-                    print(f"最后一个端口 {last_port} 没有对应的传输进程")
-                   # input()
-                if last_process and last_process.poll() is None:  # 如果最后一个传输进程尚未完成
-                    print(f"发现最后一个端口 {last_port} 的传输进程仍在运行，设置 all_transfers_complete = False")
-                    all_transfers_complete = False
+    if needs_vip_transfer:
+        global vip_transfer_complete
+        if not vip_transfer_complete:
+            # logger.info("执行VIP转移")
+            ret_code = transfer_vip()
+            vip_transfer_complete = (ret_code == 0)
+            if ret_code == 0:
+                logger.debug("VIP迁移完成")
             else:
-                print("transfer_processes 字典为空，跳过最后一个传输进程的检查")
-        if all_transfers_complete:
-            # 检查是否启用了TCP连接迁移，若启用且VIP未迁移则主动迁移
-            runc_args_str = msg['restore'].get('runc_args', '')
-            needs_vip_transfer = '--tcp-established' in runc_args_str
+                logger.error("VIP迁移失败")
 
-            if needs_vip_transfer:
-                global vip_transfer_complete
-                if not vip_transfer_complete:
-                    logger.info("VIP未迁移但状态传输完成，提前执行VIP转移")
-                    ret_code = transfer_vip()
-                    vip_transfer_complete = (ret_code == 0)
-                    logger.info(f"VIP已前提迁移")
-                else:
-                    logger.info("VIP已迁移")
+    # logger.info("开始执行恢复操作")
+    reply = perform_restore(msg)
 
-            logger.info("所有指定迭代和最后一个迭代的传输已完成，开始执行恢复操作")
+    # 异步启动进程清理任务，让主线程快速响应
+    def _cleanup_worker():
+        global transfer_processes, process_lock
+        terminated_count = 0
+        with process_lock:
+            for port, process in list(transfer_processes.items()):
+                if process and process.poll() is None:  # 进程仍在运行
+                    try:
+                        logger.debug(f"终止仍在运行的nc进程 (端口 {port}, PID {process.pid})")
+                        process.terminate()
 
-            #time.sleep(10)
-            # print("start================")
-            reply = perform_restore(msg)
-            break
+                        # 等待进程优雅退出，最多等待3秒
+                        try:
+                            process.wait(timeout=3.0)
+                            logger.debug(f"进程 {process.pid} 已退出")
+                        except subprocess.TimeoutExpired:
+                            logger.warning(f"进程 {process.pid} 未退出，强制杀死")
+                            process.kill()
+                            process.wait()
+                            logger.info(f"进程 {process.pid} 已被强制杀死")
+
+                        terminated_count += 1
+                    except Exception as e:
+                        logger.error(f"清理进程 {process.pid} 时出错: {e}")
+
+        # 清空进程字典
+        transfer_processes.clear()
+
+        if terminated_count > 0:
+            logger.debug(f"共清理了 {terminated_count} 个nc进程")
         else:
-            logger.info("等待所有传输完成后再执行恢复操作")
-            # 休眠一段时间后再次检查
-            time.sleep(2)
+            logger.debug("没有需要清理的nc进程")
 
-    restore_info = None
+    # 使用线程池异步执行清理
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cleanup")
+    executor.submit(_cleanup_worker)
+    executor.shutdown(wait=False)
+    logger.debug("已启动异步进程清理任务")
+
     return reply
 
 def migrate_server():
@@ -519,20 +490,19 @@ def migrate_server():
 
         #infinite loop so that function does not terminate and thread does not end.
         while True:
-
             reply = ""
             #Receiving from client
             data = conn.recv(1024)
-            print("data:",data)
+            # print("data:",data)
             if not data:
-                print(111)
-                break
+                # print(111)
+                # break
+                continue
             # 解码数据
             decoded_data = data.decode('utf-8').strip()
             if decoded_data.lower() == 'exit':
                 break
-            print(decoded_data)
-
+            print("received: ",decoded_data)
 
             if data == 'exit':
                 break
@@ -540,32 +510,26 @@ def migrate_server():
             try:
                 #Parse JSON string into Python dictionary
                 msg = json.loads(decoded_data)
-                print("clientthread msg:",msg)
+                # print("clientthread msg:",msg)
                 #print("msg keys:", list(msg.keys()), repr(list(msg.keys())[0]))
-
-                old_cwd = os.getcwd()
+                # old_cwd = os.getcwd()
 
                 match msg:
                     case {'transfer_vip':_}:
                         # 检查并设置VIP转移完成状态
                         global vip_transfer_complete
                         if vip_transfer_complete:
-                            logger.info("VIP已迁移，通知source")
+                            logger.debug("VIP已迁移，通知source")
                             reply = 'OK'
                         else:
                             ret = transfer_vip()
                             vip_transfer_complete = (ret == 0)
                             if ret == 0:
-                                logger.info("VIP完成迁移，通知source")
+                                logger.debug("VIP完成迁移，通知source")
                                 reply = 'OK'
                             else:
                                 reply = 'Error'
 
-                    case {'pre_xfer_complete':_}:
-                        # 只需等待该次及之前迭代以及最后一次迭代的传输完成
-                        # 中间的所有ncat线程全部可以退出，不会被用于传输
-                        #print("============handle_pre_xfer_complete=============")
-                        handle_pre_xfer_complete(msg)
 
                     case {'prepare': prepare_info}:
                         reply = handle_prepare(prepare_info)
@@ -573,8 +537,6 @@ def migrate_server():
                         # 如果所有传输已完成，立即执行恢复
                         # 所有传输指last_iter及之前的传输，和最大端口对应的传输
                         reply = handle_restore(msg)
-                        time.sleep(3)
-
                     case _:
                         print("Unknown request: " + msg)
                         reply = 'unknown request'

@@ -92,8 +92,23 @@ def stop_sync_rootfs():
                     pid = sync_rootfs_process.pid
                     # 查找并终止所有相关进程（ps -列出进程，grep -筛选，awk -提取PID，xargs -传递PID给kill）
                     kill_proc = subprocess.run(f'pkill -P {pid} || true', shell=True,
-                                             capture_output=True, text=True)
+                                              capture_output=True, text=True)
                     print("已清理 sync_rootfs.sh 的所有子进程")
+
+                    # 使用进程组ID来确保清理所有后台进程和子进程
+                    try:
+                        # 获取进程组ID
+                        proc = subprocess.run(['ps', '-p', str(pid), '-o', 'pgid='],
+                                            capture_output=True, text=True)
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            pgid = proc.stdout.strip()
+                            print(f"清理进程组 {pgid}")
+                            # 发送SIGKILL到整个进程组
+                            subprocess.run(['kill', '-KILL', '-' + pgid],
+                                         capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"清理进程组时出现警告: {e}")
+
             except Exception as e:
                 print(f"清理子进程时出现警告（这通常没有问题）: {e}")
 
@@ -107,7 +122,20 @@ def stop_sync_rootfs():
                 # 再次尝试清理子进程
                 if hasattr(sync_rootfs_process, 'pid') and sync_rootfs_process.pid:
                     kill_proc = subprocess.run(f'pkill -P {sync_rootfs_process.pid} || true',
-                                             shell=True, capture_output=True, text=True)
+                                              shell=True, capture_output=True, text=True)
+
+                    # 使用进程组ID强制清理所有相关进程
+                    try:
+                        proc = subprocess.run(['ps', '-p', str(sync_rootfs_process.pid), '-o', 'pgid='],
+                                            capture_output=True, text=True)
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            pgid = proc.stdout.strip()
+                            print(f"强制清理进程组 {pgid}")
+                            subprocess.run(['kill', '-KILL', '-' + pgid],
+                                         capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"强制清理进程组时出现警告: {e}")
+
             except subprocess.TimeoutExpired:
                 print("错误：无法杀死 sync_rootfs 进程的所有子进程")
 
@@ -116,6 +144,25 @@ def stop_sync_rootfs():
 
         finally:
             sync_rootfs_process = None
+
+    # 确保清理所有残留的sync进程
+    try:
+        # 查找所有剩余的sync_rootfs.sh进程并强制杀死
+        remaining_proc = subprocess.run(
+            "pgrep -f sync_rootfs.sh || true",
+            shell=True, capture_output=True, text=True
+        )
+        if remaining_proc.returncode == 0 and remaining_proc.stdout.strip():
+            remaining_pids = remaining_proc.stdout.strip().split('\n')
+            for pid in remaining_pids:
+                try:
+                    subprocess.run(['kill', '-KILL', pid.strip()],
+                                 capture_output=True, text=True)
+                    print(f"清理残留 sync_rootfs.sh 进程 {pid.strip()}")
+                except Exception as e:
+                    print(f"清理残留进程 {pid.strip()} 时错误: {e}")
+    except Exception as e:
+        print(f"查找残留进程时出现错误: {e}")
 
     if sync_rootfs_log_file:
         try:
@@ -635,23 +682,22 @@ def transfer_vip(new_prior):
 
 # 通知dest提升优先级
 def notify_transfer_vip(cs, inputs):
-    # vip_cmd = '{"transfer_vip"}'
     vip_cmd = json.dumps({"transfer_vip": True})
     cs.send(bytes(vip_cmd, encoding='utf-8'))
-    print("send notify_transfer_vip")
+    # print("send notify_transfer_vip")
     inputready, outputready, exceptready = select.select(inputs, [], [], 5)
-    # print(inputs)
 
     if inputready:
         for s in inputready:
             answer_bytes = s.recv(1024)
             answer = answer_bytes.decode('utf-8').strip()
-            print(answer)
-            if answer == 'OK':
-                # print("okkkkkk")
+            # print(answer)
+            pattern = r"OK"
+            match = re.search(pattern, answer)
+            if not match:
+                print(answer)
                 return 0
             else:
-                # print("notok")
                 return 1
     else:
         print("can't confirm the VIP has been transfered")
@@ -660,7 +706,7 @@ def notify_transfer_vip(cs, inputs):
 # 异步VIP迁移
 def async_vip_migration(cs, inputs):
     """
-    1. 降低优先级到30（低于目标节点任何配置）
+    1. 降低优先级到30 (低于目标节点)
     2. 通知目标节点接管VIP
     3. 验证迁移成功，异常时自动恢复
     """
@@ -670,25 +716,23 @@ def async_vip_migration(cs, inputs):
         ret = transfer_vip('30')
 
         if ret == 0:
-            time.sleep(0.02)
-
             ret = notify_transfer_vip(cs, inputs)
             if ret == 0:
                 # 记录迁移时间
                 migration_time = time.time() - migration_start
-                print(f"VIP迁移成功，耗时: {migration_time:.2f}秒")
+                print(f"VIP migration: {migration_time:.2f}s")
                 return
             else:
-                print("VIP通知确认失败，恢复优先级")
-                transfer_vip('100')  # 恢复到原优先级
+                print("VIP notification confirmation failed, restoring priority")
+                transfer_vip('70')  # 恢复到原优先级
                 return
         else:
-            print("VIP优先级设置失败，迁移终止")
+            print("VIP priority setting failed, migration aborted")
             return
 
     except Exception as e:
-        print(f"VIP迁移过程中发生异常: {e}，恢复优先级")
-        transfer_vip('100')  # 恢复到原优先级
+        print(f"VIP migration failed: {e}, restoring priority")
+        transfer_vip('70')  # 恢复到原优先级
 
 # 计算image目录下除pages-x.img外的文件总大小
 def calculate_image(directory, exclude_pages=False):
@@ -842,74 +886,57 @@ def parse_size(size_str):
         size = float(size_str)  # 默认单位为字节，保持为原始值
     return size
 
-#Transfer the previously created pre-dump using rsync
+#Transfer the previously created pre-dump using nc (同步版本)
 def xfer_pre_dump(parent_path, dest, i, port):
     global pre_dump_xfer_time_total
 
-    # print(f"xfer PRE-DUMP {i}")
-
-    # 创建压缩包并通过SSH传输并解压
-    print(f"开始传输 PRE-DUMP {i} 到 {dest}")
+    # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
+    # 创建压缩包
     if compress:
         archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
         cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
     else:
         archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
         cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
-    print(cmd_tar)
+
+    # print(cmd_tar)
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    # 检查返回值
-    if ret != 0:
-        # os.system返回值是退出状态码左移8位，需要右移8位获取实际退出码
-        exit_code = ret >> 8
-        print(f"pre_dump_{i} tar命令执行失败，退出码: {exit_code}")
-        # 可根据需要处理:
-        # 1. 抛出异常
-        raise RuntimeError(f" pre_dump_{i} tar命令执行失败(退出码 {exit_code})，请检查{parent_path}目录或权限。")
-        # 或者 2. 打印警告并返回
-        # return
 
-    # 若执行成功，可检查文件是否真的存在且非空
+    if ret != 0:
+        exit_code = ret >> 8
+        print(f"Compress pre_dump_{i} failed, ExitCode: {exit_code}")
+        raise RuntimeError(f"tar pre_dump_{i} failed")
+
     if not os.path.exists(archive_name):
-        print(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
-        raise FileNotFoundError(f"pre_dump_{i} 打包文件 {archive_name} 未创建成功。请检查{parent_path}目录内容。")
-    else:
-        # 还可检查tar文件大小，若为0说明打包空目录失败
-        size = os.path.getsize(archive_name)
-        if size == 0:
-            print(f"pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
-            raise ValueError(f" pre_dump_{i} 打包文件 {archive_name} 大小为0，请检查{parent_path}是否为空或有可打包的文件。")
-        else:
-            print(f"pre_dump_{i} 打包文件 {archive_name} 大小为{size}")
-    if compress:
-        print(f"PRE-DUMP {i} 压缩时间 {(end - start):.3f} ms")
-    else:
-        print(f"PRE-DUMP {i} 打包时间 {(end - start):.3f} ms")
-    pre_dump_xfer_time_total += end - start
+        raise FileNotFoundError(f"Archive file {archive_name} not found")
+
+    size = os.path.getsize(archive_name)
+    if size == 0:
+        raise ValueError(f"pre_dump_{i} archive size is 0")
+
+    print(f"Pre-dump {i} archive: {size} Bytes, {(end - start):.3f} ms")
+
     # 传输到目标服务器
     nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-    if not os.path.exists(archive_name):
-        print(f"File {archive_name} does not exist!")
-    print(nc_cmd)
+    # print(nc_cmd)
 
     start = time.perf_counter() * 1000
     ret = os.system(nc_cmd)
     end = time.perf_counter() * 1000
+    transfer_time = end - start
 
-    print(f"PRE-DUMP {i} transfer time {(end - start):.3f} ms")
+    print(f"Pre-dump {i} xfer: {transfer_time:.3f} ms")
+
     if ret != 0:
-        print("ret:")
-        print(ret)
-        print("xfer_pre_dump_async transfer error")
+        print(f"Pre-dump {i} xfer failed, ExitCode: {ret}")
         error()
-    if time_constraint > 0:
-        # Calculate transfer speed (Bytes/s)
-        bandwidth_measurements.append(1000.0 * size / (end - start))
 
-    # 累计传输时间
-    pre_dump_xfer_time_total += end - start
+    if time_constraint > 0:
+        bandwidth_measurements.append(1000.0 * size / transfer_time)
+
+    pre_dump_xfer_time_total += transfer_time
 
 #Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, compress, port):
@@ -924,7 +951,7 @@ def xfer_final(image_path, dest, compress, port):
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
-    print(f"DUMP transfer time {(end - start):.3f} ms")
+    # print(f"DUMP transfer time {(end - start):.3f} ms")
 
     # 计算传输时间
     dump_xfer_time = end - start
@@ -959,10 +986,10 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         pre_dump(mig_base, container, last_iter, dirtymap)
 
         dir_size = getdirsize(last_path, 'pages')
-        print("parent_path:",parent_path)
-        print("last_iter:",last_iter)
+        # print("parent_path:",parent_path)
+        # print("last_iter:",last_iter)
         less_last_path = parent_path[last_iter - 2]  if last_iter > 1 else None
-        print("less_last_path:",less_last_path)
+        # print("less_last_path:",less_last_path)
 
         # 更新最大predump大小
         global max_predump_size
@@ -987,12 +1014,13 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             if read_max_scount(container_pids, dirtymap_path) >= 3:
                 iter_terminate = True
 
+        # 传输当前迭代的 pre-dump
         xfer_pre_dump(last_path, dest, last_iter, port_list[last_iter-1])
-
-
         if iter_terminate:
             break
         last_iter += 1
+    print("last_iter:",last_iter)
+    print("less_last_path:",less_last_path)
     return last_iter
 
 def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
@@ -1031,13 +1059,13 @@ def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
             if accumulate:  # 只有当accumulate为True时，才执行累加
                 if log_type == 'pre_dump':
                     pre_dump_time_total += total_time / 1000
-                    print(f"stats-dump total_time for pre-dump: {total_time}ms")
+                    print(f"stats-dump total_time for pre-dump: {total_time/1000}ms")
                 elif log_type == 'dump':
                     dump_time += total_time / 1000
-                    print(f"stats-dump total_time for dump: {total_time}ms")
+                    print(f"stats-dump total_time for dump: {total_time/1000}ms")
             else:
                 esti_dump_time = total_time / 1000
-                print(f"stats-dump total_time for first-dump: {total_time}ms")
+                print(f"stats-dump total_time for first-dump: {total_time/1000}ms")
 
 
     except subprocess.CalledProcessError as e:
@@ -1128,14 +1156,14 @@ def update_image_parent(mig_base: str, latest_parent: str):
     if os.path.islink(image_parent_link) or os.path.exists(image_parent_link):
         try:
             os.remove(image_parent_link)
-            print(f"已移除旧的 image parent 符号链接: {image_parent_link}")
+            # print(f"已移除旧的 image parent 符号链接: {image_parent_link}")
         except OSError as e:
             print(f"无法移除旧的 image parent 符号链接 {image_parent_link}: {e}")
             error()
 
     try:
         os.symlink(relative_target, image_parent_link)
-        print(f"已更新 image parent 符号链接: {image_parent_link} -> {relative_target}")
+        # print(f"已更新 image parent 符号链接: {image_parent_link} -> {relative_target}")
     except OSError as e:
         print(f"无法创建新的 image parent 符号链接 {image_parent_link} -> {relative_target}: {e}")
         error()
@@ -1152,7 +1180,6 @@ def migrate(container, dest, pre, post, replay,
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print("已注册退出处理器，确保 sync_rootfs 进程会被正确停止")
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
     mig_base = base_path + "/migrate"
@@ -1171,10 +1198,11 @@ def migrate(container, dest, pre, post, replay,
             parent_path.append(pathname)
             pathname = mig_base + "/pd_log_{}".format(i)
             work_path.append(pathname)
-            print(port_list)
             port_list.append(INIT_PORT + i)  # del +1
 
-    print(parent_path)
+
+    print("post_list: {0}", port_list)
+    print("parent_path: {0}", parent_path)
     prepare(mig_base, image_path, parent_path, work_path)
 
     real_dump_0(mig_base, runc_args=runc_args)
@@ -1197,7 +1225,7 @@ def migrate(container, dest, pre, post, replay,
             device_file = open(DEVICE_PATH, 'wb')
             device_fd = device_file.fileno()
         except FileNotFoundError:
-            print(f"设备文件{DEVICE_PATH}不存在。请先加载dirty-track内核模块。")
+            print(f"Light-DT not found in {DEVICE_PATH}, please load the dirty-track kernel module first.")
             sys.exit(1)
 
         # 迁移开始前配置dirty-map目录
@@ -1237,7 +1265,7 @@ def migrate(container, dest, pre, post, replay,
     if inputready:
         for s in inputready:
             answer = s.recv(1024).decode("utf-8")
-            print(answer)
+            # print(answer)
             pattern = r"OK"
             match = re.search(pattern, answer)
             if not match:
@@ -1273,7 +1301,7 @@ def migrate(container, dest, pre, post, replay,
 
         # 保存进程对象到全局变量
         sync_rootfs_process = subprocess.Popen(sync_cmd, shell=True, stdout=sync_rootfs_log_file, stderr=sync_rootfs_log_file)
-        print(f"已启动 sync_rootfs 进程 (PID: {sync_rootfs_process.pid})")
+        print(f"sync_rootfs started: (PID = {sync_rootfs_process.pid})")
 
     if pre:
         if diskless:
@@ -1285,9 +1313,7 @@ def migrate(container, dest, pre, post, replay,
 
         # iter pre-dump
         last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
-        transfer_complete_msg = json.dumps({"pre_xfer_complete": f"{last_iter}"})
-        cs.send(bytes(transfer_complete_msg, encoding='utf-8'))
-        print(f"已发送 PRE-DUMP {last_iter} 传输完成标志")
+        # 使用同步传输，所有传输已在iterate_predump中完成，无需发送确认消息
         #if diskless:
         #   diskless_pre_dump(base_path, container, dest)
         #else:
@@ -1352,7 +1378,7 @@ def migrate(container, dest, pre, post, replay,
                     # print("[Warning]post-copy is not enabled, pre-copy may failed")
                     post = True
             else:
-                print(f"We can transfer within one-shot stop&dump")
+                print(f"We can transfer within one-shot stop-and-copy")
                 if post:
                     post = False
 
@@ -1377,7 +1403,7 @@ def migrate(container, dest, pre, post, replay,
     cs.send(bytes(restore_cmd, encoding='utf-8'))
 
     # 等待恢复完成
-    print("等待destination恢复完成...")
+    print("Wait for destination...")
     max_wait_time = 200 if post else 30  # post-copy使用更长的等待时间
     time_left = max_wait_time
     polling_interval = 5  # 每5秒检测一次，防止占用过多CPU
@@ -1390,10 +1416,10 @@ def migrate(container, dest, pre, post, replay,
             break  # 收到数据，跳出等待循环
 
         time_left -= polling_interval
-        print(f"等待恢复完成，还需等待 {time_left} 秒...")
+        print(f"  Remaining {time_left} seconds...")
 
         if time_left <= 0:
-            print(f"警告：超过 {max_wait_time} 秒未收到恢复确认信息，可能迁移已完成或出现问题")
+            print(f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues")
     #If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     for s in inputready:
@@ -1478,13 +1504,8 @@ parser.add_argument('-z', '--compress', dest='compress', action='store_true', he
 # 将这些参数排除在脚本参数解析之外
 args, remaining = parser.parse_known_args()
 
-# 调试信息：显示解析结果
-if len(remaining) > 0:
-    print(f"Debug: 解析剩余参数: {remaining}")
-
-# 处理容器名：需要更智能地找到位置参数
 def extract_positional_args():
-    """智能提取位置参数（container名）和目标IP，从原始命令行中"""
+    """从原始命令行中智能提取位置参数(container名和目标IP)"""
 
     # 定义所有已知的可带数值参数
     value_params = {'-tc', '--time-constraint', '-i', '--iter'}
@@ -1505,9 +1526,7 @@ def extract_positional_args():
                 i += 1
                 continue
         else:
-            # 这是一个位置参数
             positional_args.append(arg)
-
         i += 1
 
     return positional_args
@@ -1545,8 +1564,8 @@ if not container_name:
 if not container_name:
     parser.error("container name is required")
 
-print(f"Debug: container_name = '{container_name}'")
-print(f"Debug: runc_args = {runc_args}")
+# print(f"Debug: container_name = '{container_name}'")
+# print(f"Debug: criu_args = {runc_args}")
 
 if __name__ == '__main__':
 
