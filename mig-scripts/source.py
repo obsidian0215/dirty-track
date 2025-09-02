@@ -1386,8 +1386,47 @@ def migrate(container, dest, pre, post, replay,
     # 更新 image/parent 符号链接指向最新的 parent_i
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
 
+    # 创建标记文件确保rsync同步一次
+    if rootfs and sync_rootfs_process and sync_rootfs_process.poll() is None:
+        try:
+            # 创建标记文件触发rsync同步
+            force_sync_marker = os.path.join(base_path, "force_sync.marker")
+            with open(force_sync_marker, 'w'):
+                pass  # 创建空文件
+            print("标记文件已创建：触发实转储后同步")
+        except Exception as e:
+            print(f"创建转储后同步标记失败: {e}")
+
     # 传输容器剩余状态
     xfer_final(image_path, dest, compress, port_list[-1])
+
+    # 等待强制同步完成 - 检查标记文件是否已被删除
+    if rootfs and sync_rootfs_process and sync_rootfs_process.poll() is None:
+        print("等待强制rootfs同步完成...")
+        force_sync_marker = os.path.join(base_path, "force_sync.marker")
+
+        for attempt in range(50):
+            try:
+                # 如果标记文件不存在，说明强制同步已完成
+                if not os.path.exists(force_sync_marker):
+                    print("强制rootfs同步已完成")
+                    break
+            except Exception as e:
+                print(f"检查同步状态时出错: {e}")
+                break
+            time.sleep(0.2)
+
+        # 如果循环结束标记文件还存在，可能有问题
+        if os.path.exists(force_sync_marker):
+            print("警告：rootfs强制同步可能未完成，继续迁移流程")
+            # 清理标记文件以避免后续问题
+            try:
+                os.remove(force_sync_marker)
+                print("清理未完成的同步标记文件")
+            except Exception:
+                pass
+    else:
+        print("rootfs同步进程未运行，跳过同步检查")
     # dir_size = convert_byte(getdirsize(image_path))
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 

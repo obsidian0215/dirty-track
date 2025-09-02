@@ -10,7 +10,7 @@ import distutils.util
 import time
 import subprocess
 import re
-import iptc
+import psutil
 import logging
 from collections import deque
 import threading
@@ -72,6 +72,9 @@ def prepare(base_path, image_path, parent_path):
 
 def handle_prepare(prepare_info):
     global compress, iteration_list, port_list
+    logger.info("开始处理prepare请求")
+    prep_start = time.perf_counter()
+    cpu_prep_start = psutil.cpu_percent(interval=None)
 
     path = prepare_info['path']
     image_path = prepare_info['image_path']
@@ -133,6 +136,13 @@ def handle_prepare(prepare_info):
             with process_lock:
                 transfer_processes[last_port] = process
         #print_transfer_processes()
+
+        prep_end = time.perf_counter()
+        cpu_prep_end = psutil.cpu_percent(interval=None)
+        prep_elapsed = (prep_end - prep_start) * 1000
+        prep_cpu = cpu_prep_end - cpu_prep_start
+        logger.info(f"handle_prepare completed in {prep_elapsed:.3f} ms, CPU usage change: {prep_cpu:.2f}%")
+
         reply = 'OK'
 
     return reply
@@ -357,11 +367,16 @@ def perform_restore(msg):
         time.sleep(0.07)  # 等待0.07秒，可根据需要调整时间
 
     # 现在启动 runc restore 命令
-    # print("Running restore command...")
-    # start = time.perf_counter() * 1000
+    logger.info("Running restore command...")
+    start_time = time.perf_counter()
+    cpu_start = psutil.cpu_percent(interval=None)
     p = subprocess.Popen(cmd, shell=True)
     ret = p.wait()
-    # end = time.perf_counter() * 1000
+    end_time = time.perf_counter()
+    cpu_end = psutil.cpu_percent(interval=None)
+    cpu_usage = cpu_end - cpu_start
+    elapsed_ms = (end_time - start_time) * 1000
+    logger.info(".3f")
 
     if lazy:
         # 等待 lazy-pages 守护进程结束
@@ -487,7 +502,6 @@ def migrate_server():
     def clientthread(conn, addr):
         global compress, iteration_list, last_iter
         #Sending message to connected client
-
         #infinite loop so that function does not terminate and thread does not end.
         while True:
             reply = ""
@@ -495,9 +509,7 @@ def migrate_server():
             data = conn.recv(1024)
             # print("data:",data)
             if not data:
-                # print(111)
-                # break
-                continue
+                break  # 连接断开时退出循环
             # 解码数据
             decoded_data = data.decode('utf-8').strip()
             if decoded_data.lower() == 'exit':
