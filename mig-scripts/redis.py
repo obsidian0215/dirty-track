@@ -7,11 +7,11 @@ YCSB_IP = "192.168.37.158"  # 第三台机器的IP，请根据实际情况修改
 
 # 定义实验类型与参数
 experiments = {
-    "pre-copy": "-pre -d -t -s ",
-    "pre-copy-dirtymap": "-pre -d -t -s -dm",
-    "post-copy": "-post -d -t -s",
-    "hybrid": "-pre -post -d -t -s",
-    "hybrid-dirtymap": "-pre -post -d -t -s -dm"
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    "post-copy": "-post -d --tcp-established --shell-job",
+    "hybrid": "-pre -post -d --tcp-established --shell-job",
+    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 runs = 3
@@ -103,7 +103,7 @@ def source_run_migration(exp_args):
    # input()
     cmd = f"python3 source.py redis {DEST_IP} {exp_args}"
     run_cmd(cmd)
-    # clean 
+    # clean
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true", ignore_error=False)
    # run_cmd("rm -f /tmp/recvtty_source.pid", ignore_error=False)
 
@@ -125,6 +125,6 @@ for exp_name, exp_args in experiments.items():
         destination_recover()
 
         print(f"======== Finished {exp_name} experiment run {i} ========")
-        time.sleep(30) # 
+        time.sleep(30) #
 
 

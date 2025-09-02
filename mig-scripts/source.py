@@ -696,9 +696,9 @@ def notify_transfer_vip(cs, inputs):
             match = re.search(pattern, answer)
             if not match:
                 print(answer)
-                return 0
-            else:
                 return 1
+            else:
+                return 0
     else:
         print("can't confirm the VIP has been transfered")
         return 1

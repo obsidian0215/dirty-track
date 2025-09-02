@@ -35,10 +35,6 @@ def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
     else:
         print(result.stdout)
 
-
-
-
-
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
     """
     修改 keepalived 配置文件中的 priority 参数，支持本地和远程执行。
@@ -205,15 +201,16 @@ def source_clean(args):
     container_name = args.container
     # 清理dirtypages残余进程
     if args.tool.lower() == "dirtypages":
-        run_cmd("sudo pkill -SIGKILL -f '/bin/dirty-pages'",ignore_error=True);
+        run_cmd("sudo pkill -SIGKILL -f '/bin/dirty-pages'",ignore_error=True)
     # 清理console.sock
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null",ignore_error=True)
     # 清理 dirtypages的挂载, 可忽略错误(有时候挂载都清理完毕了)
     run_cmd(f"umount /runc/containers/{container_name}/migrate/*",ignore_error=True)
-    run_cmd(f"runc kill {container_name}", ignore_error=True),  # 如果容器不存在可忽略错误
-    run_cmd (f"runc delete {container_name}", ignore_error=True), # 如果容器不存在可忽略错误
+    run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
+    run_cmd(f"runc delete {container_name}", ignore_error=True) # 如果容器不存在可忽略错误
     run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
     run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
+
 def destination_prepare(args):
     # 在目标节点执行准备操作
     # 有些命令可能出现非致命错误，用ignore_error=True
@@ -257,8 +254,8 @@ def execute_ycsb_tests():
 
 
     # 还原keepalived配置
-    update_keepalived_priority(100)
-    update_keepalived_priority(50,True,DEST_IP)
+    update_keepalived_priority(70)
+    update_keepalived_priority(30,True,DEST_IP)
 
 
     # 杀死之前可能未完成的run进程, 开启load
@@ -363,16 +360,16 @@ def configure_network():
 
 # 定义实验类型与参数
 experiments = {
-    "pre-copy": "-pre -d -t -s ",
-    "pre-copy-dirtymap": "-pre -d -t -s -dm",
-    "post-copy": "-post -d -t -s",
-    "hybrid": "-pre -post -d -t -s",
-    "hybrid-dirtymap": "-pre -post -d -t -s -dm"
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    "post-copy": "-post -d --tcp-established --shell-job",
+    "hybrid": "-pre -post -d --tcp-established --shell-job",
+    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 
-# 每种实验进行三次
-runs = 3
+# 每种实验进行5次
+runs = 5
 
 # 主流程
 if __name__ == "__main__":
@@ -384,7 +381,6 @@ if __name__ == "__main__":
     parser.add_argument("--client-ip", required=False, help="IP address of the machine running client such as ycsb.")
     parser.add_argument("--virtual-ip", required=False, help="virtual ip ")
     args = parser.parse_args()
-
 
 
     SOURCE_IP = args.source_ip
