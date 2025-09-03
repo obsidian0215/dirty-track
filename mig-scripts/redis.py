@@ -105,7 +105,7 @@ def destination_prepare():
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
 
-    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
+    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
 
 
@@ -132,7 +132,7 @@ def source_prepare():
         (f"rm -rf /runc/containers/{container_name}", False),
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
-        (f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid", False),
+        (f"nohup recvtty -m null /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid", False),
         # 启动容器
         (f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}", False)
     ]

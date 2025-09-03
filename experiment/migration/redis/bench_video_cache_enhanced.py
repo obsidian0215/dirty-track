@@ -237,10 +237,12 @@ class VideoCacheEnhancedBench:
         """周期性输出Redis处理吞吐量和延迟"""
         current_time = time.time()
         if current_time - self.last_report_time >= self.monitor_interval:
+            # 正确的elapsed时间计算
+            elapsed = current_time - self.start_time
             success_count = self.success
             new_operations = success_count - self.last_success_count
 
-            if self.last_report_time > 0 and new_operations >= 0:
+            if new_operations >= 0:
                 throughput_ops_sec = new_operations / (current_time - self.last_report_time)
 
                 # 计算延迟统计
@@ -254,9 +256,9 @@ class VideoCacheEnhancedBench:
                     recent_latencies.sort()
                     avg_lat = statistics.mean(recent_latencies)
                     p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
-                    logger.info(f"[{total_duration:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
                 else:
-                    logger.info(f"[{total_duration:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
 
                 self.last_report_time = current_time
                 self.last_success_count = success_count
@@ -325,6 +327,15 @@ class VideoCacheEnhancedBench:
            fallback_rate: int = 5, do_get_pct: int = 0):
         """启动基准测试"""
         pool = self._init_connection_pool()
+
+        # 记录测试开始时间，用于计算精确的elapsed时间
+        start_time = time.time()
+
+        # 初始化监控参数
+        self.last_report_time = start_time
+        self.last_success_count = 0
+        self.start_time = start_time
+
         tlist = []
 
         for _ in range(threads):

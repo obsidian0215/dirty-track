@@ -14,6 +14,7 @@ FEATURES:
 USAGE:
   python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 30 --vehicle-pattern highway --payload-size-kb 5 --connect-timeout 2
   python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 4 --duration 60 --size-distribution normal --pool-size 50
+  python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 4 --duration 30 --rps 100  # 限制为100 RPS
 
 EXTENDED USAGE:
   --vehicle-pattern: normal_city/highway/stop_go (default: normal_city)
@@ -23,6 +24,7 @@ EXTENDED USAGE:
   --socket-timeout: Socket timeout seconds (default: 5)
   --pool-timeout: Pool wait timeout seconds (default: 10)
   --pool-size: Connection pool max size (default: threads*10)
+  --rps/--max-requests-per-second: Maximum requests per second (default: no limit)
 """
 import argparse
 import json
@@ -49,7 +51,9 @@ class CarTelematicsBench:
                  vehicle_pattern: str = "normal_city",
                  # 连接超时配置
                  connect_timeout: int = 5, socket_timeout: int = 5,
-                 pool_timeout: int = 10, pool_size: Optional[int] = None):
+                 pool_timeout: int = 10, pool_size: Optional[int] = None,
+                 # 消息速率控制
+                 max_requests_per_second: Optional[int] = None):
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
         self.stream_name = stream_name
@@ -69,6 +73,11 @@ class CarTelematicsBench:
         self.pool_timeout = pool_timeout
         self.pool_size = pool_size or (10 * 4)  # 默认10倍线程数
 
+        # 消息速率控制配置
+        self.max_requests_per_second = max_requests_per_second
+        self.requests_this_second = 0
+        self.last_second_start = time.time()
+
         # 统计
         self.latencies_ms = []  # 全局收集（注意内存）
         self.success = 0
@@ -82,6 +91,41 @@ class CarTelematicsBench:
         self.monitor_interval = 1.0  # 监控间隔(秒)
         self.last_report_time = 0
         self.last_success_count = 0
+
+        # 计算速率控制参数
+        if self.max_requests_per_second:
+            self.min_interval_per_request = 1.0 / self.max_requests_per_second
+        else:
+            self.min_interval_per_request = None  # 无速率限制
+
+    def _rate_controller(self, op_start_time: float):
+        """控制消息发送速率"""
+        if self.min_interval_per_request is None:
+            return  # 无速率限制，使用原有逻辑
+
+        current_time = time.time()
+
+        # 检查是否需要等待
+        if self.max_requests_per_second and self.requests_this_second >= self.max_requests_per_second:
+            # 等待到下一秒开始
+            sleep_time = max(0, 1.0 - (current_time - self.last_second_start))
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            self.last_second_start = time.time()
+            self.requests_this_second = 0
+
+        # 计算操作耗时，调整等待时间
+        if op_start_time:
+            op_duration = current_time - op_start_time
+            wait_time = max(0, self.min_interval_per_request - op_duration)
+
+            # 避免过长的等待（保留原有的10ms最小间隔）
+            if wait_time > 0.01:
+                time.sleep(wait_time)
+            elif wait_time > 0:
+                time.sleep(0.01)  # 最小10ms间隔
+
+        self.requests_this_second += 1
 
     def _init_connection_pool(self):
         """初始化Redis连接池"""
@@ -221,15 +265,19 @@ class CarTelematicsBench:
         r = redis.Redis(connection_pool=pool, decode_responses=True)
         end_time = time.time() + duration
         vehicle_id = None  # 为每个线程维护车辆ID以保持连续性
+        op_start_time = time.time()
 
         while time.time() < end_time and not self._stop.is_set():
+            # 应用速率控制
+            self._rate_controller(op_start_time)
+
             payload = self._make_payload(vehicle_id)
             vehicle_id = payload["vehicle_id"]  # 更新车辆ID以保持连续性
 
-            start = time.perf_counter()
+            op_start_time = time.perf_counter()
             try:
                 r.xadd(self.stream_name, {"data": json.dumps(payload)})
-                lat = (time.perf_counter() - start) * 1000.0
+                lat = (time.perf_counter() - op_start_time) * 1000.0
                 with self.lock:
                     self.latencies_ms.append(lat)
                     self.success += 1
@@ -237,6 +285,7 @@ class CarTelematicsBench:
                 logger.debug("xadd failed: %s", e)
                 with self.lock:
                     self.fail += 1
+                # 出错时仍应用速率控制，避免风暴式重试
                 time.sleep(0.01)  # 短暂退避
 
             # 周期性监控输出
@@ -246,11 +295,12 @@ class CarTelematicsBench:
         """周期性输出Redis处理吞吐量和延迟"""
         current_time = time.time()
         if current_time - self.last_report_time >= self.monitor_interval:
-            elapsed = 1.0  # 使用固定表示或当前运行时间
+            # 正确的elapsed时间计算
+            elapsed = current_time - self.start_time
             success_count = self.success
             new_operations = success_count - self.last_success_count
 
-            if self.last_report_time > 0 and new_operations >= 0:
+            if new_operations >= 0:
                 throughput_ops_sec = new_operations / (current_time - self.last_report_time)
 
                 # 计算当前延迟统计
@@ -273,6 +323,15 @@ class CarTelematicsBench:
     def run(self, threads: int = 4, duration: int = 10):
         # 初始化连接池
         pool = self._init_connection_pool()
+
+        # 记录测试开始时间，用于计算精确的elapsed时间
+        start_time = time.time()
+
+        # 初始化监控参数
+        self.last_report_time = start_time
+        self.last_success_count = 0
+        self.start_time = start_time
+
         tlist = []
         for _ in range(threads):
             t = threading.Thread(target=self._worker, args=(duration, pool), daemon=True)
@@ -333,6 +392,11 @@ def main():
     parser.add_argument("--duration", default=10, type=int,
                        help="Benchmark duration in seconds")
 
+    # 消息速率控制
+    parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
+                       type=int,
+                       help="Maximum requests per second (default: no limit, based on hardness sleep)")
+
     args = parser.parse_args()
 
     # 计算默认池大小
@@ -353,7 +417,9 @@ def main():
         connect_timeout=args.connect_timeout,
         socket_timeout=args.socket_timeout,
         pool_timeout=args.pool_timeout,
-        pool_size=pool_size
+        pool_size=pool_size,
+        # 消息速率控制
+        max_requests_per_second=args.rps
     )
     bench.run(threads=args.threads, duration=args.duration)
 
