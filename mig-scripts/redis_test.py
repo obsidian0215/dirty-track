@@ -248,8 +248,8 @@ def source_run_migration(exp_args, scene_config, extra_args):
     run_remote_cmd('pkill -f "python.*bench"', CLIENT_IP, ignore_error=True)
 
     # 设置环境变量并执行bench（load）
-    env_setup = "export PATH=$PATH:/usr/bin:/usr/local/bin; cd /root"
-    bench_cmd = f"python {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
+    env_setup = "cd /root/dirty-track"
+    bench_cmd = f"python3 {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
 
     full_bench_cmd = f"{env_setup} && {bench_cmd}"
     run_remote_cmd(full_bench_cmd, CLIENT_IP)
@@ -258,7 +258,7 @@ def source_run_migration(exp_args, scene_config, extra_args):
     configure_network()
     print("Network configuration applied between bench load and run.")
 
-    time.sleep(8)  # 等待bench启动稳定
+    time.sleep(3)  # 等待bench启动稳定
 
     # 执行source.py进行迁移
     migration_cmd = f"python3 source.py {exp_args} {container_name} {DEST_IP}"

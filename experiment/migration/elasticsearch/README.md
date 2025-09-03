@@ -190,16 +190,40 @@ curl -X GET "localhost:9200/_cluster/health?pretty"
 
 ElasticSearch基准测试也可与容器迁移测试结合：
 
+### 单一节点迁移测试
 ```bash
 # 在后台运行ES基准测试
-python benchmark.py --threads 10 --operations 10000 --es-host localhost \
-    --index-name migration-test --test-mode mixed --field-count 10 &
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 10 \
+    --operations 10000 \
+    --es-host localhost \
+    --index-name migration-test \
+    --test-mode mixed \
+    --field-count 10 &
 
 # 同时运行迁移测试
-python chk_restore.py <container_name> [options]
+python3 chk_restore.py elasticsearch [options]
 ```
 
-这有助于评估迁移过程对搜索性能的影响。
+### 分布式迁移测试
+```bash
+# 源节点 - 索引负载测试
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 16 \
+    --operations 5000 \
+    --es-host source-node \
+    --test-mode index \
+    --field-count 20
+
+# 目标节点 - 搜索验证
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 8 \
+    --operations 2000 \
+    --es-host dest-node \
+    --test-mode search
+```
+
+这有助于评估迁移过程对搜索性能的影响，以及确保数据一致性和索引完整性。
 
 ---
 
@@ -225,3 +249,44 @@ curl -X GET "localhost:9200/"
 2. 降低文档复杂度
 3. 增加ESJVM堆大小
 4. 考虑分批处理
+
+### 集群同步问题
+1. 验证集群健康状态
+2. 检查分片分配状态
+3. 监控主从节点同步
+
+---
+
+## 快速开始指南
+
+### 完整测试流程示例
+```bash
+# 1. 启动Elasticsearch容器
+cd /runc/containers && \
+runc run --console-socket elasticsearch/console.sock -d -b elasticsearch elasticsearch
+
+# 2. 等待服务就绪 (约30秒)
+curl -f http://localhost:9200/_cluster/health?pretty
+
+# 3. 运行快速索引测试
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 4 \
+    --operations 100 \
+    --test-mode index
+
+# 4. 运行混合负载测试
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 8 \
+    --operations 1000 \
+    --test-mode mixed \
+    --field-count 15 \
+    --duration 30
+
+# 5. 清理测试索引 (可选)
+python3 ./experiment/migration/elasticsearch/benchmark.py \
+    --threads 1 \
+    --operations 1
+# 然后输入 'y' 确认删除
+```
+
+建议：从小到大逐步增加测试规模，确保系统稳定后再进行大规模测试。

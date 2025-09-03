@@ -13,9 +13,9 @@ FEATURES:
    - 实时分析: Continuous location tracking and diagnostics
 
 USAGE:
-   python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket vehicle-data --threads 8 --duration 30 --vehicle-pattern highway --payload-size-kb 5
-   python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket vehicle-data --threads 4 --duration 60 --size-distribution normal
-   python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket vehicle-data --payload-size-kb 2 --connect-timeout 5
+   python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 8 --duration 30 --vehicle-pattern highway --payload-size-kb 5
+   python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 4 --duration 60 --size-distribution normal
+   python3 bench_cartelem.py --influx-url http://localhost:8181 --payload-size-kb 2 --connect-timeout 5
 
 EXTENDED USAGE:
    --vehicle-pattern: normal_city/highway/stop_go (default: normal_city)
@@ -32,7 +32,7 @@ import time
 import statistics
 from typing import Dict, Any, Optional
 from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import ASYNCHRONOUS
+from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
 
 logger = logging.getLogger(__name__)
@@ -45,8 +45,8 @@ logger.addHandler(handler)
 class VehicleInfluxBench:
     """Vehicle Telematics InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "vehicle-data",
-                 # Data scale extension
-                 payload_size_kb: int = 1, size_distribution: str = "uniform",
+                  # Data scale extension
+                  payload_size_kb: float = 1.0, size_distribution: str = "uniform",
                  # Data type realism
                  vehicle_pattern: str = "normal_city",
                  # 消息速率控制
@@ -87,9 +87,11 @@ class VehicleInfluxBench:
             # 初始化为空列表避免错误
             self.request_timestamps = []
 
+
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
-        self.write_api = self.client.write_api(write_options=ASYNCHRONOUS)
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
+
 
     def _get_vehicle_state(self, vehicle_id: str) -> Dict[str, Any]:
         """Get or initialize vehicle state for realistic simulation"""
@@ -208,13 +210,26 @@ class VehicleInfluxBench:
 
         points.append(diag_point)
 
-        # Data scale extension - add sensor data
+        # Data scale extension - add sensor data (apply specified distribution)
         current_size = len(json.dumps({
             "vehicle_id": vehicle_id, "speed": current_speed,
             "fuel_level": state["fuel"], "engine_temp": state["engine_temp"],
             "latitude": state["lat"], "longitude": state["lon"]
         }))
-        target_size_bytes = self.payload_size_kb * 1024
+        base_target_bytes = int(self.payload_size_kb * 1024)  # 基本目标大小
+
+        # Apply distribution function
+        if self.size_distribution == "uniform":
+            random_multiplier = random.uniform(0.8, 1.2)
+        elif self.size_distribution == "normal":
+            random_multiplier = random.gauss(1.0, 0.1)  # 正态分布，均值1，标准差0.1
+            random_multiplier = max(0.7, min(1.3, random_multiplier))  # 限制在70%-130%
+        elif self.size_distribution == "zipf":
+            random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6  # Zipf-like分布，偏向较小值
+        else:
+            random_multiplier = 1.0  # 默认fallback
+
+        target_size_bytes = int(base_target_bytes * random_multiplier)
 
         if current_size < target_size_bytes:
             # Add additional sensor readings
@@ -222,7 +237,7 @@ class VehicleInfluxBench:
             sensor_types = ["gps_accuracy", "gyroscope", "accelerometer", "magnetometer",
                           "tire_pressure", "brake_pressure", "throttle_position", "exhaust_sensor"]
 
-            while len(json.dumps({**{"vehicle_id": vehicle_id, "speed": current_speed}, "sensors": sensors})) < target_size_bytes and len(sensors) < 8:
+            while len(sensors) < 8:
                 sensor = {
                     "type": random.choice(sensor_types),
                     "value": random.random() * random.choice([100, 200, 500, 1000]),
@@ -243,6 +258,16 @@ class VehicleInfluxBench:
                     .time(base_timestamp + len(sensors) * 1000000, write_precision=WritePrecision.NS)  # 1ms offset
 
                 points.append(sensor_point)
+
+                # 检查添加后大小，如果超过则移除最后一个点
+                new_size = len(json.dumps({**{"vehicle_id": vehicle_id, "speed": current_speed}, "sensors": sensors}))
+                if new_size > target_size_bytes:
+                    points.pop()  # 移除添加的点
+                    logger.debug(f"Payload size would exceed target {target_size_bytes} bytes (would be {new_size}), truncated")
+                    break
+
+        if current_size > target_size_bytes:
+            logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
 
         return points
 
@@ -398,13 +423,13 @@ def main():
     parser = argparse.ArgumentParser(description="Advanced Vehicle Telematics InfluxDB Benchmark")
 
     # InfluxDB connection
-    parser.add_argument("--influx-url", default="http://localhost:8086", help="InfluxDB URL")
+    parser.add_argument("--influx-url", default="http://localhost:8181", help="InfluxDB URL")
     parser.add_argument("--token", default="my-super-secret-auth-token", help="InfluxDB token")
     parser.add_argument("--org", default="my-org", help="InfluxDB org")
     parser.add_argument("--bucket", default="vehicle-data", help="InfluxDB bucket")
 
     # Data scale extension
-    parser.add_argument("--payload-size-kb", default=1, type=int, help="Target payload size in KB")
+    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="Target payload size in KB (support decimals)")
     parser.add_argument("--size-distribution", default="uniform", type=str,
                        choices=["uniform", "normal", "zipf"], help="Distribution type for payload sizes")
 

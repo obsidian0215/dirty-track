@@ -10,64 +10,75 @@ pip install influxdb-client
 
 ## 脚本概览
 
-### benchmark.py
-**通用InfluxDB基准测试**
+### bench_cartelem.py
+**车联网遥测数据InfluxDB基准测试**
 
-基本的InfluxDB写入和查询性能测试，支持并发写入和范围查询。
+模拟车联网数据写入InfluxDB时间序列存储，包含车辆GPS、速度、燃油、诊断等真实遥测数据。
 
 #### 基本用法
 ```bash
-python3 benchmark.py --threads 10 --operations 1000 --url http://localhost:8086 \
-    --token my-token --org my-org --bucket benchmark --test-mode write
+python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
+    --org my-org --bucket vehicle-data --threads 8 --duration 30
 ```
 
 #### 参数配置
 
 ##### InfluxDB连接参数
-- `--url`: InfluxDB服务器URL (默认: http://localhost:8086)
+- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8181)
 - `--token`: 认证令牌 (默认: my-super-secret-auth-token)
 - `--org`: 组织名称 (默认: my-org)
-- `--bucket`: 数据桶名称 (默认: benchmark)
+- `--bucket`: 数据桶名称 (默认: vehicle-data)
+
+##### 数据规模扩展参数
+- `--payload-size-kb`: 目标负载大小(KB) (默认: 1)
+- `--size-distribution`: 数据大小分布 (uniform/normal/zipf) (默认: uniform)
+
+##### 数据类型真实性参数
+- `--vehicle-pattern`: 驾驶模式 (normal_city/highway/stop_go) (默认: normal_city)
 
 ##### 负载参数
-- `--threads`: 并发线程数 (默认: 10)
-- `--operations`: 每个线程操作数 (默认: 1000)
-- `--field-count`: 每点字段数 (默认: 5)
-- `--tag-count`: 每点标签数 (默认: 3)
-- `--test-mode`: 测试模式 (write/read/mixed) (默认: write)
+- `--threads`: 工作线程数 (默认: 4)
+- `--duration`: 测试时长(秒) (默认: 10)
+- `--read-pct`: 读操作百分比 (默认: 10)
+
+##### 速率控制参数
+- `--rps` 或 `--max-requests-per-second`: 每秒最大请求数 (默认: 无限制)
 
 #### 使用示例
 ```bash
-# 高并发写入测试
-python3 benchmark.py --threads 20 --operations 5000 --url http://localhost:8086 \
-    --bucket high-throughput-test --test-mode write
+# 车队管理平台测试
+python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
+    --org my-org --bucket fleet-health --threads 12 --duration 45 \
+    --vehicle-pattern highway --payload-size-kb 3
 
-# 混合读写测试
-python3 benchmark.py --threads 8 --operations 1000 --url http://localhost:8086 \
-    --bucket mixed-workload --test-mode mixed
+# 城市物流车辆监控测试
+python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
+    --org my-org --bucket logistics-monitor --threads 8 --duration 30 \
+    --vehicle-pattern stop_go --payload-size-kb 2 --rps 200
 
-# 大量字段数据测试
-python3 benchmark.py --threads 4 --operations 1000 --url http://localhost:8086 \
-    --field-count 20 --tag-count 5
+# 高速交通数据分析
+python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
+    --org my-org --bucket traffic-analytics --threads 16 --duration 60 \
+    --vehicle-pattern highway --payload-size-kb 4 --read-pct 5
 ```
 
 ---
 
-### bench_sensor_influx.py
-**传感器数据专项基准测试**
+### bench_sensoragg.py
+**传感器聚合数据InfluxDB基准测试**
 
-针对传感器数据的InfluxDB测试，支持多传感器类型、环境噪音模拟等真实性特征。
+模拟IoT传感器数据写入InfluxDB，支持多传感器类型和环境噪音模拟。
 
 #### 基本用法
 ```bash
-python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket sensor-data --threads 8 --duration 30 --read-pct 10
 ```
 
 #### 参数配置
 
 ##### InfluxDB连接参数
-- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8086)
+- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8181)
 - `--token`: 认证令牌 (默认: my-super-secret-auth-token)
 - `--org`: 组织名称 (默认: my-org)
 - `--bucket`: 数据桶名称 (默认: sensor-data)
@@ -77,7 +88,7 @@ python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-tok
 - `--sensors-per-device`: 每个设备传感器数量 (默认: 5)
 
 ##### 数据类型真实性参数
-- `--sensor-types`: 传感器类型列表 (默认: temperature,humidity,pressure,vibration)
+- `--sensor-types`: 传感器类型列表 (temperature,humidity,pressure,vibration) (默认: temperature,humidity,pressure,vibration)
 - `--environmental-noise`: 环境噪音水平 (默认: 0.05)
 
 ##### 负载参数
@@ -85,102 +96,55 @@ python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-tok
 - `--duration`: 测试时长(秒) (默认: 10)
 - `--read-pct`: 读操作百分比 (默认: 10)
 
+##### 速率控制参数
+- `--rps` 或 `--max-requests-per-second`: 每秒最大请求数 (默认: 无限制)
+
 #### 使用示例
 ```bash
-# 多传感器类型物联网平台测试
-python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token \
+# 多传感器物联网平台测试
+python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket iot-sensors --threads 16 --duration 60 \
-    --sensors-per-device 12 --sensor-types temperature,humidity,pressure,vibration \
-    --payload-size-kb 2
+    --sensors-per-device 12 --rps 500
 
 # 工业环境传感器测试（高噪声）
-python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket industrial-mon --threads 8 --duration 30 \
     --sensor-types temperature,vibration,pressure --environmental-noise 0.15
 
 # 大规模物联网数据采集测试
-python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket large-scale-iot --threads 32 --duration 45 \
     --sensors-per-device 20 --payload-size-kb 5 --read-pct 5
 ```
 
 ---
 
-### bench_vehicle_influx.py
-**车联网遥测数据InfluxDB测试**
+### bench_video_cache.py
+**视频分析缓存数据InfluxDB基准测试**
 
-将car telematics数据适配到InfluxDB的车辆遥测基准测试。
-
-#### 基本用法
-```bash
-python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token \
-    --org my-org --bucket vehicle-telemetry --threads 8 --duration 30
-```
-
-#### 参数配置
-
-##### InfluxDB连接参数
-- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8086)
-- `--token`: 认证令牌 (默认: my-super-secret-auth-token)
-- `--org`: 组织名称 (默认: my-org)
-- `--bucket`: 数据桶名称 (默认: vehicle-telemetry)
-
-##### 数据规模扩展参数
-- `--payload-size-kb`: 目标负载大小(KB) (默认: 2)
-
-##### 数据类型真实性参数
-- `--vehicle-pattern`: 驾驶模式 (normal_city/highway/stop_go) (默认: normal_city)
-
-##### 负载参数
-- `--threads`: 工作线程数 (默认: 4)
-- `--duration`: 测试时长(秒) (默认: 10)
-
-#### 使用示例
-```bash
-# 车队管理平台测试
-python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token \
-    --org my-org --bucket fleet-health --threads 12 --duration 45 \
-    --vehicle-pattern highway --payload-size-kb 3
-
-# 城市物流车辆监控测试
-python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token \
-    --org my-org --bucket logistics-monitor --threads 8 --duration 30 \
-    --vehicle-pattern stop_go --payload-size-kb 2
-
-# 高速交通数据分析
-python3 bench_vehicle_influx.py --influx-url http://localhost:8086 --token my-token \
-    --org my-org --bucket traffic-analytics --threads 16 --duration 60 \
-    --vehicle-pattern highway --payload-size-kb 4
-```
-
----
-
-### bench_video_influx.py
-**视频分析数据InfluxDB测试**
-
-将视频流分析数据适配到InfluxDB的时间序列存储。
+将视频分析推理结果存储到InfluxDB的时间序列数据库，用于AI视频分析平台的数据存储。
 
 #### 基本用法
 ```bash
-python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket video-analytics --threads 8 --duration 30
 ```
 
 #### 参数配置
 
 ##### InfluxDB连接参数
-- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8086)
+- `--influx-url`: InfluxDB服务器URL (默认: http://localhost:8181)
 - `--token`: 认证令牌 (默认: my-super-secret-auth-token)
 - `--org`: 组织名称 (默认: my-org)
 - `--bucket`: 数据桶名称 (默认: video-analytics)
 
 ##### 数据规模扩展参数
 - `--payload-size-kb`: 目标负载大小(KB) (默认: 2)
-- `--objects-per-frame`: 每帧物体数量 (默认: 3)
 
 ##### 数据类型真实性参数
 - `--camera-count`: 摄像头数量 (默认: 10)
-- `--inference-model`: 推理模型类型 (yolov5_small/medium/ssd_mobile)
+- `--inference-model`: 推理模型类型 (yolov5_small/medium/ssd_mobile) (默认: yolov5_medium)
+- `--objects-per-frame`: 每帧检测物体数量 (默认: 3)
 
 ##### 负载参数
 - `--threads`: 工作线程数 (默认: 4)
@@ -189,17 +153,17 @@ python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-toke
 #### 使用示例
 ```bash
 # 智能城市视频监控平台测试
-python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket smart-city-video --threads 20 --duration 45 \
     --camera-count 100 --objects-per-frame 8 --inference-model yolov5_medium
 
 # 交通监控系统测试
-python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket traffic-monitoring --threads 12 --duration 30 \
     --camera-count 50 --inference-model ssd_mobile
 
 # 零售客流分析平台测试
-python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token \
+python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket retail-analytics --threads 8 --duration 60 \
     --objects-per-frame 6 --payload-size-kb 3
 ```
@@ -265,7 +229,7 @@ data-dir = "/var/lib/influxdb/data"
 wal-dir = "/var/lib/influxdb/wal"
 
 # HTTP绑定
-http-bind-address = "0.0.0.0:8086"
+http-bind-address = "0.0.0.0:8181"
 
 # 缓存大小
 cache-max-memory-size = "256m"
@@ -315,10 +279,35 @@ max-concurrent-compactions = 4
 
 这些InfluxDB基准测试脚本可与`chk_restore.py`容器迁移测试结合使用，评估迁移期间的性能影响：
 
+### 单一节点迁移测试
 ```bash
 # 在迁移测试期间运行基准测试
-python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token \
-    --org my-org --bucket migration-test --threads 8 --duration 300 &
+python3 ./experiment/migration/influxdb/bench_sensoragg.py \
+    --influx-url http://localhost:8181 \
+    --token my-token \
+    --org my-org \
+    --bucket migration-test \
+    --threads 8 \
+    --duration 300 \
+    --rps 200 &
 ```
 
-然后运行迁移测试，从而评估迁移对InfluxDB性能的影响。
+### 分布式迁移测试
+```bash
+# 源节点运行负载测试
+python3 ./experiment/migration/influxdb/bench_cartelem.py \
+    --influx-url http://source-node:8181 \
+    --threads 12 \
+    --duration 180 \
+    --vehicle-pattern highway \
+    --payload-size-kb 2
+
+# 迁移完成后在目标节点验证
+python3 ./experiment/migration/influxdb/bench_cartelem.py \
+    --influx-url http://dest-node:8181 \
+    --threads 12 \
+    --duration 60 \
+    --vehicle-pattern highway
+```
+
+然后运行迁移测试或mig-scripts，从而评估迁移对InfluxDB性能的影响。

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-bench_sensoragg.py (Enhanced Version)
+bench_sensoragg.py
 
 Enhanced Sensor Aggregator Benchmark with Realistic Sensors and Scalable Data
 Supports multiple sensor types, data scale extension, and robust connection management
@@ -16,6 +16,7 @@ USAGE:
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 8 --duration 30 --read-pct 10
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 60 --sensors-per-device 10 --sensor-types temperature,humidity,pressure
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --payload-size-kb 2 --connect-timeout 3 --pool-size 100
+  python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 30 --rps 100  # 限制为100 RPS
 
 EXTENDED USAGE:
   --sensors-per-device: 每个设备的传感器数量 (default: 5)
@@ -46,14 +47,16 @@ logger.addHandler(handler)
 class SensorAggBench:
     """增强版传感器聚合基准测试，支持真实传感器模拟、数据规模扩展和连接管理"""
     def __init__(self, redis_host: str, redis_port: int, set_key: str = "sensors:ts",
-                 # 数据规模扩展
-                 payload_size_kb: int = 1, sensors_per_device: int = 5,
-                 # 数据类型真实性配置
-                 sensor_types: Optional[List[str]] = None,
-                 environmental_noise: float = 0.05,
-                 # 连接超时配置
-                 connect_timeout: int = 5, socket_timeout: int = 5,
-                 pool_timeout: int = 10, pool_size: Optional[int] = None):
+                   # 数据规模扩展
+                   payload_size_kb: float = 1.0, sensors_per_device: int = 5,
+                  # 数据类型真实性配置
+                  sensor_types: Optional[List[str]] = None,
+                  environmental_noise: float = 0.05,
+                  # 连接超时配置
+                  connect_timeout: int = 5, socket_timeout: int = 5,
+                  pool_timeout: int = 10, pool_size: Optional[int] = None,
+                  # 消息速率控制
+                  max_requests_per_second: Optional[int] = None):
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
         self.set_key = set_key
@@ -87,6 +90,16 @@ class SensorAggBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # 速率控制参数
+        self.max_requests_per_second = max_requests_per_second
+        if self.max_requests_per_second:
+            # 重置速率控制状态
+            self.request_timestamps = []
+            self.request_interval = 1.0 / self.max_requests_per_second
+        else:
+            # 初始化为空列表避免错误
+            self.request_timestamps = []
 
     def _init_connection_pool(self):
         """初始化Redis连接池"""
@@ -217,16 +230,18 @@ class SensorAggBench:
             "readings_count": state["readings_count"]
         })
 
-        # 数据规模扩展 - 添加额外传感器读数达到目标大小
+        # 数据规模扩展 - 添加额外传感器读数达到目标大小（添加随机性: 80%-120%）
         current_size = len(json.dumps(sensor_data))
-        target_size_bytes = self.payload_size_kb * 1024
+        target_size_bytes = int(self.payload_size_kb * 1024)  # 转换到字节，整数
+        random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
+        random_stop_bytes = int(target_size_bytes * random_multiplier)
 
-        if current_size < target_size_bytes:
-            # 添加环境传感器读数
+        if current_size < random_stop_bytes:
+            # 添加环境传感器读数，直到接近随机停止点
             additional_readings = []
             remaining_sensor_types = [st for st in self.sensor_types if st != sensor_type]
 
-            while len(json.dumps({**sensor_data, "environment_sensors": additional_readings})) < target_size_bytes and remaining_sensor_types:
+            while remaining_sensor_types and current_size + len(json.dumps(additional_readings)) < random_stop_bytes:
                 env_type = random.choice(remaining_sensor_types)
                 env_reading = {
                     "type": env_type,
@@ -241,8 +256,37 @@ class SensorAggBench:
 
             if additional_readings:
                 sensor_data["environment_sensors"] = additional_readings
+            elif current_size > target_size_bytes:
+                logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
 
         return sensor_data
+
+    def _rate_control(self):
+        """实现精确的速率控制"""
+        if not self.max_requests_per_second:
+            return
+
+        current_time = time.time()
+
+        # 清理过期的时间戳（超过1秒）
+        cutoff_time = current_time - 1.0
+        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
+
+        # 如果未达到速率限制，直接允许
+        if len(self.request_timestamps) < self.max_requests_per_second:
+            self.request_timestamps.append(current_time)
+            return
+
+        # 计算需要等待的时间
+        earliest_timestamp = self.request_timestamps[0] if self.request_timestamps else current_time
+        wait_time = self.request_interval - (current_time - earliest_timestamp)
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        # 记录本次请求时刻
+        self.request_timestamps.append(time.time())
+        # 再次清理以保持列表大小
+        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
 
     def _worker(self, duration: float, read_pct: int, pool):
         r = redis.Redis(connection_pool=pool, decode_responses=True)
@@ -250,6 +294,8 @@ class SensorAggBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
+            # 速率控制检查
+            self._rate_control()
 
             try:
                 if do_read:
@@ -357,8 +403,8 @@ def main():
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
     # 数据规模扩展
-    parser.add_argument("--payload-size-kb", default=1, type=int,
-                       help="Target payload size in KB")
+    parser.add_argument("--payload-size-kb", default=1.0, type=float,
+                       help="Target payload size in KB (support decimals)")
     parser.add_argument("--sensors-per-device", default=5, type=int,
                        help="Number of sensors per device")
 
@@ -381,11 +427,15 @@ def main():
 
     # 负载参数
     parser.add_argument("--threads", default=4, type=int,
-                       help="Number of worker threads")
+                        help="Number of worker threads")
     parser.add_argument("--duration", default=10, type=int,
-                       help="Benchmark duration in seconds")
+                        help="Benchmark duration in seconds")
     parser.add_argument("--read-pct", default=10, type=int,
-                       help="Percent of operations that are reads")
+                        help="Percent of operations that are reads")
+
+    # 消息速率控制
+    parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
+                        type=int, help="Maximum requests per second (default: no limit)")
 
     args = parser.parse_args()
 
@@ -411,7 +461,9 @@ def main():
         connect_timeout=args.connect_timeout,
         socket_timeout=args.socket_timeout,
         pool_timeout=args.pool_timeout,
-        pool_size=pool_size
+        pool_size=pool_size,
+        # 消息速率控制
+        max_requests_per_second=args.rps
     )
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

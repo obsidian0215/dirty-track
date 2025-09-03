@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-influxdb_automation_test.py - InfluxDB自动化负载测试脚本
+influxdb_test.py - InfluxDB自动化负载测试脚本
 
 为InfluxDB的video, sensor, vehicle场景提供自动化测试，支持类似redis.py的循环运行。
 支持参数配置传递给bench脚本。
 
 使用：
-  python influxdb_automation_test.py --scene video --threads 8 --duration 30 --runs 3
-  python influxdb_automation_test.py --scene sensor --threads 4 --duration 60
-  python influxdb_automation_test.py --scene vehicle --threads 4 --duration 60 --experiment-types post-copy
+  python influxdb_test.py --scene video --threads 8 --duration 30 --runs 3
+  python influxdb_test.py --scene sensor --threads 4 --duration 60
+  python influxdb_test.py --scene vehicle --threads 4 --duration 60 --experiment-types post-copy
 
 配置在scene_configs字典中定义各场景的bench文件和默认参数。
 """
@@ -40,9 +40,9 @@ scene_configs = {
     'video': {
         'bench': 'experiment/migration/influxdb/bench_video_cache.py',
         'base_args': {
-            '--influx-url': 'http://localhost:8086',
-            '--token': 'token',
-            '--org': 'org',
+            '--influx-url': 'http://localhost:8181',
+            # '--token': 'token',
+            # '--org': 'org',
             '--bucket': 'data',
             '--threads': '4',
             '--duration': '60',
@@ -53,9 +53,9 @@ scene_configs = {
     'sensor': {
         'bench': 'experiment/migration/influxdb/bench_sensoragg.py',
         'base_args': {
-            '--influx-url': 'http://localhost:8086',
-            '--token': 'token',
-            '--org': 'org',
+            '--influx-url': 'http://localhost:8181',
+            # '--token': 'token',
+            # '--org': 'org',
             '--bucket': 'sensor-data',
             '--threads': '4',
             '--duration': '60',
@@ -66,9 +66,9 @@ scene_configs = {
     'vehicle': {
         'bench': 'experiment/migration/influxdb/bench_cartelem.py',
         'base_args': {
-            '--influx-url': 'http://localhost:8086',
-            '--token': 'token',
-            '--org': 'org',
+            '--influx-url': 'http://localhost:8181',
+            # '--token': 'token',
+            # '--org': 'org',
             '--bucket': 'vehicle-data',
             '--threads': '4',
             '--duration': '60',
@@ -283,8 +283,8 @@ def source_run_migration(exp_args, scene_config, extra_args):
     run_remote_cmd('pkill -f "python.*bench"', CLIENT_IP, ignore_error=True)
 
     # 设置环境变量并执行bench（load）
-    env_setup = "export PATH=$PATH:/usr/bin:/usr/local/bin; cd /root"
-    bench_cmd = f"python {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
+    env_setup = "cd /root/dirty-track"
+    bench_cmd = f"python3 {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
     full_bench_cmd = f"{env_setup} && {bench_cmd}"
     run_remote_cmd(full_bench_cmd, CLIENT_IP)
 
@@ -292,7 +292,7 @@ def source_run_migration(exp_args, scene_config, extra_args):
     configure_network()
     print("Network configuration applied between bench load and run.")
 
-    time.sleep(8)  # 等待bench启动稳定
+    time.sleep(3)  # 等待bench启动稳定
 
     # 执行source.py进行迁移
     migration_cmd = f"python3 source.py {exp_args} {container_name} {DEST_IP}"
@@ -320,8 +320,8 @@ def main():
     parser.add_argument("-c", "--client-ip", default=CLIENT_IP, help="客户端IP")
     parser.add_argument("--scene", choices=['video', 'sensor', 'vehicle'], required=True,
                        help="场景: video, sensor, vehicle")
-    parser.add_argument("--influx-token", default='token', help="InfluxDB token")
-    parser.add_argument("--org", default='org', help="InfluxDB org")
+    # parser.add_argument("--influx-token", default='token', help="InfluxDB token")
+    # parser.add_argument("--org", default='org', help="InfluxDB org")
     parser.add_argument("--bucket", help="InfluxDB bucket (默认根据场景设置)")
     parser.add_argument("--threads", type=int, help="线程数")
     parser.add_argument("--duration", type=int, help="测试时长(s)")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-bench_video_influx.py - Video Inference Benchmark for InfluxDB
+bench_video_cache.py - Video Inference Benchmark for InfluxDB
 
 Complete Video Inference Benchmark adapted for InfluxDB
 Enhanced data scale extension, realistic inference simulation, and robust operations
@@ -13,9 +13,9 @@ FEATURES:
    - 推理模拟: Multiple inference models (YOLO, SSD, etc.)
 
 USAGE:
-   python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket video-data --threads 8 --duration 30 --inference-model yolov5_medium --payload-size-kb 5
-   python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket video-data --threads 4 --duration 60 --camera-count 15 --objects-per-frame 5
-   python3 bench_video_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket video-data --write-pct 85 --read-pct 15
+   python3 bench_video_cache.py --influx-url http://localhost:8181 --threads 8 --duration 30 --inference-model yolov5_medium --payload-size-kb 5
+   python3 bench_video_cache.py --influx-url http://localhost:8181 --threads 4 --duration 60 --camera-count 15 --objects-per-frame 5
+   python3 bench_video_cache.py --influx-url http://localhost:8181 --write-pct 85 --read-pct 15
 
 EXTENDED USAGE:
    --payload-size-kb: Target payload size in KB (default: 2)
@@ -437,7 +437,7 @@ def main():
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # InfluxDB connection
-    parser.add_argument("--influx-url", default="http://localhost:8086", help="InfluxDB URL")
+    parser.add_argument("--influx-url", default="http://localhost:8181", help="InfluxDB URL")
     parser.add_argument("--token", default="my-super-secret-auth-token", help="InfluxDB token")
     parser.add_argument("--org", default="my-org", help="InfluxDB org")
     parser.add_argument("--bucket", default="video-data", help="InfluxDB bucket")

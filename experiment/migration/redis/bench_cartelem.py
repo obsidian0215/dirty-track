@@ -45,8 +45,8 @@ logger.addHandler(handler)
 class CarTelematicsBench:
     """车联网写入 Redis Stream 的负载发生器"""
     def __init__(self, redis_host: str, redis_port: int, stream_name: str = "vehicle:telemetry",
-                 # 数据规模扩展
-                 payload_size_kb: int = 1, size_distribution: str = "uniform",
+                  # 数据规模扩展
+                  payload_size_kb: float = 1.0, size_distribution: str = "uniform",
                  # 数据类型真实性
                  vehicle_pattern: str = "normal_city",
                  # 连接超时配置
@@ -237,9 +237,22 @@ class CarTelematicsBench:
             }
         }
 
-        # 数据规模扩展
+        # 数据规模扩展 (应用指定分布)
         current_size = len(json.dumps(payload))
-        target_size_bytes = self.payload_size_kb * 1024
+        base_target_bytes = int(self.payload_size_kb * 1024)  # 基本目标大小
+
+        # 应用分布函数
+        if self.size_distribution == "uniform":
+            random_multiplier = random.uniform(0.8, 1.2)
+        elif self.size_distribution == "normal":
+            random_multiplier = random.gauss(1.0, 0.1)  # 正态分布，均值1，标准差0.1
+            random_multiplier = max(0.7, min(1.3, random_multiplier))  # 限制在70%-130%
+        elif self.size_distribution == "zipf":
+            random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6  # Zipf-like分布，偏向较小值
+        else:
+            random_multiplier = 1.0  # 默认fallback
+
+        target_size_bytes = int(base_target_bytes * random_multiplier)
 
         if current_size < target_size_bytes:
             # 添加额外的传感器数据
@@ -247,7 +260,7 @@ class CarTelematicsBench:
             sensor_types = ["gps_accuracy", "gyroscope", "accelerometer", "magnetometer",
                           "tire_pressure", "brake_pressure", "throttle_position", "exhaust_sensor"]
 
-            while len(json.dumps({**payload, "sensors": sensors})) < target_size_bytes:
+            while current_size + len(json.dumps(sensors)) < target_size_bytes and sensors is not None:
                 sensor = {
                     "type": random.choice(sensor_types),
                     "value": random.random() * random.choice([100, 200, 500, 1000]),
@@ -257,7 +270,17 @@ class CarTelematicsBench:
                 }
                 sensors.append(sensor)
 
-            payload["sensors"] = sensors
+                # 检查添加后是否超过限制
+                new_size = len(json.dumps({**payload, "sensors": sensors}))
+                if new_size > target_size_bytes:
+                    sensors.pop()  # 移除添加的传感数据
+                    logger.debug(f"Payload size would exceed target {target_size_bytes} bytes (would be {new_size}), truncated")
+                    break
+
+            if sensors:
+                payload["sensors"] = sensors
+            elif current_size > target_size_bytes:
+                logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
 
         return payload
 
@@ -363,8 +386,8 @@ def main():
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
     # 数据规模扩展
-    parser.add_argument("--payload-size-kb", default=1, type=int,
-                       help="Target payload size in KB")
+    parser.add_argument("--payload-size-kb", default=1.0, type=float,
+                       help="Target payload size in KB (support decimals)")
     parser.add_argument("--size-distribution", default="uniform", type=str,
                        choices=["uniform", "normal", "zipf"],
                        help="Distribution type for payload sizes")

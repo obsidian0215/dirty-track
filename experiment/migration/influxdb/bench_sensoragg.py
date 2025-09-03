@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-bench_sensor_influx.py - Sensor Aggregation Benchmark for InfluxDB
+bench_sensoragg.py - Sensor Aggregation Benchmark for InfluxDB
 
 Enhanced Sensor Aggregator Benchmark with realistic sensors and scalable data
 Supports multiple sensor types, data scale extension, and robust connection management
@@ -13,9 +13,10 @@ FEATURES:
    - 连接池管理: Connection pooling and robust error handling
 
 USAGE:
-   python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket sensor-data --threads 8 --duration 30 --read-pct 10
-   python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket sensor-data --threads 4 --duration 60 --sensors-per-device 10 --sensor-types temperature,humidity,pressure
-   python3 bench_sensor_influx.py --influx-url http://localhost:8086 --token my-token --org my-org --bucket sensor-data --payload-size-kb 2
+    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 8 --duration 30 --read-pct 10
+    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 4 --duration 60 --sensors-per-device 10 --sensor-types temperature,humidity,pressure
+    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --payload-size-kb 2
+    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 4 --duration 30 --rps 100
 
 EXTENDED USAGE:
    --sensors-per-device: Number of sensors per device (default: 5)
@@ -33,7 +34,7 @@ import time
 import statistics
 from typing import List, Optional, Dict, Any
 from influxdb_client import InfluxDBClient, Point, WritePrecision
-from influxdb_client.client.write_api import ASYNCHRONOUS
+from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
 
 logger = logging.getLogger(__name__)
@@ -46,11 +47,13 @@ logger.addHandler(handler)
 class SensorInfluxBench:
     """Enhanced Sensor Aggregator InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "sensor-data",
-                 # Data scale extension
-                 payload_size_kb: int = 1, sensors_per_device: int = 5,
-                 # Data type realism
-                 sensor_types: Optional[List[str]] = None,
-                 environmental_noise: float = 0.05):
+                  # Data scale extension
+                  payload_size_kb: float = 1.0, sensors_per_device: int = 5,
+                  # Data type realism
+                  sensor_types: Optional[List[str]] = None,
+                  environmental_noise: float = 0.05,
+                  # 消息速率控制
+                  max_requests_per_second: Optional[int] = None):
 
         self.influx_url = influx_url
         self.token = token
@@ -78,10 +81,22 @@ class SensorInfluxBench:
         self.fail = 0
         self.lock = threading.Lock()
 
+        # 速率控制参数
+        self.max_requests_per_second = max_requests_per_second
+        if self.max_requests_per_second:
+            # 重置速率控制状态
+            self.request_timestamps = []
+            self.request_interval = 1.0 / self.max_requests_per_second
+        else:
+            # 初始化为空列表避免错误
+            self.request_timestamps = []
+
+
         # Initialize InfluxDB client
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
-        self.write_api = self.client.write_api(write_options=ASYNCHRONOUS)
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
+
 
     def _get_sensor_state(self, sensor_id: str, sensor_type: str) -> Dict[str, Any]:
         """Get or initialize sensor state for realism simulation"""
@@ -206,12 +221,14 @@ class SensorInfluxBench:
 
         points.append(point)
 
-        # Data scale extension - add environmental sensors to reach target size
+        # Data scale extension - add environmental sensors to reach target size (adds randomness: 80%-120%)
         current_size = len(json.dumps({
             "sensor_id": primary_sensor_id, "value": value,
             "battery_level": state["battery_level"], "readings_count": state["readings_count"]
         }))
-        target_size_bytes = self.payload_size_kb * 1024
+        target_size_bytes = int(self.payload_size_kb * 1024)  # 转换到字节，整数
+        random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
+        random_stop_bytes = int(target_size_bytes * random_multiplier)
 
         remaining_types = [st for st in self.sensor_types if st != primary_sensor_type]
         additional_points = 0
@@ -242,11 +259,22 @@ class SensorInfluxBench:
                 .time(base_timestamp + additional_points, write_precision=WritePrecision.NS)
 
             points.append(env_point)
-            current_size = len(json.dumps({
+
+            # 检查添加后大小，如果超过则移除最后一个点
+            new_size = len(json.dumps({
                 **{"sensor_id": primary_sensor_id, "value": value},
                 "additional_sensors": additional_points + 1
             }))
+            if new_size > target_size_bytes:
+                points.pop()  # 移除添加的点
+                logger.debug(f"Payload size would exceed target {target_size_bytes} bytes (would be {new_size}), truncated")
+                break
+
+            current_size = new_size
             additional_points += 1
+
+        if current_size > target_size_bytes:
+            logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
 
         return points
 
@@ -314,6 +342,33 @@ class SensorInfluxBench:
 
         return [Point("query_result").tag("type", query_type).field("count", len(result))]
 
+    def _rate_control(self):
+        """实现精确的速率控制"""
+        if not self.max_requests_per_second:
+            return
+
+        current_time = time.time()
+
+        # 清理过期的时间戳（超过1秒）
+        cutoff_time = current_time - 1.0
+        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
+
+        # 如果未达到速率限制，直接允许
+        if len(self.request_timestamps) < self.max_requests_per_second:
+            self.request_timestamps.append(current_time)
+            return
+
+        # 计算需要等待的时间
+        earliest_timestamp = self.request_timestamps[0] if self.request_timestamps else current_time
+        wait_time = self.request_interval - (current_time - earliest_timestamp)
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        # 记录本次请求时刻
+        self.request_timestamps.append(time.time())
+        # 再次清理以保持列表大小
+        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
+
     def _worker(self, duration: float, read_pct: int):
         """Worker thread for mixed read/write operations"""
         end_time = time.time() + duration
@@ -321,6 +376,8 @@ class SensorInfluxBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
+            # 速率控制检查
+            self._rate_control()
 
             try:
                 if do_read:
@@ -421,13 +478,13 @@ def main():
     parser = argparse.ArgumentParser(description="Enhanced Sensor Aggregator InfluxDB Benchmark")
 
     # InfluxDB connection
-    parser.add_argument("--influx-url", default="http://localhost:8086", help="InfluxDB URL")
+    parser.add_argument("--influx-url", default="http://localhost:8181", help="InfluxDB URL")
     parser.add_argument("--token", default="my-super-secret-auth-token", help="InfluxDB token")
     parser.add_argument("--org", default="my-org", help="InfluxDB org")
     parser.add_argument("--bucket", default="sensor-data", help="InfluxDB bucket")
 
     # Data scale extension
-    parser.add_argument("--payload-size-kb", default=1, type=int, help="Target payload size in KB")
+    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="Target payload size in KB (support decimals)")
     parser.add_argument("--sensors-per-device", default=5, type=int, help="Sensors per device")
 
     # Data type realism
@@ -440,6 +497,10 @@ def main():
     parser.add_argument("--threads", default=4, type=int, help="Worker threads")
     parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
+
+    # 消息速率控制
+    parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
+                        type=int, help="Maximum requests per second (default: no limit)")
 
     args = parser.parse_args()
 
@@ -456,7 +517,9 @@ def main():
         sensors_per_device=args.sensors_per_device,
         # Data type realism
         sensor_types=sensor_types,
-        environmental_noise=args.environmental_noise
+        environmental_noise=args.environmental_noise,
+        # 消息速率控制
+        max_requests_per_second=args.rps
     )
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)

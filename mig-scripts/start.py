@@ -325,14 +325,14 @@ def clean_configure_network():
 
 def configure_network():
     source_rules = [
-    {"rate": "50mbit", "delay": "3ms", "dst": DEST_IP}
+    {"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}
 ]
     dest_rules = [
-    {"rate": "50mbit", "delay": "3ms", "dst": SOURCE_IP}
+    {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}
 ]
     if VIP_IP:
-        source_rules.append({"rate": "50mbit", "delay": "6ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "1ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": CLIENT_IP})
 
   # 配置source的网络限制  source->dest  source->client
     configure_network_do(
@@ -352,7 +352,8 @@ def configure_network():
         configure_network_do(
         interface="ens33",
         rules=[
-            {"rate": "50mbit", "delay": "1ms", "dst": VIP_IP}
+            {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
+            {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP}
         ],
         is_remote=True,  # 远程执行
         target_ip=CLIENT_IP  # 远程执行命令机器 IP
