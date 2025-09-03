@@ -30,7 +30,7 @@ import random
 import threading
 import time
 import statistics
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
@@ -48,7 +48,9 @@ class VehicleInfluxBench:
                  # Data scale extension
                  payload_size_kb: int = 1, size_distribution: str = "uniform",
                  # Data type realism
-                 vehicle_pattern: str = "normal_city"):
+                 vehicle_pattern: str = "normal_city",
+                 # 消息速率控制
+                 max_requests_per_second: Optional[int] = None):
 
         self.influx_url = influx_url
         self.token = token
@@ -75,7 +77,16 @@ class VehicleInfluxBench:
         self.fail = 0
         self.lock = threading.Lock()
 
-        # Initialize InfluxDB client
+        # 速率控制参数
+        self.max_requests_per_second = max_requests_per_second
+        if self.max_requests_per_second:
+            # 重置速率控制状态
+            self.request_timestamps = []
+            self.request_interval = 1.0 / self.max_requests_per_second
+        else:
+            # 初始化为空列表避免错误
+            self.request_timestamps = []
+
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
         self.write_api = self.client.write_api(write_options=ASYNCHRONOUS)
         self.query_api = self.client.query_api()
@@ -263,6 +274,8 @@ class VehicleInfluxBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
+            # 速率控制检查
+            self._rate_control()
 
             try:
                 if do_read:
@@ -289,10 +302,12 @@ class VehicleInfluxBench:
         """Periodic throughput and latency monitoring"""
         current_time = time.time()
         if current_time - self.last_report_time >= self.monitor_interval:
+            # 正确的elapsed时间计算
+            elapsed = current_time - self.start_time
             success_count = self.success
             new_operations = success_count - self.last_success_count
 
-            if self.last_report_time > 0 and new_operations >= 0:
+            if new_operations >= 0:
                 throughput_ops_sec = new_operations / (current_time - self.last_report_time)
 
                 recent_latencies = []
@@ -305,15 +320,23 @@ class VehicleInfluxBench:
                     recent_latencies.sort()
                     avg_lat = statistics.mean(recent_latencies)
                     p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
-                    logger.info(f"[{total_duration:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
                 else:
-                    logger.info(f"[{total_duration:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
 
                 self.last_report_time = current_time
                 self.last_success_count = success_count
 
     def run(self, threads: int = 4, duration: int = 10, read_pct: int = 5):
         """Run the benchmark"""
+        # 记录测试开始时间，用于计算精确的elapsed时间
+        start_time = time.time()
+
+        # 初始化监控参数
+        self.last_report_time = start_time
+        self.last_success_count = 0
+        self.start_time = start_time
+
         tlist = []
         for _ in range(threads):
             t = threading.Thread(target=self._worker, args=(duration, read_pct), daemon=True)
@@ -330,6 +353,33 @@ class VehicleInfluxBench:
 
         # Close client connection
         self.client.close()
+
+    def _rate_control(self):
+        """实现精确的速率控制"""
+        if not self.max_requests_per_second:
+            return
+
+        current_time = time.time()
+
+        # 清理过期的时间戳（超过1秒）
+        cutoff_time = current_time - 1.0
+        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
+
+        # 如果未达到速率限制，直接允许
+        if len(self.request_timestamps) < self.max_requests_per_second:
+            self.request_timestamps.append(current_time)
+            return
+
+        # 计算需要等待的时间
+        earliest_timestamp = self.request_timestamps[0] if self.request_timestamps else current_time
+        wait_time = self.request_interval - (current_time - earliest_timestamp)
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        # 记录本次请求时刻
+        self.request_timestamps.append(time.time())
+        # 再次清理以保持列表大小
+        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
 
     def _print_summary(self, duration: int):
         """Print benchmark summary"""
@@ -367,6 +417,10 @@ def main():
     parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
 
+    # 消息速率控制
+    parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
+                       type=int, help="Maximum requests per second (default: no limit)")
+
     args = parser.parse_args()
 
     bench = VehicleInfluxBench(
@@ -378,7 +432,9 @@ def main():
         payload_size_kb=args.payload_size_kb,
         size_distribution=args.size_distribution,
         # Data type realism
-        vehicle_pattern=args.vehicle_pattern
+        vehicle_pattern=args.vehicle_pattern,
+        # 消息速率控制
+        max_requests_per_second=args.rps
     )
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)

@@ -66,6 +66,9 @@ class VideoCacheRedisBench:
         self.pool_timeout = pool_timeout
         self.pool_size = pool_size
 
+        # 线程控制
+        self._stop = threading.Event()
+
         # 初始化连接池
         self.connection_pool = None
 
@@ -177,6 +180,39 @@ class VideoCacheRedisBench:
                 # 发生错误时短暂退避
                 time.sleep(0.01)
 
+            # 周期性监控输出
+            self._periodic_monitoring(duration)
+
+    def _periodic_monitoring(self, total_duration: int):
+        """周期性输出Redis处理吞吐量和延迟"""
+        current_time = time.time()
+        if current_time - self.last_report_time >= self.monitor_interval:
+            # 正确的elapsed时间计算
+            elapsed = current_time - self.start_time
+            success_count = self.success
+            new_operations = success_count - self.last_success_count
+
+            if new_operations >= 0:
+                throughput_ops_sec = new_operations / (current_time - self.last_report_time)
+
+                # 计算当前延迟统计
+                recent_latencies = []
+                with self.lock:
+                    if self.latencies_ms:
+                        recent_count = min(1000, len(self.latencies_ms))
+                        recent_latencies = self.latencies_ms[-recent_count:]
+
+                if recent_latencies:
+                    recent_latencies.sort()
+                    avg_lat = statistics.mean(recent_latencies)
+                    p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                else:
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+
+                self.last_report_time = current_time
+                self.last_success_count = success_count
+
     def run(self, threads: int = 4, duration: int = 10, write_pct: int = 80, fallback_rate: int = 5, do_get_pct: int = 0):
         """
         启动多个线程运行 benchmark
@@ -186,6 +222,14 @@ class VideoCacheRedisBench:
         - fallback_rate: 写操作中回落到 persist 的概率（0-100）
         - do_get_pct: 写操作后触发一次 GET 的概率（0-100）
         """
+        # 记录测试开始时间，用于计算精确的elapsed时间
+        start_time = time.time()
+
+        # 初始化监控参数
+        self.last_report_time = start_time
+        self.last_success_count = 0
+        self.start_time = start_time
+
         conn_kwargs = {"host": self.redis_host, "port": self.redis_port, "decode_responses": False}
         tlist = []
         for _ in range(threads):
