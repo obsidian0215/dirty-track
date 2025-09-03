@@ -21,7 +21,7 @@ import threading
 import time
 import statistics
 import sys
-from typing import List
+from typing import List, Optional, Dict, Any
 import redis
 
 logger = logging.getLogger(__name__)
@@ -38,17 +38,76 @@ class VideoCacheRedisBench:
     - persist_hash: Redis hash key for fallback/persistence
     """
     def __init__(self, redis_host: str = "127.0.0.1", redis_port: int = 6379,
-                 cache_ttl: int = 60, persist_hash: str = "video_inference_persist"):
+                 cache_ttl: int = 60, persist_hash: str = "video_inference_persist",
+                 # 数据规模扩展
+                 payload_size_kb: int = 2, objects_per_frame: int = 3,
+                 # 数据类型真实性配置
+                 camera_count: int = 10, inference_model: str = "yolov5_medium",
+                 # 连接超时配置
+                 connect_timeout: int = 5, socket_timeout: int = 5,
+                 pool_timeout: int = 10, pool_size: Optional[int] = None):
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
         self.cache_ttl = int(cache_ttl)
         self.persist_hash = persist_hash
 
-        self._stop = threading.Event()
+        # 数据规模扩展配置
+        self.payload_size_kb = payload_size_kb
+        self.objects_per_frame = objects_per_frame
+
+        # 数据类型真实性配置
+        self.camera_count = camera_count
+        self.inference_model = inference_model  # yolov5_small/medium/ssd_mobile
+        self.camera_positions: Dict[str, Dict[str, float]] = {}  # 摄像头位置跟踪
+
+        # 连接超时配置
+        self.connect_timeout = connect_timeout
+        self.socket_timeout = socket_timeout
+        self.pool_timeout = pool_timeout
+        self.pool_size = pool_size
+
+        # 初始化连接池
+        self.connection_pool = None
+
+        # 周期性监控配置
+        self.monitor_interval = 1.0
+        self.last_report_time = 0
+        self.last_success_count = 0
+
+        # 统计
         self.latencies_ms: List[float] = []
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # 初始化摄像头位置
+        self._init_camera_positions()
+
+    def _init_connection_pool(self):
+        """初始化Redis连接池"""
+        if self.connection_pool is None:
+            self.connection_pool = redis.ConnectionPool(
+                host=self.redis_host,
+                port=self.redis_port,
+                socket_connect_timeout=self.connect_timeout,
+                socket_timeout=self.socket_timeout,
+                max_connections=self.pool_size
+            )
+        return self.connection_pool
+
+    def _init_camera_positions(self):
+        """初始化摄像头地理位置用于真实性模拟"""
+        base_lat, base_lng = 31.0, 121.0  # 上海为中心
+
+        for i in range(self.camera_count):
+            # 随机分布在城市区域内
+            lat_offset = (random.random() - 0.5) * 0.02  # ±10km
+            lng_offset = (random.random() - 0.5) * 0.02
+
+            self.camera_positions[f"cam-{i+1}"] = {
+                "lat": base_lat + lat_offset,
+                "lng": base_lng + lng_offset
+            }
 
     def _make_result(self) -> dict:
         """生成模拟推理结果"""
