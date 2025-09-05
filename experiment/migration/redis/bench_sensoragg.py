@@ -47,19 +47,22 @@ logger.addHandler(handler)
 class SensorAggBench:
     """增强版传感器聚合基准测试，支持真实传感器模拟、数据规模扩展和连接管理"""
     def __init__(self, redis_host: str, redis_port: int, set_key: str = "sensors:ts",
-                   # 数据规模扩展
-                   payload_size_kb: float = 1.0, sensors_per_device: int = 5,
-                  # 数据类型真实性配置
-                  sensor_types: Optional[List[str]] = None,
-                  environmental_noise: float = 0.05,
-                  # 连接超时配置
-                  connect_timeout: int = 5, socket_timeout: int = 5,
-                  pool_timeout: int = 10, pool_size: Optional[int] = None,
-                  # 消息速率控制
-                  max_requests_per_second: Optional[int] = None):
+                # 数据规模扩展
+                payload_size_kb: float = 1.0, sensors_per_device: int = 5,
+               # 数据类型真实性配置
+               sensor_types: Optional[List[str]] = None,
+               environmental_noise: float = 0.05,
+               # 连接超时配置
+               connect_timeout: int = 5, socket_timeout: int = 5,
+               pool_timeout: int = 10, pool_size: Optional[int] = None,
+               # 消息速率控制
+               max_requests_per_second: Optional[int] = None,
+               # 数据库大小控制
+               target_db_size_mb: Optional[float] = None, ttl: int = 3600):
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
         self.set_key = set_key
+        self.target_db_size_mb = target_db_size_mb
         self._stop = threading.Event()
 
         # 数据规模扩展配置
@@ -79,6 +82,20 @@ class SensorAggBench:
 
         # 初始化连接池
         self.connection_pool = None
+
+        # 数据生命周期管理
+        self.ttl = ttl  # 固定的TTL值
+        if target_db_size_mb:
+            self.set_ttl = ttl  # 初始TTL值为参数指定的值
+            self.clean_interval = 200  # 每200个请求调整一次TTL
+            # 自适应TTL参数
+            self.avg_payload_size = 512  # 估算平均负载大小(bytes)
+            self.current_ttl = ttl  # 初始TTL值为参数指定的值
+            self.last_ttl_adjust = time.time()
+            self.adjust_interval = 60  # 每60秒检查一次
+        else:
+            self.set_ttl = ttl  # TTL参数值
+            self.clean_interval = 200
 
         # 周期性监控配置
         self.monitor_interval = 1.0
@@ -323,6 +340,34 @@ class SensorAggBench:
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
+                        self.request_count += 1
+
+                    # 设置Sorted Set TTL，确保数据会在设定时间后过期
+                    if self.target_db_size_mb:
+                        # 自适应模式：使用动态计算的TTL，TTL参数无效
+                        try:
+                            r.expire(self.set_key, int(self.current_ttl))
+                            logger.debug(f"Adaptive TTL set: {self.current_ttl}s")
+                        except Exception as ttl_error:
+                            logger.debug(f"Adaptive TTL setting failed: {ttl_error}")
+                    else:
+                        # 固定TTL模式：使用TTL参数值
+                        try:
+                            r.expire(self.set_key, self.ttl)
+                            logger.debug(f"Fixed TTL set: {self.ttl}s")
+                        except Exception as ttl_error:
+                            logger.debug(f"Fixed TTL setting failed: {ttl_error}")
+
+                    # 设置Sorted Set TTL以防止无限增长
+                    if self.request_count % self.clean_interval == 0:
+                        if self.target_db_size_mb:
+                            self._adaptive_ttl_adjustment(r)
+                        else:
+                            try:
+                                r.expire(self.set_key, self.set_ttl)
+                                logger.debug(f"Set TTL for {self.set_key} to {self.set_ttl}s")
+                            except Exception as e:
+                                logger.debug(f"TTL setting failed: {e}")
             except Exception as e:
                 logger.debug("op failed: %s", e)
                 with self.lock:
@@ -385,6 +430,40 @@ class SensorAggBench:
             t.join()
         self._print_summary(duration)
 
+    def _adaptive_ttl_adjustment(self, redis_client):
+        """自适应TTL调整算法"""
+        current_time = time.time()
+
+        # 定期检查和调整TTL
+        if current_time - self.last_ttl_adjust >= self.adjust_interval:
+            try:
+                # 获取当前数据库大小(估算)
+                info = redis_client.info('memory')
+                current_db_size_mb = info['used_memory'] / 1024 / 1024
+
+                # 获取当前请求速率
+                current_rate = self.success / max(1, current_time - self.start_time)
+
+                # 根据目标大小和当前速率计算理想TTL
+                if current_rate > 0 and self.target_db_size_mb is not None:
+                    # 目标TTL = 目标大小 / (请求速率 × 平均负载大小)
+                    target_ttl_bytes = self.target_db_size_mb * 1024 * 1024
+                    data_rate_bytes_per_sec = current_rate * self.avg_payload_size
+                    target_ttl_seconds = target_ttl_bytes / data_rate_bytes_per_sec
+                    # 限制TTL在合理范围内
+                    target_ttl_seconds = max(60, min(86400, target_ttl_seconds))  # 1分钟到24小时
+
+                    # 渐进调整TTL(避免剧烈变化)
+                    if abs(target_ttl_seconds - self.current_ttl) > 300:  # 差值超过5分钟
+                        self.current_ttl = (self.current_ttl * 0.7) + (target_ttl_seconds * 0.3)
+                        redis_client.expire(self.set_key, int(self.current_ttl))
+                        logger.info(f"Adaptive TTL adjusted: {self.current_ttl:.0f}s (target: {target_ttl_seconds:.0f}s, db_size: {current_db_size_mb:.1f}MB)")
+
+                self.last_ttl_adjust = current_time
+
+            except Exception as e:
+                logger.debug(f"TTL adjustment failed: {e}")
+
     def _print_summary(self, duration):
         total = self.success + self.fail
         ops_per_sec = self.success / max(1e-9, duration)
@@ -437,6 +516,12 @@ def main():
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
                         type=int, help="Maximum requests per second (default: no limit)")
 
+    # 数据库大小控制
+    parser.add_argument("--target-db-size-mb", type=float,
+                        help="Target database size in MB (enables adaptive TTL adjustment)")
+    parser.add_argument("--ttl", type=int, default=3600,
+                        help="TTL in seconds when not using adaptive mode (default: 3600)")
+
     args = parser.parse_args()
 
     # 解析传感器类型参数
@@ -463,7 +548,10 @@ def main():
         pool_timeout=args.pool_timeout,
         pool_size=pool_size,
         # 消息速率控制
-        max_requests_per_second=args.rps
+        max_requests_per_second=args.rps,
+        # 数据库大小控制
+        target_db_size_mb=args.target_db_size_mb,
+        ttl=args.ttl
     )
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

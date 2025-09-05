@@ -45,15 +45,18 @@ logger.addHandler(handler)
 class CarTelematicsBench:
     """车联网写入 Redis Stream 的负载发生器"""
     def __init__(self, redis_host: str, redis_port: int, stream_name: str = "vehicle:telemetry",
-                  # 数据规模扩展
-                  payload_size_kb: float = 1.0, size_distribution: str = "uniform",
-                 # 数据类型真实性
-                 vehicle_pattern: str = "normal_city",
-                 # 连接超时配置
-                 connect_timeout: int = 5, socket_timeout: int = 5,
-                 pool_timeout: int = 10, pool_size: Optional[int] = None,
-                 # 消息速率控制
-                 max_requests_per_second: Optional[int] = None):
+                 # 数据规模扩展
+                 payload_size_kb: float = 1.0, size_distribution: str = "uniform",
+                # 数据类型真实性
+                vehicle_pattern: str = "normal_city",
+                # 连接超时配置
+                connect_timeout: int = 5, socket_timeout: int = 5,
+                pool_timeout: int = 10, pool_size: Optional[int] = None,
+                # 消息速率控制
+                max_requests_per_second: Optional[int] = None,
+                # 数据库大小控制
+                target_db_size_mb: Optional[float] = None, ttl: int = 3600,
+                stream_maxlen: Optional[int] = None):
         self.redis_host = redis_host
         self.redis_port = int(redis_port)
         self.stream_name = stream_name
@@ -75,8 +78,22 @@ class CarTelematicsBench:
 
         # 消息速率控制配置
         self.max_requests_per_second = max_requests_per_second
-        self.requests_this_second = 0
-        self.last_second_start = time.time()
+        self.request_timestamps = []  # 滑动窗口时间戳列表
+        self.min_interval_per_request = None
+
+        # 数据生命周期管理
+        self.target_db_size_mb = target_db_size_mb  # 目标数据库大小(MB)
+        self.ttl = ttl  # 固定的TTL值
+        # TTL为主要机制，stream_maxlen作为可选辅助机制
+        self.stream_maxlen = stream_maxlen  # 可以设置为None，默认不使用
+
+        # 自适应TTL参数
+        if self.target_db_size_mb:
+            self.avg_payload_size = 512  # 估算平均负载大小(bytes)
+            self.current_ttl = 3600  # 初始TTL 1小时
+            self.last_ttl_adjust = time.time()
+            self.adjust_interval = 60  # 每60秒检查一次
+            self.size_history = []  # 存储最近的数据库大小历史
 
         # 统计
         self.latencies_ms = []  # 全局收集（注意内存）
@@ -86,6 +103,10 @@ class CarTelematicsBench:
 
         # 初始化连接池
         self.connection_pool = None
+
+        # 清理间隔计数器
+        self.clean_interval = 100  # 每100个请求清理一次
+        self.request_count = 0
 
         # 周期性输出参数
         self.monitor_interval = 1.0  # 监控间隔(秒)
@@ -99,33 +120,36 @@ class CarTelematicsBench:
             self.min_interval_per_request = None  # 无速率限制
 
     def _rate_controller(self, op_start_time: float):
-        """控制消息发送速率"""
+        """控制消息发送速率 - 改进版本使用滑动窗口"""
         if self.min_interval_per_request is None:
             return  # 无速率限制，使用原有逻辑
 
-        current_time = time.time()
+        with self.lock:  # 保护整个速率控制逻辑
+            current_time = time.time()
 
-        # 检查是否需要等待
-        if self.max_requests_per_second and self.requests_this_second >= self.max_requests_per_second:
-            # 等待到下一秒开始
-            sleep_time = max(0, 1.0 - (current_time - self.last_second_start))
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            self.last_second_start = time.time()
-            self.requests_this_second = 0
+            if hasattr(self, 'request_timestamps') and self.request_timestamps:
+                # 清理过期时间戳（超过1秒）
+                cutoff_time = current_time - 1.0
+                self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
 
-        # 计算操作耗时，调整等待时间
-        if op_start_time:
-            op_duration = current_time - op_start_time
-            wait_time = max(0, self.min_interval_per_request - op_duration)
+                # 检查是否达到限制
+                if self.max_requests_per_second and len(self.request_timestamps) >= self.max_requests_per_second:
+                    # 计算需要等待的时间
+                    earliest_timestamp = self.request_timestamps[0]
+                    wait_time = self.min_interval_per_request - (current_time - earliest_timestamp)
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+                    # 重新清理
+                    current_time = time.time()
+                    self.request_timestamps = [t for t in self.request_timestamps if t > current_time - 1.0]
 
-            # 避免过长的等待（保留原有的10ms最小间隔）
-            if wait_time > 0.01:
-                time.sleep(wait_time)
-            elif wait_time > 0:
-                time.sleep(0.01)  # 最小10ms间隔
-
-        self.requests_this_second += 1
+            # 记录此次请求
+            if not hasattr(self, 'request_timestamps'):
+                self.request_timestamps = []
+            self.request_timestamps.append(current_time)
+            # 保持列表大小，避免内存膨胀
+            if self.max_requests_per_second:
+                self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
 
     def _init_connection_pool(self):
         """初始化Redis连接池"""
@@ -304,6 +328,34 @@ class CarTelematicsBench:
                 with self.lock:
                     self.latencies_ms.append(lat)
                     self.success += 1
+                    self.request_count += 1
+
+                    # 设置Stream TTL，确保数据会在设定时间后过期
+                    if self.target_db_size_mb:
+                        # 自适应模式：使用动态计算的TTL，TTL参数无效
+                        try:
+                            r.expire(self.stream_name, int(self.current_ttl))
+                            logger.debug(f"Adaptive TTL set: {self.current_ttl}s")
+                        except Exception as ttl_error:
+                            logger.debug(f"Adaptive TTL setting failed: {ttl_error}")
+                    else:
+                        # 固定TTL模式：使用TTL参数值
+                        try:
+                            r.expire(self.stream_name, self.ttl)
+                            logger.debug(f"Fixed TTL set: {self.ttl}s")
+                        except Exception as ttl_error:
+                            logger.debug(f"Fixed TTL setting failed: {ttl_error}")
+
+                # 数据生命周期管理
+                if self.target_db_size_mb:
+                    self._adaptive_ttl_adjustment(r)
+                elif self.stream_maxlen and self.request_count % self.clean_interval == 0:
+                    try:
+                        r.xtrim(self.stream_name, maxlen=self.stream_maxlen, approximate=True)
+                        logger.debug(f"Cleaned stream {self.stream_name}, maxlen={self.stream_maxlen}")
+                    except Exception as e:
+                        logger.debug(f"Stream cleanup failed: {e}")
+
             except Exception as e:
                 logger.debug("xadd failed: %s", e)
                 with self.lock:
@@ -368,6 +420,40 @@ class CarTelematicsBench:
         logger.info("Workers finished")
         self._print_summary(duration)
 
+    def _adaptive_ttl_adjustment(self, redis_client):
+        """自适应TTL调整算法"""
+        current_time = time.time()
+
+        # 定期检查和调整TTL
+        if current_time - self.last_ttl_adjust >= self.adjust_interval:
+            try:
+                # 获取当前数据库大小(估算)
+                info = redis_client.info('memory')
+                current_db_size_mb = info['used_memory'] / 1024 / 1024
+
+                # 获取当前请求速率
+                current_rate = self.success / max(1, current_time - self.start_time)
+
+                # 根据目标大小和当前速率计算理想TTL
+                if current_rate > 0 and self.target_db_size_mb is not None:
+                    # 目标TTL = 目标大小 / (请求速率 × 平均负载大小)
+                    target_ttl_bytes = self.target_db_size_mb * 1024 * 1024
+                    data_rate_bytes_per_sec = current_rate * self.avg_payload_size
+                    target_ttl_seconds = target_ttl_bytes / data_rate_bytes_per_sec
+                    # 限制TTL在合理范围内
+                    target_ttl_seconds = max(60, min(86400, target_ttl_seconds))  # 1分钟到24小时
+
+                    # 渐进调整TTL(避免剧烈变化)
+                    if abs(target_ttl_seconds - self.current_ttl) > 300:  # 差值超过5分钟
+                        self.current_ttl = (self.current_ttl * 0.7) + (target_ttl_seconds * 0.3)
+                        redis_client.expire(self.stream_name, int(self.current_ttl))
+                        logger.info(f"Adaptive TTL adjusted: {self.current_ttl:.0f}s (target: {target_ttl_seconds:.0f}s, db_size: {current_db_size_mb:.1f}MB)")
+
+                self.last_ttl_adjust = current_time
+
+            except Exception as e:
+                logger.debug(f"TTL adjustment failed: {e}")
+
     def _print_summary(self, duration):
         total = self.success + self.fail
         ops_per_sec = self.success / max(1e-9, duration)
@@ -417,8 +503,16 @@ def main():
 
     # 消息速率控制
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
-                       type=int,
-                       help="Maximum requests per second (default: no limit, based on hardness sleep)")
+                        type=int,
+                        help="Maximum requests per second (default: no limit, based on hardness sleep)")
+
+    # 数据库大小控制
+    parser.add_argument("--target-db-size-mb", type=float,
+                        help="Target database size in MB (enables adaptive TTL adjustment)")
+    parser.add_argument("--ttl", type=int, default=3600,
+                        help="TTL in seconds when not using adaptive mode (default: 3600)")
+    parser.add_argument("--stream-maxlen", type=int,
+                        help="Optional: Maximum Redis Stream length (complements TTL, use as needed)")
 
     args = parser.parse_args()
 
@@ -442,7 +536,11 @@ def main():
         pool_timeout=args.pool_timeout,
         pool_size=pool_size,
         # 消息速率控制
-        max_requests_per_second=args.rps
+        max_requests_per_second=args.rps,
+        # 数据库大小控制
+        target_db_size_mb=args.target_db_size_mb,
+        ttl=args.ttl,
+        stream_maxlen=args.stream_maxlen
     )
     bench.run(threads=args.threads, duration=args.duration)
 

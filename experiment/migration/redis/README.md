@@ -26,10 +26,34 @@ python3 bench_cartelem.py --pool-size 100 --connect-timeout 3 --socket-timeout 3
 ```
 
 ### TTL Management (过期管理)
-支持不同场景的TTL策略：
-- **缓存模式**: 短期TTL (60-300秒)
-- **时序数据**: 长期存储，无TTL
-- **传感器数据**: 中期缓存，根据刷新频率
+优先使用TTL机制，stream_maxlen作为可选辅助：
+
+- **TTL（推荐）**: 基于时间的精确控制，支持自适应调整
+- **自适应TTL**: 设置 `--target-db-size-mb` 启用智能大小控制
+- **固定TTL**: 设置 `--ttl` 使用固定时间，默认3600秒
+- **Stream Maxlen**: 可选的长度限制，仅对bench_cartelem.py有效
+
+```bash
+# 1. 自适应大小控制（推荐）
+--target-db-size-mb 100
+
+# 2. 固定TTL控制
+--ttl 7200
+
+# 3. 结合长度限制（可选）
+--stream-maxlen 10000
+```
+
+```bash
+# 自适应数据库大小控制 (推荐)
+python3 bench_cartelem.py --target-db-size-mb 100 --rps 500
+
+# 固定TTL模式：自定义TTL时间
+python3 bench_sensoragg.py --rps 200 --ttl 7200  # 2小时TTL
+
+# 默认TTL模式：使用3600秒(1小时)TTL
+python3 bench_sensoragg.py --rps 200
+```
 
 ## 📝 脚本总览
 
@@ -92,6 +116,9 @@ python3 bench_video_cache.py --redis-host 127.0.0.1 --threads 16 --duration 30 \
 | `--payload-size-kb` | 目标负载大小(KB) | 1 | `--payload-size-kb 5` |
 | `--size-distribution` | 数据大小分布 | uniform | `--size-distribution normal` |
 | `--rps`/`--max-requests-per-second` | 请求速率限制(每秒) | 无限制 | `--rps 1000` |
+| `--target-db-size-mb` | 目标数据库大小(MB) | 自适应 | `--target-db-size-mb 100` |
+| `--ttl` | TTL秒数(非自适应时) | 3600 | `--ttl 7200` |
+| `--stream-maxlen` | 可选Stream最大长度(仅bench_cartelem.py) | None | `--stream-maxlen 5000` |
 | `--connect-timeout` | 连接超时(秒) | 5 | `--connect-timeout 3` |
 | `--socket-timeout` | Socekt超时(秒) | 5 | `--socket-timeout 3` |
 | `--pool-timeout` | 池等待超时(秒) | 10 | `--pool-timeout 15` |
@@ -132,6 +159,19 @@ python3 ./experiment/migration/redis/bench_cartelem.py \
 # 精确控制每秒请求数
 python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 60 \
     --rps 500 --payload-size-kb 2
+```
+
+#### 自适应数据库大小控制
+```bash
+# 根据请求速率自动调整TTL，维持数据库大小稳定
+python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 300 \
+    --target-db-size-mb 100 --rps 1000
+
+# InfluxDB的大小控制(手动设置retention policy)
+python3 ./experiment/migration/influxdb/bench_cartelem.py \
+    --influx-url http://localhost:8181 \
+    --retention-policy 5m \
+    --threads 8 --duration 300
 ```
 
 #### 大规模数据测试
@@ -177,5 +217,8 @@ pip install redis
 3. **网络优化**: 高并发时使用连接池参数
 4. **真实性优先**: 生产评估时使用真实性参数
 5. **速率控制**: 负载测试时设置合理的RPS限制
-6. **分布模式选择**: normal模式适合现实世界负载，uniform适合理论分析
-7. **实时监控**: 关注P95延迟而非平均延迟，更能反映用户体验
+6. **数据库大小控制**: 迁移测试时使用 `--target-db-size-mb` 防止无限增长
+7. **分布模式选择**: normal模式适合现实世界负载，uniform适合理论分析
+8. **实时监控**: 关注P95延迟而非平均延迟，更能反映用户体验
+9. **TTL策略选择**: 自适应模式适合动态负载，固定TTL适合稳定负载
+10. **TTL配置建议**: 高并发场景推荐自适应模式，稳定负载适合固定TTL

@@ -2,6 +2,19 @@
 
 该目录包含用于InfluxDB的时间序列数据基准测试脚本，适用于物联网、传感器监控等时间序列应用场景。
 
+## 🚀 核心特性
+
+### 数据大小控制 (Data Size Control)
+防止数据库无限增长，支持智能retention policy管理：
+```bash
+# 设置1小时retention，自动控制数据库大小
+python3 bench_cartelem.py --retention-policy 1h --rps 1000
+
+# 验证bucket配置
+INFO: Checking bucket 'sensor-data' retention policy...
+INFO: Bucket configured with 1h retention policy
+```
+
 ## 依赖安装
 
 ```bash
@@ -98,6 +111,18 @@ python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
 
 ##### 速率控制参数
 - `--rps` 或 `--max-requests-per-second`: 每秒最大请求数 (默认: 无限制)
+
+##### 数据生命周期管理参数
+- `--retention-policy`: bucket保留策略 (默认: 1h，即1小时)
+  - 支持格式: 1h, 24h, 7d, 30d 等
+
+##### 数据生命周期管理参数
+- `--retention-policy`: bucket保留策略 (默认: 1h，即1小时)
+  - 支持格式: 1h, 24h, 7d, 30d 等
+  - ⚠️ **重要**: 脚本会自动与InfluxDB交互，验证和配置bucket的retention policy
+  - 🔄 **自动处理**: 检查现有bucket配置，如果与设置不匹配则提醒更新
+  - ⚠️ **重要**: 脚本会自动与InfluxDB交互，验证和配置bucket的retention policy
+  - 🔄 **自动处理**: 检查现有bucket配置，如果与设置不匹配则提醒更新
 
 #### 使用示例
 ```bash

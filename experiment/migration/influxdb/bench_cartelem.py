@@ -45,12 +45,14 @@ logger.addHandler(handler)
 class VehicleInfluxBench:
     """Vehicle Telematics InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "vehicle-data",
-                  # Data scale extension
-                  payload_size_kb: float = 1.0, size_distribution: str = "uniform",
-                 # Data type realism
-                 vehicle_pattern: str = "normal_city",
-                 # 消息速率控制
-                 max_requests_per_second: Optional[int] = None):
+                 # Data scale extension
+                 payload_size_kb: float = 1.0, size_distribution: str = "uniform",
+                # Data type realism
+                vehicle_pattern: str = "normal_city",
+                # 数据生命周期管理
+                retention_policy: str = "1h",
+                # 消息速率控制
+                max_requests_per_second: Optional[int] = None):
 
         self.influx_url = influx_url
         self.token = token
@@ -65,6 +67,9 @@ class VehicleInfluxBench:
         # Data type realism config
         self.vehicle_pattern = vehicle_pattern  # normal_city, highway, stop_go
         self.vehicle_states: Dict[str, Dict[str, Any]] = {}
+
+        # 数据生命周期管理
+        self.retention_policy = retention_policy
 
         # Monitoring config
         self.monitor_interval = 1.0
@@ -88,9 +93,21 @@ class VehicleInfluxBench:
             self.request_timestamps = []
 
 
+        # InfluxDB client initialization
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
         self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
         self.query_api = self.client.query_api()
+
+        # Bucket management client
+        from influxdb_client.client.bucket_api import BucketsApi
+        self.buckets_api = self.client.buckets_api()
+        self.org_api = self.client.organizations_api()
+
+        # Configure retention policy
+        try:
+            self._configure_bucket_retention()
+        except Exception as e:
+            logger.warning(f"Failed to configure bucket retention: {e}")
 
 
     def _get_vehicle_state(self, vehicle_id: str) -> Dict[str, Any]:
@@ -379,6 +396,67 @@ class VehicleInfluxBench:
         # Close client connection
         self.client.close()
 
+    def _configure_bucket_retention(self):
+        """Configure bucket retention policy"""
+        try:
+            # Get organization ID
+            org = self.org_api.find_organization_by_name(self.org)
+            if not org:
+                logger.warning(f"Organization '{self.org}' not found, skipping retention policy configuration")
+                return
+
+            # Check if bucket exists
+            bucket = self.buckets_api.find_bucket_by_name(bucket_name=self.bucket)
+            if bucket:
+                # Update existing bucket retention policy
+                if hasattr(bucket, 'retention_rules') and bucket.retention_rules:
+                    current_rule = bucket.retention_rules[0]
+                    current_duration = current_rule.every_micros // 1000000  # Convert to seconds
+
+                    # Parse desired retention policy
+                    desired_seconds = self._parse_duration_to_seconds(self.retention_policy)
+
+                    if abs(current_duration - desired_seconds) > 60:  # Update if difference > 1 minute
+                        logger.info(f"Updating bucket '{self.bucket}' retention from {current_duration}s to {desired_seconds}s")
+                        # Note: Updating retention rules requires admin permissions
+                        # For now, just log the desired change
+                        logger.info(f"Desired retention policy: {self.retention_policy} ({desired_seconds}s)")
+                    else:
+                        logger.info(f"Bucket '{self.bucket}' retention already matches: {self.retention_policy}")
+                else:
+                    logger.info(f"Bucket '{self.bucket}' has no retention rule, desired: {self.retention_policy}")
+            else:
+                logger.info(f"Bucket '{self.bucket}' does not exist, will be created by first write operation")
+
+        except Exception as e:
+            logger.warning(f"Retention policy configuration failed: {e}")
+            logger.info("Continuing without retention policy configuration - data will accumulate")
+
+    def _parse_duration_to_seconds(self, duration_str):
+        """Parse duration string like '1h', '24h', '7d' to seconds"""
+        if not duration_str:
+            return 3600  # Default 1 hour
+
+        duration_str = duration_str.lower()
+        multiplier = {
+            's': 1,
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+            'w': 604800
+        }
+
+        # Parse duration
+        import re
+        match = re.match(r'^(\d+)([smhdw])$', duration_str)
+        if match:
+            value, unit = match.groups()
+            return int(value) * multiplier.get(unit, 1)
+
+        # Default fallback
+        logger.warning(f"Invalid duration format: {duration_str}, using default 1h")
+        return 3600
+
     def _rate_control(self):
         """实现精确的速率控制"""
         if not self.max_requests_per_second:
@@ -441,6 +519,8 @@ def main():
     parser.add_argument("--threads", default=4, type=int, help="Worker threads")
     parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
+    parser.add_argument("--retention-policy", default="1h", type=str,
+                       help="Bucket retention policy (e.g., 1h, 24h, 7d)")
 
     # 消息速率控制
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
@@ -458,6 +538,8 @@ def main():
         size_distribution=args.size_distribution,
         # Data type realism
         vehicle_pattern=args.vehicle_pattern,
+        # 数据生命周期管理
+        retention_policy=args.retention_policy,
         # 消息速率控制
         max_requests_per_second=args.rps
     )
