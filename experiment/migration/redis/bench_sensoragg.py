@@ -88,11 +88,12 @@ class SensorAggBench:
         if target_db_size_mb:
             self.set_ttl = ttl  # 初始TTL值为参数指定的值
             self.clean_interval = 200  # 每200个请求调整一次TTL
-            # 自适应TTL参数
-            self.avg_payload_size = 512  # 估算平均负载大小(bytes)
+            # 自适应TTL参数 - 优化实现
+            self.payload_sizes = []  # 动态跟踪payload大小
+            self.avg_payload_size = 512  # 初始估算值，会动态更新
             self.current_ttl = ttl  # 初始TTL值为参数指定的值
             self.last_ttl_adjust = time.time()
-            self.adjust_interval = 60  # 每60秒检查一次
+            self.adjust_interval = 10  # 每10秒检查一次，提高响应速度
         else:
             self.set_ttl = ttl  # TTL参数值
             self.clean_interval = 200

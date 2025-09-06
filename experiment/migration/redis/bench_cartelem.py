@@ -89,10 +89,11 @@ class CarTelematicsBench:
 
         # 自适应TTL参数
         if self.target_db_size_mb:
-            self.avg_payload_size = 512  # 估算平均负载大小(bytes)
+            self.payload_sizes = []  # 动态跟踪payload大小
+            self.avg_payload_size = 512  # 初始估算值，会动态更新
             self.current_ttl = 3600  # 初始TTL 1小时
             self.last_ttl_adjust = time.time()
-            self.adjust_interval = 60  # 每60秒检查一次
+            self.adjust_interval = 10  # 每10秒检查一次，提高响应速度
             self.size_history = []  # 存储最近的数据库大小历史
 
         # 统计
@@ -321,6 +322,17 @@ class CarTelematicsBench:
             payload = self._make_payload(vehicle_id)
             vehicle_id = payload["vehicle_id"]  # 更新车辆ID以保持连续性
 
+            # 动态跟踪payload大小用于自适应TTL计算
+            if self.target_db_size_mb:
+                payload_size = len(json.dumps(payload))
+                self.payload_sizes.append(payload_size)
+                # 保持最近100个payload大小用于准确计算
+                if len(self.payload_sizes) > 100:
+                    self.payload_sizes.pop(0)
+                # 更新平均payload大小
+                if self.payload_sizes:
+                    self.avg_payload_size = sum(self.payload_sizes) / len(self.payload_sizes)
+
             op_start_time = time.perf_counter()
             try:
                 r.xadd(self.stream_name, {"data": json.dumps(payload)})
@@ -436,18 +448,28 @@ class CarTelematicsBench:
 
                 # 根据目标大小和当前速率计算理想TTL
                 if current_rate > 0 and self.target_db_size_mb is not None:
-                    # 目标TTL = 目标大小 / (请求速率 × 平均负载大小)
+                    # 改进的目标TTL计算：使用动态payload大小
                     target_ttl_bytes = self.target_db_size_mb * 1024 * 1024
                     data_rate_bytes_per_sec = current_rate * self.avg_payload_size
                     target_ttl_seconds = target_ttl_bytes / data_rate_bytes_per_sec
-                    # 限制TTL在合理范围内
+
+                    # 限制TTL在合理范围内，避免极端值
                     target_ttl_seconds = max(60, min(86400, target_ttl_seconds))  # 1分钟到24小时
 
-                    # 渐进调整TTL(避免剧烈变化)
-                    if abs(target_ttl_seconds - self.current_ttl) > 300:  # 差值超过5分钟
-                        self.current_ttl = (self.current_ttl * 0.7) + (target_ttl_seconds * 0.3)
+                    # 更平滑的TTL调整算法
+                    ttl_diff = target_ttl_seconds - self.current_ttl
+                    if abs(ttl_diff) > 60:  # 差值超过1分钟就开始调整
+                        # 根据差值大小调整步长：小差值稳步调整，大差值快速调整
+                        if abs(ttl_diff) < 300:  # 小于5分钟，稳步调整
+                            adjust_factor = 0.1
+                        elif abs(ttl_diff) < 1800:  # 5-30分钟，中等调整
+                            adjust_factor = 0.2
+                        else:  # 大于30分钟，快速调整
+                            adjust_factor = 0.5
+
+                        self.current_ttl = self.current_ttl + (ttl_diff * adjust_factor)
                         redis_client.expire(self.stream_name, int(self.current_ttl))
-                        logger.info(f"Adaptive TTL adjusted: {self.current_ttl:.0f}s (target: {target_ttl_seconds:.0f}s, db_size: {current_db_size_mb:.1f}MB)")
+                        logger.info(f"Adaptive TTL adjusted: {self.current_ttl:.0f}s (target: {target_ttl_seconds:.0f}s, payload_avg: {self.avg_payload_size:.0f}B, db_size: {current_db_size_mb:.1f}MB)")
 
                 self.last_ttl_adjust = current_time
 

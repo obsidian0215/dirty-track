@@ -33,6 +33,11 @@ python3 bench_cartelem.py --pool-size 100 --connect-timeout 3 --socket-timeout 3
 - **固定TTL**: 设置 `--ttl` 使用固定时间，默认3600秒
 - **Stream Maxlen**: 可选的长度限制，仅对bench_cartelem.py有效
 
+### 🆕 自适应TTL
+- ✨ **动态Payload计算**: 实时跟踪并更新平均payload大小以提高计算精度
+- ⚡ **更高响应速度**: TTL调整频率为10秒
+- 🎯 **智能调整算法**: 根据大小差异程度采用不同的调整步长（小差值稳步调整，大差值快速调整）
+
 ```bash
 # 1. 自适应大小控制（推荐）
 --target-db-size-mb 100
@@ -163,15 +168,21 @@ python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 60 \
 
 #### 自适应数据库大小控制
 ```bash
-# 根据请求速率自动调整TTL，维持数据库大小稳定
+# 🍃 动态大小控制（推荐，已优化算法）
 python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 300 \
-    --target-db-size-mb 100 --rps 1000
+    --target-db-size-mb 1000 --rps 2000  # 现在具备更好的精度和响应速度
 
-# InfluxDB的大小控制(手动设置retention policy)
-python3 ./experiment/migration/influxdb/bench_cartelem.py \
-    --influx-url http://localhost:8181 \
-    --retention-policy 5m \
-    --threads 8 --duration 300
+# 🔧 固定TTL控制
+python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 300 \
+    --ttl 1800 --rps 1000  # 30分钟固定TTL
+
+# 📊 大数据库测试
+python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 16 --duration 600 \
+    --target-db-size-mb 5000 --rps 5000  # 适应高负载场景
+
+# 🔍 调试模式（查看详细TTL调整日志）
+python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 180 \
+    --target-db-size-mb 200 --rps 500  # 观察日志输出
 ```
 
 #### 大规模数据测试
@@ -222,3 +233,26 @@ pip install redis
 8. **实时监控**: 关注P95延迟而非平均延迟，更能反映用户体验
 9. **TTL策略选择**: 自适应模式适合动态负载，固定TTL适合稳定负载
 10. **TTL配置建议**: 高并发场景推荐自适应模式，稳定负载适合固定TTL
+
+### 🆕 数据库大小控制优化指南
+
+#### 使用建议
+```bash
+# 1. 小型数据库 (推荐自适应模式)
+python3 bench_cartelem.py --target-db-size-mb 100 --rps 200 --duration 300
+
+# 2. 中型数据库 (稳定负载)
+python3 bench_cartelem.py --ttl 3600 --rps 500 --duration 300
+
+# 3. 大型数据库 (高并发场景)
+python3 bench_cartelem.py --target-db-size-mb 5000 --rps 2000 --threads 32 --duration 600
+
+# 4. 调试和监控
+python3 bench_sensoragg.py --target-db-size-mb 200 --rps 300 --duration 180
+```
+
+#### 验证方法
+- 📈 观察日志中的"Adaptive TTL adjusted"消息
+- 📊 实时监控Redis内存使用情况 (INFO memory)
+- ⚙️ 查看payload大小统计输出
+- 📋 确认TTL调整频率 (每10秒一次)

@@ -2,10 +2,11 @@
 
 该目录包含用于InfluxDB的时间序列数据基准测试脚本，适用于物联网、传感器监控等时间序列应用场景。
 
+
 ## 🚀 核心特性
 
 ### 数据大小控制 (Data Size Control)
-防止数据库无限增长，支持智能retention policy管理：
+防止数据库无限增长，支持通过retention policy间接管理：
 ```bash
 # 设置1小时retention，自动控制数据库大小
 python3 bench_cartelem.py --retention-policy 1h --rps 1000
@@ -15,10 +16,90 @@ INFO: Checking bucket 'sensor-data' retention policy...
 INFO: Bucket configured with 1h retention policy
 ```
 
+⚠️ InfluxDB脚本不支持直接设置最大数据库大小
+- 📉 **不直接支持**: 无`--target-db-size-mb`参数
+- 📋 **间接控制**: 通过设置更长的retention policy来增加数据库大小
+- 🔄 **替代方案**: 使用`--retention-policy 168h`（7天）或更长来间接控制大小
+
 ## 依赖安装
 
 ```bash
 pip install influxdb-client
+```
+
+## 数据过期验证方法
+
+### 脚本执行时的验证日志
+```bash
+# 脚本运行时会显示数据过期配置信息
+INFO: Checking bucket 'vehicle-data' retention policy...
+INFO: Bucket configured with 1h retention policy
+INFO: Desired retention policy: 1h - matches current configuration
+
+# 如果配置不匹配会显示警告
+WARNING: Bucket 'sensor-data' current retention: 3600s, desired: 7200s
+INFO: Consider updating bucket retention policy manually
+```
+
+### InfluxDB CLI验证过期设置
+
+1. **连接到InfluxDB CLI**：
+```bash
+influx v2 query -t YOUR_TOKEN --org YOUR_ORG
+```
+
+2. **查看所有buckets的retention policy**：
+```bash
+buckets()
+  |> rename(columns: {name: "Bucket_Name", retentionPeriod: "Retention_Hours"})
+  |> map(fn: (r) => ({r.Bucket_Name, Retention_Hours: int(v: r.Retention_Hours) / 3600000000000}))
+```
+
+3. **查看特定bucket的详细信息**：
+```bash
+buckets()
+  |> filter(fn: (r) => r.name == "vehicle-data")
+  |> rename(columns: {retentionPeriod: "Retention_Nanoseconds"})
+```
+
+4. **监控数据删除**：
+```bash
+# 查询bucket中的数据量随时间变化
+from(bucket: "vehicle-data")
+  |> range(start: -24h)
+  |> count()
+```
+
+### 直接API验证过期设置
+
+```bash
+# 使用curl验证bucket配置
+curl -X GET "http://localhost:8086/api/v2/buckets" \
+  -H "Authorization: Token YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  | jq '.buckets[] | {name, retentionRules}'
+```
+
+### 测试数据过期效果
+
+1. **写入测试数据**：
+```bash
+python3 bench_cartelem.py --influx-url http://localhost:8181 \
+  --token my-token --org my-org --bucket test-retention \
+  --retention-policy 5m --threads 2 --duration 30
+```
+
+2. **让retention policy生效**：
+```bash
+# 等待5分钟后检查数据
+influx v2 query -t YOUR_TOKEN --org YOUR_ORG \
+  -q "from(bucket: \"test-retention\") |> range(start: -10m) |> count()"
+```
+
+3. **检查数据是否按预期清理**：
+```bash
+# 如果retention policy生效，5分钟后的数据应该已被清理
+# 查询结果应该显示逐渐减少的记录数
 ```
 
 ## 脚本概览
@@ -304,9 +385,9 @@ max-concurrent-compactions = 4
 
 这些InfluxDB基准测试脚本可与`chk_restore.py`容器迁移测试结合使用，评估迁移期间的性能影响：
 
-### 单一节点迁移测试
+### 数据过期验证测试
 ```bash
-# 在迁移测试期间运行基准测试
+# 测试数据过期配置并运行迁移基准测试
 python3 ./experiment/migration/influxdb/bench_sensoragg.py \
     --influx-url http://localhost:8181 \
     --token my-token \
@@ -314,7 +395,33 @@ python3 ./experiment/migration/influxdb/bench_sensoragg.py \
     --bucket migration-test \
     --threads 8 \
     --duration 300 \
-    --rps 200 &
+    --rps 200 \
+    --retention-policy 10m
+
+# 预期输出日志：
+# INFO: Checking bucket 'migration-test' retention policy...
+# INFO: Bucket configured with 10m retention policy
+# INFO: Desired retention policy: 10m - matches current configuration
+```
+
+### 单一节点迁移测试
+```bash
+# 🔄 使用retention policy控制数据大小（间接控制）
+python3 ./experiment/migration/influxdb/bench_sensoragg.py \
+    --influx-url http://localhost:8181 \
+    --token my-token \
+    --org my-org \
+    --bucket migration-test \
+    --threads 8 \
+    --duration 300 \
+    --rps 200 \
+    --retention-policy 30m &  # 通过较短的retention实现大小控制
+
+# 💡 大数据库测试：设置更长的retention来增加数据量
+python3 ./experiment/migration/influxdb/bench_cartelem.py \
+    --retention-policy 24h \  # 24小时retention，间接增加最大大小
+    --threads 16 \
+    --rps 1000
 ```
 
 ### 分布式迁移测试
