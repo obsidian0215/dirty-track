@@ -409,10 +409,6 @@ class SensorInfluxBench:
                     self.write_api.write(bucket=self.bucket, org=self.org, record=points)
                     lat = (time.perf_counter() - start) * 1000.0
 
-                    # 第一次写入成功后配置retention
-                    if not self._retention_configured:
-                        self._configure_bucket_retention_on_first_write()
-
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
@@ -479,25 +475,6 @@ class SensorInfluxBench:
         # Close client connection
         self.client.close()
 
-    def _configure_bucket_retention_on_first_write(self):
-        """在第一次写入成功后配置retention"""
-        try:
-            # 尝试设置bucket的retention policy
-            logger.info(f"Setting retention policy '{self.retention_policy}' for bucket '{self.bucket}'")
-
-            # 获取bucket信息
-            bucket = self.buckets_api.find_bucket_by_name(bucket_name=self.bucket)
-            if bucket:
-                # 这里可以添加实际的retention修改逻辑
-                # 例如：更新bucket的retention规则
-                logger.info(f"Bucket '{self.bucket}' retention policy set to '{self.retention_policy}'")
-
-            self._retention_configured = True
-
-        except Exception as e:
-            logger.warning(f"Failed to configure bucket retention: {e}")
-            # 即使配置失败也标记为已配置，避免重复尝试
-            self._retention_configured = True
 
     def _parse_duration_to_seconds(self, duration_str):
         """Parse duration string like '1h', '24h', '7d' to seconds"""
