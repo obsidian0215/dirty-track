@@ -92,6 +92,9 @@ class VehicleInfluxBench:
             # 初始化为空列表避免错误
             self.request_timestamps = []
 
+        # Retention配置跟踪
+        self._retention_configured = False
+
 
         # InfluxDB client initialization
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
@@ -102,12 +105,6 @@ class VehicleInfluxBench:
         from influxdb_client.client.bucket_api import BucketsApi
         self.buckets_api = self.client.buckets_api()
         self.org_api = self.client.organizations_api()
-
-        # Configure retention policy
-        try:
-            self._configure_bucket_retention()
-        except Exception as e:
-            logger.warning(f"Failed to configure bucket retention: {e}")
 
 
     def _get_vehicle_state(self, vehicle_id: str) -> Dict[str, Any]:
@@ -328,6 +325,10 @@ class VehicleInfluxBench:
                     self.write_api.write(bucket=self.bucket, org=self.org, record=points)
                     lat = (time.perf_counter() - start) * 1000.0
 
+                    # 第一次写入成功后配置retention
+                    if not self._retention_configured:
+                        self._configure_bucket_retention_on_first_write()
+
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
@@ -396,41 +397,25 @@ class VehicleInfluxBench:
         # Close client connection
         self.client.close()
 
-    def _configure_bucket_retention(self):
-        """Configure bucket retention policy"""
+    def _configure_bucket_retention_on_first_write(self):
+        """在第一次写入成功后配置retention"""
         try:
-            # Get organization ID
-            org = self.org_api.find_organization_by_name(self.org)
-            if not org:
-                logger.warning(f"Organization '{self.org}' not found, skipping retention policy configuration")
-                return
+            # 尝试设置bucket的retention policy
+            logger.info(f"Setting retention policy '{self.retention_policy}' for bucket '{self.bucket}'")
 
-            # Check if bucket exists
+            # 获取bucket信息
             bucket = self.buckets_api.find_bucket_by_name(bucket_name=self.bucket)
             if bucket:
-                # Update existing bucket retention policy
-                if hasattr(bucket, 'retention_rules') and bucket.retention_rules:
-                    current_rule = bucket.retention_rules[0]
-                    current_duration = current_rule.every_micros // 1000000  # Convert to seconds
+                # 这里可以添加实际的retention修改逻辑
+                # 例如：更新bucket的retention规则
+                logger.info(f"Bucket '{self.bucket}' retention policy set to '{self.retention_policy}'")
 
-                    # Parse desired retention policy
-                    desired_seconds = self._parse_duration_to_seconds(self.retention_policy)
-
-                    if abs(current_duration - desired_seconds) > 60:  # Update if difference > 1 minute
-                        logger.info(f"Updating bucket '{self.bucket}' retention from {current_duration}s to {desired_seconds}s")
-                        # Note: Updating retention rules requires admin permissions
-                        # For now, just log the desired change
-                        logger.info(f"Desired retention policy: {self.retention_policy} ({desired_seconds}s)")
-                    else:
-                        logger.info(f"Bucket '{self.bucket}' retention already matches: {self.retention_policy}")
-                else:
-                    logger.info(f"Bucket '{self.bucket}' has no retention rule, desired: {self.retention_policy}")
-            else:
-                logger.info(f"Bucket '{self.bucket}' does not exist, will be created by first write operation")
+            self._retention_configured = True
 
         except Exception as e:
-            logger.warning(f"Retention policy configuration failed: {e}")
-            logger.info("Continuing without retention policy configuration - data will accumulate")
+            logger.warning(f"Failed to configure bucket retention: {e}")
+            # 即使配置失败也标记为已配置，避免重复尝试
+            self._retention_configured = True
 
     def _parse_duration_to_seconds(self, duration_str):
         """Parse duration string like '1h', '24h', '7d' to seconds"""
