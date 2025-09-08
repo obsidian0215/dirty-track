@@ -43,11 +43,12 @@ void handle_sigint(int sig) {
  * 函数：生成格式为 <pid>-<timestamp>.txt 的文件名
  *
  * @param pid 进程 ID
+ * @param output_dir 输出目录，如果为NULL则使用当前目录
  * @param filename 输出的文件名字符串缓冲区
  * @param size 缓冲区大小
  * @return 如果成功生成文件名，返回 0；否则返回 -1
  */
-int generate_dirty_map_filename(pid_t pid, char *filename, size_t size) {
+int generate_dirty_map_filename(pid_t pid, const char *output_dir, char *filename, size_t size) {
     if (filename == NULL) {
         fprintf(stderr, "Filename buffer is NULL.\n");
         return -1;
@@ -81,10 +82,19 @@ int generate_dirty_map_filename(pid_t pid, char *filename, size_t size) {
         return -1;
     }
 
-    // 生成文件名 "<pid>-<timestamp>.txt"
-    if (snprintf(filename, size, "%d-%s.txt", pid, timestamp_with_ms) >= size) {
-        fprintf(stderr, "Filename buffer too small.\n");
-        return -1;
+    // 生成文件名，如果指定了输出目录，则包含完整路径
+    if (output_dir != NULL) {
+        // 生成完整路径: <output_dir>/<pid>-<timestamp>.txt
+        if (snprintf(filename, size, "%s/%d-%s.txt", output_dir, pid, timestamp_with_ms) >= size) {
+            fprintf(stderr, "Filename buffer too small.\n");
+            return -1;
+        }
+    } else {
+        // 生成相对路径: <pid>-<timestamp>.txt (当前目录)
+        if (snprintf(filename, size, "%d-%s.txt", pid, timestamp_with_ms) >= size) {
+            fprintf(stderr, "Filename buffer too small.\n");
+            return -1;
+        }
     }
 
     return 0;
@@ -244,8 +254,8 @@ int track_dirty_pages(pid_t pid) {
         }
 
         // 仅处理可写的内存区域
-        if (strchr(perms, 'w') == NULL)
-            continue;
+        // if (strchr(perms, 'w') == NULL)
+            // continue;
 
         // 批量读取 soft-dirty 位
         if (is_soft_dirty_bulk(pid, start, end) != 0) {
@@ -281,10 +291,13 @@ int write_dirty_pages_to_file(const char *filepath) {
 
 int main(int argc, char *argv[]) {
     pid_t pid;
+    char *output_dir = NULL;
     char output_file[MAX_FILENAME_LENGTH];
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <pid>\n", argv[0]);
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "Usage: %s <pid> [output_directory]\n", argv[0]);
+        fprintf(stderr, "  pid: Process ID to monitor\n");
+        fprintf(stderr, "  output_directory: Optional output directory (default: current directory)\n");
         return EXIT_FAILURE;
     }
 
@@ -294,7 +307,13 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (generate_dirty_map_filename(pid, output_file, sizeof(output_file)) != 0) {
+    // 检查是否指定了输出目录
+    if (argc >= 3) {
+        output_dir = argv[2];
+        printf("Output directory specified: %s\n", output_dir);
+    }
+
+    if (generate_dirty_map_filename(pid, output_dir, output_file, sizeof(output_file)) != 0) {
         fprintf(stderr, "Failed to generate filename.\n");
         return EXIT_FAILURE;
     }
