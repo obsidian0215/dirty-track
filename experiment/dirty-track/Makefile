@@ -1,9 +1,9 @@
 # Makefile for dirty-track testing tools and scripts
 # Comprehensive build system for dirty-track kernel module testing framework
 
-# Build settings
+# Build settings - 使用标准的GNU C编译选项以确保兼容性
 CC=gcc
-CFLAGS=-Wall -Wextra -O2 -std=c11
+CFLAGS=-Wall -Wextra -O2 -g
 LDFLAGS=
 PV=python3
 
