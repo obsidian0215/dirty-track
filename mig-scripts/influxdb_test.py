@@ -21,60 +21,52 @@ import time
 import re
 
 # 默认设置
-SOURCE_IP = "192.168.15.199"
-DEST_IP = "192.168.15.239"
-CLIENT_IP = "192.168.15.181"
-VIP = "192.168.15.100"
+SOURCE_IP = "192.168.37.159"
+DEST_IP = "192.168.37.161"
+CLIENT_IP = "192.168.37.158"
+VIP = "192.168.37.150"
 
 # 定义实验类型
 experiments = {
-    "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    "post-copy": "-post -d --tcp-established --shell-job",
+    # "pre-copy": "-pre -d --tcp-established --shell-job",
+    # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    # "post-copy": "-post -d --tcp-established --shell-job"
     "hybrid": "-pre -post -d --tcp-established --shell-job",
-    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+    # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 # 场景配置：InfluxDB的video, sensor, vehicle场景
 scene_configs = {
-    'video': {
-        'bench': 'experiment/migration/influxdb/bench_video_cache.py',
-        'base_args': {
-            '--influx-url': 'http://localhost:8181',
-            # '--token': 'token',
-            # '--org': 'org',
-            '--bucket': 'data',
-            '--threads': '4',
-            '--duration': '60',
-            '--payload-size-kb': '2',
-            '--objects-per-frame': '3'
-        }
-    },
     'sensor': {
         'bench': 'experiment/migration/influxdb/bench_sensoragg.py',
         'base_args': {
-            '--influx-url': 'http://localhost:8181',
+            '--influx-url': 'http://192.168.37.150:8181',
             # '--token': 'token',
             # '--org': 'org',
-            '--bucket': 'sensor-data',
-            '--threads': '4',
-            '--duration': '60',
-            '--payload-size-kb': '1',
-            '--sensors-per-device': '5'
+            # '--bucket': 'sensor-data',
+            # '--threads': '4',
+            '--payload-size-kb': '2',
+            '--sensors-per-device': '10',
+            '--read-pct':'0',
+            '--duration': '120'
+
         }
     },
     'vehicle': {
         'bench': 'experiment/migration/influxdb/bench_cartelem.py',
         'base_args': {
-            '--influx-url': 'http://localhost:8181',
+            '--influx-url': 'http://192.168.37.150:8181',
             # '--token': 'token',
             # '--org': 'org',
-            '--bucket': 'vehicle-data',
-            '--threads': '4',
-            '--duration': '60',
-            '--payload-size-kb': '1',
-            '--read-pct': '10',
-            '--vehicle-pattern': 'normal_city'
+            # '--bucket': 'vehicle-data',
+            # '--threads': '4',
+            '--payload-size-kb': '2',
+            # '--size-distribution':'normal',
+            # '--vehicle-pattern': 'highway',
+            '--duration': '120',
+            '--read-pct': '0',
+            # '--target-db-size-mb':'120'
+            '--retention-policy':'60s'
         }
     }
 }
@@ -112,7 +104,7 @@ def destination_prepare():
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
 
-    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
 
 def destination_clean():
@@ -131,7 +123,7 @@ def source_prepare():
     cmds = [
         (f"rm -rf /runc/containers/{container_name}", False),
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
-        (f"nohup recvtty -m null /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid", False),
+        (f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_source.pid", False),
         (f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}", False)
     ]
     for c, ign in cmds:
@@ -275,36 +267,77 @@ def configure_network():
         )
 
 
-def source_run_migration(exp_args, scene_config, extra_args):
+def source_run_migration(exp_args, scene_config, extra_args,scene):
     container_name = "influxdb"
     time.sleep(6)  # 等待容器启动稳定
 
     print("Running bench test on the client machine...")
     run_remote_cmd('pkill -f "python.*bench"', CLIENT_IP, ignore_error=True)
+    run_remote_cmd('rm -f /tmp/bench_client.pid /tmp/bench_run.log || true', CLIENT_IP, ignore_error=True)
 
     # 设置环境变量并执行bench（load）
-    env_setup = "cd /root/dirty-track"
-    bench_cmd = f"python3 {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
-    full_bench_cmd = f"{env_setup} && {bench_cmd}"
-    run_remote_cmd(full_bench_cmd, CLIENT_IP)
+    bench_dir = "/root/dirty-track/experiment/migration/influxdb"
+    bench_file = scene_config['bench'].split('/')[-1]
+
+    def args_to_str(d):
+        return " ".join(f"{k} {v}" for k, v in d.items() if v is not None and v != "")
+
+
+     # --- load 阶段：用 scene_configs 里的 base_args ---
+    load_args = extra_args.copy()
+    load_cmd = f"cd {bench_dir} && python3 {bench_file} {args_to_str(load_args)}"
+    run_remote_cmd(load_cmd, CLIENT_IP)
 
     # 在load和run之间设置网络配置
     configure_network()
     print("Network configuration applied between bench load and run.")
 
+       # --- run 阶段：覆盖 payload-size-kb / sensors-per-device ---
+    run_args = extra_args.copy()
+    if scene == 'sensor':
+        run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
+        run_args['--sensors-per-device'] = '15' # ★ 你要的新值\
+
+    if scene == 'vehicle':
+        run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
+        run_args['--size-distribution'] = 'normal' # 
+        run_args['--vehicle-pattern'] = 'highway'
+
+    # run 
+    run_bg_cmd = (
+        f"cd {bench_dir} && "
+        f"nohup python3 {bench_file} {args_to_str(run_args)} "
+        f"> /tmp/bench_run.log 2>&1 & echo $! > /tmp/bench_client.pid"
+    )
+    run_remote_cmd(run_bg_cmd, CLIENT_IP, ignore_error=False)
+
     time.sleep(3)  # 等待bench启动稳定
 
     # 执行source.py进行迁移
-    migration_cmd = f"python3 source.py {exp_args} {container_name} {DEST_IP}"
+    migration_cmd = f"python3 source-cpu-mem-net.py {exp_args} {container_name} {DEST_IP}"
     run_cmd(migration_cmd)
 
+    # ---------- 5) 迁移后清理后台 bench ----------
+    # 先温柔 SIGTERM，再强制 SIGKILL（避免残留）
+    kill_bg = (
+        "if [ -f /tmp/bench_client.pid ]; then "
+        "  PID=$(cat /tmp/bench_client.pid) 2>/dev/null; "
+        "  if [ -n \"$PID\" ] && kill -0 $PID 2>/dev/null; then "
+        "    kill $PID 2>/dev/null || true; "
+        "    sleep 0.5; "
+        "    kill -9 $PID 2>/dev/null || true; "
+        "  fi; "
+        "fi; "
+        "rm -f /tmp/bench_client.pid"
+    )
+    run_remote_cmd(kill_bg, CLIENT_IP, ignore_error=True)
     # clean
     cleanup_cmd = "kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true"
     run_cmd(cleanup_cmd, ignore_error=False)
 
 def run_migration(experiment_args, container_name):
     """运行迁移命令"""
-    migration_cmd = f"python3 source.py {experiment_args} {container_name} {DEST_IP}"
+    migration_cmd = f"python3 source-cpu-mem-net.py {experiment_args} {container_name} {DEST_IP}"
     print(f"Running migration: {migration_cmd}")
     result = subprocess.run(migration_cmd, shell=True)
     if result.returncode != 0:
@@ -314,6 +347,8 @@ def run_migration(experiment_args, container_name):
     return True
 
 def main():
+    # 使用参数值更新全局变量
+    global SOURCE_IP, DEST_IP, CLIENT_IP
     parser = argparse.ArgumentParser(description="InfluxDB自动化负载测试脚本")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="迁移源IP")
     parser.add_argument("-d", "--dest-ip", default=DEST_IP, help="迁移目标IP")
@@ -338,8 +373,7 @@ def main():
 
     args = parser.parse_args()
 
-    # 使用参数值更新全局变量
-    global SOURCE_IP, DEST_IP, CLIENT_IP
+    
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
@@ -412,7 +446,7 @@ def main():
                         extra_args['--vehicle-pattern'] = args.vehicle_pattern
 
                 # 执行bench和迁移
-                source_run_migration(exp_args, scene_config, extra_args)
+                source_run_migration(exp_args, scene_config, extra_args,args.scene)
                 print(f"Bench test and migration completed successfully for {exp_name} run {run_num}.")
 
                 print(f"Experiment {exp_name}, run {run_num} completed.")

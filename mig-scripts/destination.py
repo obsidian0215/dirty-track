@@ -33,9 +33,41 @@ last_iter = 0
 
 # 确保线程安全
 process_lock = threading.Lock()
-VIP = "192.168.15.100"
+VIP = "192.168.37.150"
 rst_time = 0.0
 vip_transfer_complete = False  # 标记VIP转移是否完成
+
+PRIORITY_RE = re.compile(r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})', re.S)
+KEEPALIVED_CONF = '/etc/keepalived/keepalived.conf'
+KEEPALIVED_BAK  = '/etc/keepalived/keepalived.conf.bak'
+
+def set_keepalived_priority(new_priority, config_path=KEEPALIVED_CONF, backup_path=KEEPALIVED_BAK):
+    # 备份
+    shutil.copy(config_path, backup_path)
+    with open(config_path, 'r') as f:
+        cfg = f.read()
+    new_cfg, cnt = re.subn(PRIORITY_RE, lambda m: f"{m.group(1)}{new_priority}{m.group(3)}", cfg)
+    if cnt == 0:
+        raise RuntimeError("未找到 vrrp_instance VI_1 的 priority 配置段")
+    with open(config_path, 'w') as f:
+        f.write(new_cfg)
+    res = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        # 回滚
+        shutil.copy(backup_path, config_path)
+        subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'])
+        raise RuntimeError(f"reload keepalived 失败: {res.stderr}")
+# 在 handle_restore(msg) 末尾，return reply 之前加：
+def _restore_target_priority_later():
+    try:
+        # 给个缓冲时间，等源端先恢复到 100
+        time.sleep(4.0)   # 可按需调整 1~5 秒
+        set_keepalived_priority(50)  # 恢复到 50（或原值）
+        print(f"目标端优先级已恢复到 50")
+    except Exception as e:
+        print(f"恢复目标端优先级失败: {e}")
+
 
 def prepare(base_path, image_path, parent_path):
     # parent_path为None时，仅准备image_path
@@ -414,7 +446,27 @@ def print_transfer_processes():
         for port, process in transfer_processes.items():
             status = '运行中' if process.poll() is None else f'已结束 (退出码: {process.returncode})'
             print(f"  端口: {port}, PID: {process.pid}, 状态: {status}, 命令: {process.args}")
-
+def _wait_file_stable(path, timeout=10.0, interval=0.1):
+    import os, time
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        if os.path.exists(path):
+            sz = os.path.getsize(path)
+            if last is not None and sz == last:
+                return True
+            last = sz
+        time.sleep(interval)
+    return False
+def _wait_all_transfers_done(timeout=30.0, interval=0.1):
+    end = time.time() + timeout
+    while time.time() < end:
+        with process_lock:
+            alive = [p for p in transfer_processes.values() if p and p.poll() is None]
+        if not alive:
+            return True
+        time.sleep(interval)
+    return False
 def handle_restore(msg):
     """
     处理 restore 命令，由于使用同步传输，传输在迁移过程中已完成，直接执行恢复操作。
@@ -422,6 +474,13 @@ def handle_restore(msg):
     # 检查是否启用了TCP连接迁移，若启用且VIP未迁移则主动迁移
     runc_args_str = msg['restore'].get('runc_args', '')
     needs_vip_transfer = '--tcp-established' in runc_args_str
+    # print(1211111)
+    image_path = msg['restore']['image_path']
+    desc = os.path.join(image_path, "descriptors.json")
+    # 2) 等待 descriptors.json 存在且大小稳定
+    if not _wait_file_stable(desc, timeout=15.0):
+        logger.error("descriptors.json not ready at %s", desc)
+        return "descriptors.json not ready"
 
     if needs_vip_transfer:
         global vip_transfer_complete
@@ -476,6 +535,7 @@ def handle_restore(msg):
     executor.shutdown(wait=False)
     logger.debug("已启动异步进程清理任务")
 
+    threading.Thread(target=_restore_target_priority_later, daemon=True).start()
     return reply
 
 def migrate_server():
@@ -548,6 +608,7 @@ def migrate_server():
                     case {'restore':_}:
                         # 如果所有传输已完成，立即执行恢复
                         # 所有传输指last_iter及之前的传输，和最大端口对应的传输
+                        # time.sleep(1)
                         reply = handle_restore(msg)
                     case _:
                         print("Unknown request: " + msg)

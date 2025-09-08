@@ -20,6 +20,331 @@ import threading
 import signal
 import atexit
 
+
+# ===== Robust Resource Monitor (Patch A + proc-sum fallback) =====
+import datetime
+
+monitor_phase = "idle"
+_monitor_lock = threading.Lock()
+
+def set_phase(p: str):
+    global monitor_phase
+    with _monitor_lock:
+        monitor_phase = p
+
+class ContainerResourceMonitor:
+    """
+    每 interval 采样一次容器与主机资源。
+    - 优先 cgroup 口径：v2: cpu.stat:usage_usec；v1: cpuacct.usage(ns)
+    - 兜底口径：对 cgroup.procs 进程的 utime+stime 求和做差分
+    输出字段：
+      timestamp  rel_s  phase  cpu_pct  mem_MB  host_cpu_pct  host_mem_MB  core_usage  method
+    说明：
+      - core_usage：容器占用的“核数”
+      - cpu_pct  ：相对于“有效 CPU 数”（cpuset）换算后的百分比
+      - method   ：'cgroup' 或 'procsum'（此次样本采用的口径）
+    """
+    def __init__(self, container_name: str, interval: float = 1.0, out_path: str | None = None, include_host: bool = True):
+        self.container = container_name
+        self.interval = interval
+        self.include_host = include_host
+        self.stop_evt = threading.Event()
+        self.thread = None
+        self.start_time = None
+
+        # 采样时间与上次值
+        self._t_prev = None
+        self._cg_prev = None        # cgroup 累计 CPU（usec 或 ns）
+        self._ticks_prev = None     # procsum 累计 ticks
+
+        # 运行时信息
+        self.cg_mode = None         # 'cgv2' / 'cgv1' / None
+        self.cg_cpu_path = None
+        self.cg_mem_path = None
+        self.cg_dir = None
+        self.effective_cpus = None
+        self.hz = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+
+        # 路径
+        base_path = f"/runc/containers/{container_name}/migrate/d_log"
+        os.makedirs(base_path, exist_ok=True)
+        self.out_path = out_path or os.path.join(base_path, "resource_usage.tsv")
+
+        # container init pid
+        with open(f"/run/runc/{container_name}/state.json","r") as f:
+            self.init_pid = int(json.load(f)["init_process_pid"])
+
+        # 检测 cgroup 与有效 CPU 数
+        self._detect_cgroup_paths()
+        self.effective_cpus = self._detect_effective_cpus()
+
+        # 写表头（若为空）
+        if not os.path.exists(self.out_path) or os.path.getsize(self.out_path) == 0:
+            with open(self.out_path,"w") as f:
+                f.write("timestamp\trel_s\tphase\tcpu_pct\tmem_MB\thost_cpu_pct\thost_mem_MB\tcore_usage\tmethod\n")
+
+        # 预热：记录一次“上次值”
+        self._prime()
+
+        # 预热宿主 CPU
+        try:
+            psutil.cpu_percent(None)
+        except Exception:
+            pass
+
+    # ---------- cgroup 检测 ----------
+    def _detect_cgroup_paths(self):
+        try:
+            lines = [ln.strip() for ln in open(f"/proc/{self.init_pid}/cgroup")]
+        except Exception:
+            self.cg_mode = None
+            return
+
+        # v2: 0::/xxx
+        v2_line = next((ln for ln in lines if ln.split(":")[0] == "0"), None)
+        if v2_line:
+            rel = v2_line.split(":",2)[-1]
+            root = "/sys/fs/cgroup"
+            self.cg_mode = "cgv2"
+            self.cg_dir = os.path.join(root, rel.lstrip("/"))
+            self.cg_cpu_path = os.path.join(self.cg_dir, "cpu.stat")
+            self.cg_mem_path = os.path.join(self.cg_dir, "memory.current")
+            return
+
+        # v1: 分别找 cpuacct 与 memory
+        def _find_ctrl(ctrl: str):
+            for ln in lines:
+                parts = ln.split(":")
+                if len(parts)!=3: 
+                    continue
+                ctrls, rel = parts[1], parts[2]
+                if ctrl in ctrls.split(","):
+                    for base in (f"/sys/fs/cgroup/{ctrl}",
+                                 f"/sys/fs/cgroup/{ctrl},cpu",
+                                 f"/sys/fs/cgroup/cpu,{ctrl}"):
+                        full = os.path.join(base, rel.lstrip("/"))
+                        if os.path.exists(full):
+                            return full
+            return None
+
+        mem_dir = _find_ctrl("memory")
+        cpu_dir = _find_ctrl("cpuacct")
+        if mem_dir and cpu_dir:
+            self.cg_mode = "cgv1"
+            self.cg_dir = cpu_dir
+            self.cg_mem_path = os.path.join(mem_dir, "memory.usage_in_bytes")
+            self.cg_cpu_path = os.path.join(cpu_dir, "cpuacct.usage")
+        else:
+            self.cg_mode = None
+
+    # ---------- 有效 CPU 数 ----------
+    @staticmethod
+    def _count_cpus_from_list(s: str) -> int:
+        # "0-3,8" -> 5
+        total = 0
+        for part in s.strip().split(","):
+            if not part: 
+                continue
+            if "-" in part:
+                a,b = part.split("-",1)
+                total += int(b) - int(a) + 1
+            else:
+                total += 1
+        return total
+
+    def _detect_effective_cpus(self) -> int:
+        # 1) cpuset（优先）
+        try:
+            if self.cg_mode == "cgv2" and self.cg_dir:
+                p = os.path.join(self.cg_dir, "cpuset.cpus.effective")
+                if os.path.exists(p):
+                    s = open(p).read().strip()
+                    n = self._count_cpus_from_list(s)
+                    if n>0: return n
+            elif self.cg_mode == "cgv1":
+                # 找到 cpuset 控制器目录
+                with open(f"/proc/{self.init_pid}/cgroup","r") as f:
+                    for ln in f:
+                        ps = ln.strip().split(":")
+                        if len(ps)==3 and "cpuset" in ps[1].split(","):
+                            for root in ("/sys/fs/cgroup/cpuset",
+                                         "/sys/fs/cgroup/cpuset,cpu",
+                                         "/sys/fs/cgroup/cpu,cpuset"):
+                                d = os.path.join(root, ps[2].lstrip("/"))
+                                if os.path.exists(d):
+                                    s = open(os.path.join(d,"cpuset.cpus")).read().strip()
+                                    n = self._count_cpus_from_list(s)
+                                    if n>0: return n
+        except Exception:
+            pass
+        # 2) /proc/<pid>/status (Cpus_allowed_list)
+        try:
+            for ln in open(f"/proc/{self.init_pid}/status"):
+                if ln.startswith("Cpus_allowed_list:"):
+                    s = ln.split(":",1)[1].strip()
+                    n = self._count_cpus_from_list(s)
+                    if n>0: return n
+        except Exception:
+            pass
+        # 3) 退回整机
+        return os.cpu_count() or 1
+
+    # ---------- 读原始累计值 ----------
+    def _read_cgroup_cpu_accum(self):
+        if self.cg_mode == "cgv2":
+            kv = {}
+            with open(self.cg_cpu_path,"r") as f:
+                for ln in f:
+                    sp = ln.split()
+                    if len(sp)==2 and sp[1].isdigit():
+                        kv[sp[0]] = int(sp[1])
+            return kv.get("usage_usec", 0), "usec"
+        elif self.cg_mode == "cgv1":
+            val = int(open(self.cg_cpu_path,"r").read().strip())
+            return val, "ns"
+        else:
+            raise RuntimeError("no cgroup")
+
+    def _read_cgroup_mem_current(self):
+        try:
+            return int(open(self.cg_mem_path,"r").read().strip())
+        except Exception:
+            # 退回进程 RSS 求和
+            return self._sum_procs_rss()
+
+    # ---------- 进程求和 ----------
+    def _list_cgroup_pids(self):
+        if not self.cg_dir:
+            return []
+        procs_file = os.path.join(self.cg_dir, "cgroup.procs" if self.cg_mode=="cgv2" else "tasks")
+        try:
+            return [int(x) for x in open(procs_file).read().split()]
+        except Exception:
+            return []
+
+    def _sum_procs_ticks(self):
+        pids = self._list_cgroup_pids()
+        tot = 0
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat","r") as f:
+                    arr = f.read().split()
+                    ut, st = int(arr[13]), int(arr[14])
+                    tot += ut + st
+            except Exception:
+                continue
+        return tot
+
+    def _sum_procs_rss(self):
+        mem = 0
+        pids = self._list_cgroup_pids()
+        for pid in pids:
+            try:
+                mem += psutil.Process(pid).memory_info().rss
+            except Exception:
+                pass
+        return mem
+
+    # ---------- 预热 ----------
+    def _prime(self):
+        now = time.monotonic()
+        self._t_prev = now
+        # cgroup 原始
+        try:
+            cg_val, _unit = self._read_cgroup_cpu_accum()
+            self._cg_prev = cg_val
+        except Exception:
+            self._cg_prev = None
+        # procsum 原始
+        self._ticks_prev = self._sum_procs_ticks()
+
+    # ---------- 主循环 ----------
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_evt.clear()
+        self.start_time = time.time()
+        self.thread = threading.Thread(target=self._run, name=f"ResMon-{self.container}", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+
+    def _run(self):
+        while not self.stop_evt.wait(self.interval):
+            t_now = time.monotonic()
+            dt = max(1e-6, t_now - self._t_prev)
+            rel = time.time() - self.start_time
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # 1) 先试 cgroup 口径
+            method = "cgroup"
+            core_usage = 0.0
+            cpu_pct = 0.0
+
+            try:
+                cg_now, unit = self._read_cgroup_cpu_accum()
+                if self._cg_prev is not None:
+                    d = max(0, cg_now - self._cg_prev)
+                    secs = d / (1_000_000.0 if unit=="usec" else 1_000_000_000.0)
+                    core_usage = secs / dt
+                    cpu_pct = (core_usage / self.effective_cpus) * 100.0
+                # 更新历史
+                self._cg_prev = cg_now
+            except Exception:
+                # cgroup 口径异常，稍后走 procsum
+                cpu_pct = 0.0
+                core_usage = 0.0
+
+            # 2) 兜底：procsum（如果 cgroup 算出来 ≤ 0，就启用兜底）
+            if core_usage <= 0.0:
+                method = "procsum"
+                ticks_now = self._sum_procs_ticks()
+                if self._ticks_prev is not None:
+                    d_ticks = max(0, ticks_now - self._ticks_prev)
+                    secs = d_ticks / float(self.hz)
+                    core_usage = secs / dt
+                    cpu_pct = (core_usage / self.effective_cpus) * 100.0
+                self._ticks_prev = ticks_now
+
+            # 内存
+            try:
+                mem_bytes = self._read_cgroup_mem_current()
+            except Exception:
+                mem_bytes = self._sum_procs_rss()
+            mem_mb = mem_bytes / (1024*1024)
+
+            # 主机
+            host_cpu = ""
+            host_mem = ""
+            if self.include_host:
+                try:
+                    host_cpu = f"{psutil.cpu_percent(interval=None):.3f}"
+                    host_mem = f"{psutil.virtual_memory().used / (1024*1024):.1f}"
+                except Exception:
+                    host_cpu, host_mem = "", ""
+
+            # 写文件
+            with _monitor_lock:
+                line = (
+                    f"{ts}\t{rel:.1f}\t{monitor_phase}\t"
+                    f"{cpu_pct:.3f}\t{mem_mb:.1f}\t{host_cpu}\t{host_mem}\t"
+                    f"{core_usage:.4f}\t{method}\n"
+                )
+                try:
+                    with open(self.out_path,"a") as f:
+                        f.write(line)
+                except Exception as e:
+                    print(f"[ResMon] write failed: {e}")
+
+            # 下一轮
+            self._t_prev = t_now
+# ===== End Robust Resource Monitor =====
+
+
+
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
 
@@ -546,17 +871,27 @@ def prepare(base_path, image_path, parent_path, work_path):
             pass
     else:
         os.mkdir(base_path)
-    if parent_path:
-        for i in parent_path:
-            os.mkdir(i)
-    if work_path:
-        for i in work_path:
-            os.mkdir(i)
-    os.mkdir(image_path)
-    os.mkdir(base_path + '/d_log')
+    # if parent_path:
+    #     for i in parent_path:
+    #         os.mkdir(i)
+    # if work_path:
+    #     for i in work_path:
+    #         os.mkdir(i)
+    # os.mkdir(image_path)
+    # os.mkdir(base_path + '/d_log'
 
+    # 推荐：
+    if parent_path:
+        for p in parent_path:
+            os.makedirs(p, exist_ok=True)
+    if work_path:
+        for p in work_path:
+            os.makedirs(p, exist_ok=True)
+    os.makedirs(image_path, exist_ok=True)
+    os.makedirs(os.path.join(base_path, 'd_log'), exist_ok=True)
 # 功能函数：获取目录下特定模式文件的总大小
 # pattern: 文件名模式, e.g. "pages*.img"
+
 def getdirsize(path, pattern=None):
     tsize = 0
     if not os.path.exists(path):
@@ -984,6 +1319,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             #         error()
             # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
+        set_phase(f"pre-dump:iter={last_iter}")
         pre_dump(mig_base, container, last_iter, dirtymap)
 
         dir_size = getdirsize(last_path, 'pages')
@@ -1332,7 +1668,7 @@ def migrate(container, dest, pre, post, replay,
                 ret = os.system(mount_cmd)
                 if ret != 0:
                     error()
-
+        set_phase("pre-dump:start")
         # iter pre-dump
         last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
         global pre_dump_iters
@@ -1405,7 +1741,7 @@ def migrate(container, dest, pre, post, replay,
                 print(f"We can transfer within one-shot stop-and-copy")
                 if post:
                     post = False
-
+    set_phase("real dump:checkpoint")
     real_dump(mig_base, pre, post, last_iter, dirtymap, replay, cs, inputs, runc_args)
     # 更新 image/parent 符号链接指向最新的 parent_i
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
@@ -1421,6 +1757,7 @@ def migrate(container, dest, pre, post, replay,
         except Exception as e:
             print(f"创建转储后同步标记失败: {e}")
 
+    set_phase("xfer:final-dump")
     # 传输容器剩余状态
     xfer_final(image_path, dest, compress, port_list[-1])
 
@@ -1462,7 +1799,7 @@ def migrate(container, dest, pre, post, replay,
     # one-shot restore with post-copy
     # Build runc_args string for restore command
     runc_args_str = ' '.join(runc_args) if runc_args else ""
-
+    set_phase("restore:waiting")
     restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "runc_args" : "' + runc_args_str.replace('"', '\\"') + '" } }'
     cs.send(bytes(restore_cmd, encoding='utf-8'))
@@ -1487,6 +1824,7 @@ def migrate(container, dest, pre, post, replay,
             print(f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues")
     #If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
+    set_phase("restored")
     for s in inputready:
         answer = s.recv(1024).decode("utf-8")
         print("answer:",answer)
@@ -1702,9 +2040,22 @@ if __name__ == '__main__':
     rsync_opts = "-az --whole-file"
     ssh_opts = "-o TCPWindowSize=65536 -o SSHBufferSize=65536 -c aes128-ctr"
 
+
+    # 启动资源监控（1s 一次，输出到 migrate/d_log/resource_usage.tsv）
+    resmon = ContainerResourceMonitor(container, interval=1.0, include_host=True)
+    resmon.start()
+    set_phase("prepare")
+
+    try:
+        migrate(container, dest, pre, post, replay, rootfs,
+                max_iter, dirtymap, time_constraint, runc_args)
+    finally:
+        set_phase("done")
+        resmon.stop()
+
     # 开始热迁移
-    migrate(container, dest, pre, post, replay, rootfs,
-                    max_iter, dirtymap, time_constraint, runc_args)
+    # migrate(container, dest, pre, post, replay, rootfs,
+    #                 max_iter, dirtymap, time_constraint, runc_args)
 
 
     print("-----------------------statistics---------------")

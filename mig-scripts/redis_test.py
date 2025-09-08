@@ -5,33 +5,53 @@ import re
 import time
 
 # 默认设置
-SOURCE_IP = "192.168.15.199"
-DEST_IP = "192.168.15.239"
-CLIENT_IP = "192.168.15.181"
-VIP = "192.168.15.100"
+SOURCE_IP = "192.168.37.159"
+DEST_IP = "192.168.37.161"
+CLIENT_IP = "192.168.37.158"
+VIP = "192.168.37.150"
 
 # 场景配置：Redis的video和sensor场景
 scene_configs = {
     'video': {
         'bench': 'experiment/migration/redis/bench_video_cache.py',
         'base_args': {
-            '--redis-host': '127.0.0.1',
+            '--redis-host': '192.168.37.150',
             '--redis-port': '6379',
-            '--threads': '4',
-            '--duration': '10',
-            '--write-pct': '80',
-            '--ttl': '60'
+            '--duration': '120', #
+            '--payload-size-kb': '1'
+            # '--threads': '4',
+            # '--duration': '10',
+            # '--write-pct': '80',
+            # '--ttl': '60'
         }
     },
     'sensor': {
         'bench': 'experiment/migration/redis/bench_sensoragg.py',
         'base_args': {
-            '--redis-host': '127.0.0.1',
+            '--redis-host': '192.168.37.150',
             '--redis-port': '6379',
-            '--threads': '4',
-            '--duration': '30',
             '--payload-size-kb': '2',
-            '--sensors-per-device': '5'
+            '--sensors-per-device': '10',
+            '--read-pct': '0',
+            '--duration': '90', # 90s 
+            '--target-db-size-mb':'120'
+        }
+    },
+    'vehicle': {
+        'bench': 'experiment/migration/redis/bench_cartelem.py',
+        'base_args': {
+            '--redis-host': '192.168.37.150',
+            '--redis-port': '6379',
+            # '--token': 'token',
+            # '--org': 'org',
+            # '--bucket': 'vehicle-data',
+            # '--threads': '4',
+            '--payload-size-kb': '2',
+            # '--size-distribution':'normal',
+            # '--vehicle-pattern': 'highway',
+            '--duration': '90',
+            '--target-db-size-mb':'1000'
+            # '--read-pct': '0'
         }
     }
 }
@@ -233,47 +253,98 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
 
 # 定义实验类型
 experiments = {
-    "pre-copy": "-pre -d --tcp-established --shell-job",
+
+    # "post-copy": "-post -d --tcp-established --shell-job",
+    # "pre-copy": "-pre -d --tcp-established --shell-job",
     "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    "post-copy": "-post -d --tcp-established --shell-job",
-    "hybrid": "-pre -post -d --tcp-established --shell-job",
-    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+    # "hybrid": "-pre -post -d --tcp-established --shell-job",
+    # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
-def source_run_migration(exp_args, scene_config, extra_args):
+def source_run_migration(exp_args, scene_config, extra_args,scene):
     container_name = "redis"
     time.sleep(6)  # 等待容器启动稳定
 
     print("Running bench test on the client machine...")
     run_remote_cmd('pkill -f "python.*bench"', CLIENT_IP, ignore_error=True)
+    run_remote_cmd('rm -f /tmp/bench_client.pid /tmp/bench_run.log || true', CLIENT_IP, ignore_error=True)
 
     # 设置环境变量并执行bench（load）
-    env_setup = "cd /root/dirty-track"
-    bench_cmd = f"python3 {scene_config['bench'].split('/')[-1]} {' '.join([f'{k} {v}' for k, v in extra_args.items()])}"
+    bench_dir = "/root/dirty-track/experiment/migration/redis"
+    bench_file = scene_config['bench'].split('/')[-1]
 
-    full_bench_cmd = f"{env_setup} && {bench_cmd}"
-    run_remote_cmd(full_bench_cmd, CLIENT_IP)
+    def args_to_str(d):
+        return " ".join(f"{k} {v}" for k, v in d.items() if v is not None and v != "")
+
+
+     # --- load 阶段：用 scene_configs 里的 base_args ---
+    if scene != 'video':
+        load_args = extra_args.copy()
+        load_cmd = f"cd {bench_dir} && python3 {bench_file} {args_to_str(load_args)}"
+        run_remote_cmd(load_cmd, CLIENT_IP)
+    # load_args = extra_args.copy()
+    # load_cmd = f"cd {bench_dir} && python3 {bench_file} {args_to_str(load_args)}"
+    # run_remote_cmd(load_cmd, CLIENT_IP)
 
     # 在load和run之间设置网络配置
     configure_network()
     print("Network configuration applied between bench load and run.")
 
-    time.sleep(3)  # 等待bench启动稳定
+
+     # --- run 阶段：覆盖 payload-size-kb / sensors-per-device ---
+    run_args = extra_args.copy()
+    if scene == 'sensor':
+        run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
+        run_args['--sensors-per-device'] = '15' # ★ 你要的新值\
+        run_args['--duration'] = '240'
+        # run_args['--rps'] = '100'
+    if scene == 'vehicle':
+        run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
+        run_args['--size-distribution'] = 'normal' # 
+        run_args['--vehicle-pattern'] = 'highway'
+
+    # run 
+    run_bg_cmd = (
+        f"cd {bench_dir} && "
+        f"nohup python3 {bench_file} {args_to_str(run_args)} "
+        f"> /tmp/bench_run.log 2>&1 & echo $! > /tmp/bench_client.pid"
+    )
+    run_remote_cmd(run_bg_cmd, CLIENT_IP, ignore_error=False)
+    time.sleep(3)
+
 
     # 执行source.py进行迁移
     migration_cmd = f"python3 source.py {exp_args} {container_name} {DEST_IP}"
     run_cmd(migration_cmd)
 
     # clean
+
+    # ---------- 5) 迁移后清理后台 bench ----------
+    # 先温柔 SIGTERM，再强制 SIGKILL（避免残留）
+    kill_bg = (
+        "if [ -f /tmp/bench_client.pid ]; then "
+        "  PID=$(cat /tmp/bench_client.pid) 2>/dev/null; "
+        "  if [ -n \"$PID\" ] && kill -0 $PID 2>/dev/null; then "
+        "    kill $PID 2>/dev/null || true; "
+        "    sleep 0.5; "
+        "    kill -9 $PID 2>/dev/null || true; "
+        "  fi; "
+        "fi; "
+        "rm -f /tmp/bench_client.pid"
+    )
+    run_remote_cmd(kill_bg, CLIENT_IP, ignore_error=True)
+
     cleanup_cmd = "kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true"
     run_cmd(cleanup_cmd, ignore_error=False)
 
 def main():
+    # 使用参数值更新全局变量
+    global SOURCE_IP, DEST_IP, CLIENT_IP
     parser = argparse.ArgumentParser(description="Redis自动化负载测试脚本")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="迁移源IP")
     parser.add_argument("-d", "--dest-ip", default=DEST_IP, help="迁移目标IP")
     parser.add_argument("-c", "--client-ip", default=CLIENT_IP, help="客户端IP")
-    parser.add_argument("--scene", choices=['video', 'sensor'], required=True, help="场景: video或sensor")
+    parser.add_argument("--scene", choices=['video', 'sensor','vehicle'], required=True, help="场景: video或sensor")
     parser.add_argument("--redis-port", type=int, default=6379, help="Redis端口")
     parser.add_argument("--threads", type=int, help="线程数")
     parser.add_argument("--duration", type=int, help="测试时长(s)")
@@ -286,8 +357,7 @@ def main():
                        default=list(experiments.keys()), help="要运行的迁移实验类型，默认全部")
     args = parser.parse_args()
 
-    # 使用参数值更新全局变量
-    global SOURCE_IP, DEST_IP, CLIENT_IP
+    
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
@@ -315,21 +385,31 @@ def main():
                 scene_config = scene_configs[args.scene]
 
                 # 构建额外参数
-                extra_args = {
-                    '--redis-host': args.redis_host,
-                    '--redis-port': args.redis_port,
-                    '--threads': args.threads,
-                    '--duration': args.duration,
-                }
-                if args.scene == 'video':
-                    extra_args['--write-pct'] = args.write_pct
-                    extra_args['--ttl'] = args.ttl
-                elif args.scene == 'sensor':
-                    extra_args['--payload-size-kb'] = args.payload_size_kb
-                    extra_args['--sensors-per-device'] = args.sensors_per_device
+                # extra_args = {
+                #     '--redis-host': args.redis_host,
+                #     '--redis-port': args.redis_port,
+                #     '--threads': args.threads,
+                #     '--duration': args.duration,
+                # }
+
+                # 从场景配置拷贝一份默认参数
+                extra_args = scene_config['base_args'].copy()
+
+                # 如果命令行传了参数，就覆盖默认值
+                # if args.threads is not None:
+                #     extra_args['--threads'] = str(args.threads)
+                # if args.duration is not None:
+                #     extra_args['--duration'] = str(args.duration)
+
+                # if args.scene == 'video':
+                #     extra_args['--write-pct'] = args.write_pct
+                #     extra_args['--ttl'] = args.ttl
+                # elif args.scene == 'sensor':
+                #     extra_args['--payload-size-kb'] = args.payload_size_kb
+                #     extra_args['--sensors-per-device'] = args.sensors_per_device
 
                 # 执行迁移（包含bench测试）
-                source_run_migration(exp_args, scene_config, extra_args)
+                source_run_migration(exp_args, scene_config, extra_args,args.scene)
                 print(f"Bench test and migration completed successfully for {exp_name} run {run_num}.")
 
                 print(f"Experiment {exp_name}, run {run_num} completed.")
@@ -342,6 +422,8 @@ def main():
             finally:
                 # 清理资源（总是清理）
                 print("Cleaning up resources...")
+                 # 清理网络配置
+                clean_configure_network()
                 destination_clean()
                 source_clean()
                 # clean_configure_network()
@@ -349,7 +431,7 @@ def main():
                 # update_keepalived_priority(70)
                 # update_keepalived_priority(30, True, DEST_IP)
 
-                time.sleep(17)  # 等待清理缓冲
+                time.sleep(5)  # 等待清理缓冲
 
         print(f"================ Finished {exp_name} experiment ===============")
 

@@ -5,11 +5,11 @@ import re
 import time
 
 # 默认设置
-SOURCE_IP = "192.168.15.199"
-DEST_IP = "192.168.15.239"
-CLIENT_IP = "192.168.15.181"  # 客户端IP
+SOURCE_IP = "192.168.37.159"
+DEST_IP = "192.168.37.161"
+CLIENT_IP = "192.168.37.158"
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
-VIP = "192.168.15.100"
+VIP = "192.168.37.150"
 
 # 使用argparse解析命令行参数以动态设置
 if __name__ == "__main__":
@@ -33,11 +33,11 @@ if __name__ == "__main__":
 
 # 定义实验类型与参数
 experiments = {
-    "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    "post-copy": "-post -d --tcp-established --shell-job",
+    # "pre-copy": "-pre -d --tcp-established --shell-job",
+    # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    # "post-copy": "-post -d --tcp-established --shell-job",
     "hybrid": "-pre -post -d --tcp-established --shell-job",
-    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+    # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 def run_cmd(cmd, ignore_error=False):
@@ -144,8 +144,9 @@ def source_clean():
     run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True) # 如果容器不存在可忽略错误
-    run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
-    run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
+    # run_cmd(f"rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True) # 如果容器不存在可忽略错误
+    # run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
+    # run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
     """
@@ -462,3 +463,4 @@ if __name__ == "__main__":
                 update_keepalived_priority(70)
                 update_keepalived_priority(30,True,DEST_IP)
             time.sleep(17) #
+            # input()
