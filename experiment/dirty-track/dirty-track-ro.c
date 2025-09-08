@@ -11,9 +11,15 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <time.h>
+#include <signal.h>
 
-// ioctl 常量定义，与内核模块匹配
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20  // Anonymous mapping flag
+#endif
+
+// dirty-track ioctl定义
 #define DIRTY_TRACK_MAGIC 'd'
 #define IOCTL_SET_DIRTY_MAP_PATH _IOW(DIRTY_TRACK_MAGIC, 1, char[256])
 #define IOCTL_START_PID _IOW(DIRTY_TRACK_MAGIC, 2, pid_t)
@@ -377,9 +383,11 @@ pid_t start_soft_dirty_monitoring(pid_t target_pid, const char *output_dir, cons
         setpgid(0, 0);
 
         // 尝试调用soft-dirty程序的不同路径
+        // 从experiment/dirty-track目录向上查找soft-dirty目录
         const char *soft_dirty_paths[] = {
-            "../soft-dirty/soft-dirty",
-            "./soft-dirty",
+            "../soft-dirty/soft-dirty",              // 从dirty-track上级目录查找
+            "../../soft-dirty/soft-dirty",           // 从experiment上级目录查找
+            "../soft-dirty",                         // 程序名在当前soft-dirty目录
             NULL
         };
 

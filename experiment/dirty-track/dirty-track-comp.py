@@ -194,10 +194,12 @@ class ContinuousMemoryTest:
         """Start userspace soft-dirty monitoring"""
         try:
             # Try different paths for soft-dirty executable
+            # From experiment/dirty-track directory, search backward
             soft_dirty_paths = [
-                "../soft-dirty/soft-dirty",
-                "./soft-dirty/soft-dirty",
-                "./soft-dirty"
+                "../soft-dirty/soft-dirty",              # From dirty-track parent directory
+                "../../soft-dirty/soft-dirty",           # From experiment parent directory
+                "../soft-dirty",                         # Just the directory name
+                "soft-dirty"
             ]
 
             executable = None
