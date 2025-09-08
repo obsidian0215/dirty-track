@@ -10,7 +10,6 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/resource.h>
-#include <search.h>
 
 #define MAX_FILENAME_LENGTH 256
 // 页大小
@@ -23,8 +22,10 @@ typedef struct dirty_page {
     unsigned int write_count;
 } dirty_page_t;
 
-// 全局变量：存储平衡树的根节点
-void *root = NULL;
+// 全局变量：存储所有脏页的数组
+dirty_page_t *dirty_pages = NULL;
+size_t dirty_page_count = 0;
+size_t dirty_page_capacity = 0;
 
 // 全局变量：存储上一次 track_dirty_pages 运行的时间（纳秒）
 long last_run_duration_ns = 0;
@@ -101,7 +102,7 @@ int generate_dirty_map_filename(pid_t pid, const char *output_dir, char *filenam
     return 0;
 }
 
-// 比较函数
+// 比较函数，用于qsort按地址升序排序
 int compare_dirty_pages(const void *a, const void *b) {
     const dirty_page_t *page_a = (const dirty_page_t *)a;
     const dirty_page_t *page_b = (const dirty_page_t *)b;
@@ -114,49 +115,43 @@ int compare_dirty_pages(const void *a, const void *b) {
         return 0;
 }
 
-// 添加或更新脏页到平衡树
+// 添加或更新脏页到数组
 void add_or_update_dirty_page(unsigned long address) {
-    dirty_page_t key;
-    key.address = address;
-    key.write_count = 0; // 初始化为0，实际值将在查找后设置
-
-    // 查找节点
-    dirty_page_t **result = (dirty_page_t **)tfind(&key, &root, compare_dirty_pages);
-
-    if (result == NULL) {
-        // 节点不存在，创建新节点
-        dirty_page_t *new_page = malloc(sizeof(dirty_page_t));
-        if (!new_page) {
-            perror("malloc dirty_page");
-            exit(EXIT_FAILURE);
+    // 检查是否已存在于当前数组中
+    for (size_t i = 0; i < dirty_page_count; i++) {
+        if (dirty_pages[i].address == address) {
+            // 已存在，只增加计数
+            dirty_pages[i].write_count++;
+            return;
         }
-        new_page->address = address;
-        new_page->write_count = 1;
-
-        // 插入新节点
-        void *node = tsearch(new_page, &root, compare_dirty_pages);
-        if (node == NULL) {
-            fprintf(stderr, "tsearch failed to insert node\n");
-            free(new_page);
-            exit(EXIT_FAILURE);
-        }
-    } else {
-        // 节点已存在，更新写入计数
-        dirty_page_t *existing_page = *result;
-        existing_page->write_count++;
     }
+
+    // 不存在，需要添加新条目
+    if (dirty_page_count >= dirty_page_capacity) {
+        // 数组已满，扩展容量
+        dirty_page_capacity = dirty_page_capacity == 0 ? 1024 : dirty_page_capacity * 2;
+        dirty_page_t *new_array = realloc(dirty_pages, dirty_page_capacity * sizeof(dirty_page_t));
+        if (!new_array) {
+            perror("realloc dirty_pages");
+            exit(EXIT_FAILURE);
+        }
+        dirty_pages = new_array;
+    }
+
+    // 添加新脏页
+    dirty_pages[dirty_page_count].address = address;
+    dirty_pages[dirty_page_count].write_count = 1;
+    dirty_page_count++;
 }
 
-// 释放平衡树的节点
-void free_dirty_page(void *nodep) {
-    dirty_page_t *page = (dirty_page_t *)nodep;
-    free(page);
-}
-
-// 释放平衡树
-void free_dirty_pages_tree() {
-    tdestroy(root, free_dirty_page);
-    root = NULL;
+// 释放脏页数组
+void free_dirty_pages_array() {
+    if (dirty_pages) {
+        free(dirty_pages);
+        dirty_pages = NULL;
+    }
+    dirty_page_count = 0;
+    dirty_page_capacity = 0;
 }
 
 // 启用 soft-dirty tracking（清除 soft-dirty 位）
@@ -221,13 +216,6 @@ int is_soft_dirty_bulk(pid_t pid, unsigned long start_addr, unsigned long end_ad
     return 0;
 }
 
-// 辅助函数，用于 twalk 的回调，写入文件
-void write_to_file_callback(const void *nodep, const VISIT which, const int depth) {
-    if (which == preorder || which == leaf) {
-        const dirty_page_t *page = *(const dirty_page_t **)nodep;
-        fprintf(global_output_file, "Page address: 0x%lx, Write count: %u\n", page->address, page->write_count);
-    }
-}
 
 // 遍历 /proc/[pid]/maps 并检查 Soft-Dirty 位
 int track_dirty_pages(pid_t pid) {
@@ -269,7 +257,7 @@ int track_dirty_pages(pid_t pid) {
     return 0;
 }
 
-// 将脏页信息写入文件
+// 将脏页信息写入文件（按地址升序排序）
 int write_dirty_pages_to_file(const char *filepath) {
     FILE *file = fopen(filepath, "w");
     if (!file) {
@@ -277,14 +265,16 @@ int write_dirty_pages_to_file(const char *filepath) {
         return -1;
     }
 
-    // 设置全局文件指针
-    global_output_file = file;
+    if (dirty_page_count > 0) {
+        // 按地址升序排序
+        qsort(dirty_pages, dirty_page_count, sizeof(dirty_page_t), compare_dirty_pages);
 
-    // 使用 twalk 进行中序遍历并写入文件
-    twalk(root, write_to_file_callback);
-
-    // 重置全局文件指针
-    global_output_file = NULL;
+        // 写入排序后的结果
+        for (size_t i = 0; i < dirty_page_count; i++) {
+            fprintf(file, "Page address: 0x%lx, Write count: %u\n",
+                   dirty_pages[i].address, dirty_pages[i].write_count);
+        }
+    }
 
     fclose(file);
     return 0;
@@ -311,7 +301,7 @@ int main(int argc, char *argv[]) {
     // 检查是否指定了输出目录
     if (argc >= 3) {
         output_dir = argv[2];
-        printf("Output directory specified: %s\n", output_dir);
+        // printf("Output directory specified: %s\n", output_dir);
     }
 
     if (generate_dirty_map_filename(pid, output_dir, output_file, sizeof(output_file)) != 0) {
@@ -319,7 +309,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Generated filename: %s\n", output_file);
+    // printf("Generated filename: %s\n", output_file);
 
     // 启用 soft-dirty tracking（初始清除）
     if (enable_soft_dirty_tracking(pid) != 0) {
@@ -327,7 +317,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // 设置信号处理器
+    // 设置信号处理器 - 同时处理SIGINT和SIGTERM
     struct sigaction sa;
     sa.sa_handler = handle_sigint;
     sa.sa_flags = 0;
@@ -337,7 +327,13 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Starting dirty page tracking for PID %d. Press Ctrl+C to stop.\n", pid);
+    // 同样设置SIGTERM处理
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction for SIGTERM");
+        return EXIT_FAILURE;
+    }
+
+    printf("[SOFT-DIRTY] Starting dirty page tracking for PID %d. Press Ctrl+C to stop.\n", pid);
 
     unsigned long total_run_duration_ns = 0;
     int i = 1;
@@ -350,6 +346,7 @@ int main(int argc, char *argv[]) {
             perror("clock_gettime");
             break;
         }
+
 
         // 追踪脏页
         if (track_dirty_pages(pid) != 0) {
@@ -398,17 +395,24 @@ int main(int argc, char *argv[]) {
         usleep(sleep_time_us);
     }
 
-    printf("\nStopping dirty page tracking for PID %d.\n", pid);
+    printf("\n[SOFT-DIRTY] Stopping dirty page tracking for PID %d...\n", pid);
+
+    // 检查是否有脏页被发现
+    if (dirty_page_count == 0) {
+        printf("[SOFT-DIRTY] No dirty pages detected during monitoring\n");
+    } else {
+        printf("[SOFT-DIRTY] Dirty pages detected (%zu), preparing to write results...\n", dirty_page_count);
+    }
 
     // 将结果写入文件
     if (write_dirty_pages_to_file(output_file) != 0) {
         fprintf(stderr, "Failed to write dirty pages to file.\n");
     } else {
-        printf("Dirty pages written to %s\n", output_file);
+        printf("[SOFT-DIRTY] Dirty pages written to %s\n", output_file);
     }
 
     // 清理
-    free_dirty_pages_tree();
+    free_dirty_pages_array();
 
     return EXIT_SUCCESS;
 }

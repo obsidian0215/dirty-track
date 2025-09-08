@@ -104,7 +104,7 @@ void run_permission_change_test(void) {
     }
 
     // 等待一段时间观察dirty-track行为
-    sleep(1);
+    sleep(2);
 
     munmap(test_mapping, 4096);
     printf("  Permission change test completed\n");
@@ -247,6 +247,7 @@ int check_device_exists(void) {
 int run_test_scenario(test_scenario_t *scenario, int device_fd, pid_t pid, char *result_dir) {
     printf("\n%s\n", scenario->description);
     printf("--------------------------------------------------\n");
+    printf("Scenario: %s, PID: %d\n", scenario->test_name, pid);
 
     // 为每个场景创建独立的目录
     char scenario_result_dir[512];
@@ -273,7 +274,7 @@ int run_test_scenario(test_scenario_t *scenario, int device_fd, pid_t pid, char 
     }
 
     // 等待准备
-    sleep(1);
+    sleep(2);
 
     // 执行测试
     scenario->test_func();
@@ -302,13 +303,13 @@ int run_test_scenario(test_scenario_t *scenario, int device_fd, pid_t pid, char 
         printf("  [WARN] Failed to start soft-dirty monitoring\n");
     } else {
         // 等待准备
-        sleep(1);
+        sleep(2);
 
         // 重新执行相同的测试
         scenario->test_func();
 
-        // 等待soft-dirty处理
-        sleep(3);
+        // 等待soft-dirty处理（给更多时间来完成监控和写入）
+        sleep(2);
 
         // 停止soft-dirty监控
         stop_soft_dirty_monitoring(soft_dirty_pid);
@@ -394,7 +395,7 @@ pid_t start_soft_dirty_monitoring(pid_t target_pid, const char *output_dir, cons
         int i = 0;
         while (soft_dirty_paths[i]) {
             if (access(soft_dirty_paths[i], X_OK) == 0) {
-                printf("[SOFT-DIRTY] Starting monitoring for PID %d with output dir: %s\n", target_pid, output_dir);
+                printf("Starting soft-dirty for PID %d with output dir: %s\n", target_pid, output_dir);
                 execl(soft_dirty_paths[i], "soft-dirty", pid_str, output_dir, (char *)NULL);
 
                 // 如果execl失败但程序存在
@@ -406,27 +407,16 @@ pid_t start_soft_dirty_monitoring(pid_t target_pid, const char *output_dir, cons
             i++;
         }
 
-        // 如果没有找到可执行文件，执行内置逻辑模拟
+        // 如果没有找到可执行文件，等待5秒后退出
         if (!soft_dirty_paths[i]) {
-            printf("[SOFT-DIRTY] Executable not found, simulating monitoring...\n");
-            // 这里可以添加简单的监控逻辑
-
-            // 简单的实现：每隔一段时间检查进程
+            printf("soft-dirty Executable not found, waiting 5 seconds and exiting...\n");
             sleep(2);
-
-            // 模拟输出文件
-            FILE *sim_file = fopen(output_file, "w");
-            if (sim_file) {
-                fprintf(sim_file, "Page address: 0x7ffc12345678, Write count: 1\n");
-                fprintf(sim_file, "Page address: 0x7ffc1234789a, Write count: 2\n");
-                fclose(sim_file);
-                printf("[SOFT-DIRTY] Simulation completed. Output written to: %s\n", output_file);
-            }
+            printf("soft-dirty Monitoring completed (executable not found)\n");
         }
 
         exit(0);
     } else if (child_pid > 0) {
-        printf("[SOFT-DIRTY] Monitor process started with PID: %d\n", child_pid);
+        printf("soft-dirty Monitor process started with PID: %d\n", child_pid);
         return child_pid;
     } else {
         perror("fork failed for soft-dirty");
@@ -445,7 +435,7 @@ int stop_soft_dirty_monitoring(pid_t monitor_pid) {
         // 等待进程终止
         int status;
         waitpid(monitor_pid, &status, 0);
-        printf("[SOFT-DIRTY] Monitor process stopped\n");
+        printf("soft-dirty Monitor process stopped\n");
         return 0;
     } else {
         perror("Failed to stop soft-dirty process");

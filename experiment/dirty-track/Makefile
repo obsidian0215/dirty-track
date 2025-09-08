@@ -70,22 +70,22 @@ dependencies: check-soft-dirty check-kernel-module
 
 .PHONY: check-soft-dirty
 check-soft-dirty:
-	@if [ ! -f $(SOFT_DIRTY_TARGET) ]; then \
-		echo "Searching for soft-dirty executable or source..."; \
-		if [ -f ../../soft-dirty/soft-dirty.c ]; then \
-			$(CC) $(CFLAGS) -o $(SOFT_DIRTY_TARGET) ../../soft-dirty/soft-dirty.c $(LDFLAGS); \
-			echo "[OK] Built soft-dirty program from source"; \
-		elif [ -x ../../soft-dirty/soft-dirty ] && [ -f ../../soft-dirty/soft-dirty ]; then \
+	@echo "Compiling soft-dirty program from source..."; \
+	if [ -f ../../soft-dirty/soft-dirty.c ]; then \
+		$(CC) $(CFLAGS) -o $(SOFT_DIRTY_TARGET) ../../soft-dirty/soft-dirty.c $(LDFLAGS); \
+		echo "[OK] Built soft-dirty program from source"; \
+	else \
+		echo "[ERROR] Soft-dirty source not found: ../../soft-dirty/soft-dirty.c"; \
+		if [ -x ../../soft-dirty/soft-dirty ] && [ -f ../../soft-dirty/soft-dirty ]; then \
+			echo "[WARN] Found executable but no source - copying existing executable"; \
 			cp ../../soft-dirty/soft-dirty $(SOFT_DIRTY_TARGET); \
 			echo "[OK] Copied soft-dirty executable"; \
 		else \
-			echo "[WARN] Soft-dirty not found in expected locations:"; \
+			echo "[ERROR] Neither source nor executable found in expected locations:"; \
 			echo "   - ../../soft-dirty/soft-dirty.c (source)"; \
 			echo "   - ../../soft-dirty/soft-dirty (executable)"; \
-			echo "   Build it manually: cd ../../soft-dirty && gcc -o soft-dirty soft-dirty.c"; \
+			exit 1; \
 		fi \
-	else \
-		echo "[OK] Soft-dirty program already exists at $(SOFT_DIRTY_TARGET)"; \
 	fi
 
 .PHONY: check-kernel-module

@@ -56,6 +56,8 @@ struct pid_check {
 #define INIT_DELAY 1000000
 // 页表项复位的最大延时，单位为ns --> 1s
 #define MAX_DELAY 1000000000
+// 强制全地址扫描周期
+#define FORCE_SCAN_CYCLE 50
 // 最大可跟踪进程数
 #define MAX_TRACKED_PROCESSES 24
 
@@ -86,6 +88,8 @@ typedef struct dirty_track {
     struct hrtimer timer;                   // 脏页追踪内核线程的高精度定时器
     bool timer_fired;                       // 定时器是否触发
     spinlock_t timer_lock;                  // 保护timer_fired的自旋锁
+    unsigned int cycle_count;               // 清除周期计数
+    bool skip_ro_vmas;                      // 是否跳过只读 VMA 遍历
 
     /* 优先停止任务的相关字段 */
     bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
@@ -617,14 +621,7 @@ static int walk_clear_wp(dirty_track_t *dti, unsigned long start, unsigned long 
 			struct vm_area_struct *vma)
 {
 	int err;
-
-    // if (is_vm_hugetlb_page(vma)) {
-	if (is_vm_hugetlb_page(vma) || (!(vma->vm_flags & VM_WRITE) && dti->soft_cleared)) {
-        err = 0;
-	} else {
-		err = walk_clear_wp_pgd_range(dti, start, end, vma);
-    }
-
+	err = walk_clear_wp_pgd_range(dti, start, end, vma);
 	return err;
 }
 
@@ -656,7 +653,8 @@ static int traverse_vmas(dirty_track_t *dti) {
             vma = find_vma(dti->mm, vma->vm_end);
             // 忽略以下vma：PFN映射、不可写、hugetlb页
             if ((walk_vma->vm_flags & VM_PFNMAP) ||
-                    is_vm_hugetlb_page(walk_vma))
+             (!(walk_vma->vm_flags & VM_WRITE) && dti->skip_ro_vmas) ||
+                is_vm_hugetlb_page(walk_vma))
                 continue;
             err = walk_clear_wp(dti, start, next, walk_vma);
         }
@@ -781,7 +779,6 @@ static int wp_fault_track(void *data) {
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         // dti->track_duration_ns += delta_ns;
-        dti->soft_cleared = true;
         if (delta_ns < INIT_DELAY / 10) {
             default_delay = 9 * delta_ns;
         } else if (delta_ns >= INIT_DELAY / 3) {
@@ -789,7 +786,9 @@ static int wp_fault_track(void *data) {
         } else {
             default_delay = INIT_DELAY;
         }
+        total_ns += delta_ns;
         dti->delay_timer = default_delay;
+        dti->soft_cleared = true;
         // 设置初始定时器超时
         kt = ktime_set(0, default_delay);
         hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
@@ -837,6 +836,13 @@ static int wp_fault_track(void *data) {
                 // 执行定时器到期后的任务
                 dti->dirty_map_updated = false;
                 start = ktime_get();
+                // 计算是否跳过RO VMA: 每50个周期或累计时间超过100ms则遍历一次全地址空间
+                if (dti->cycle_count % FORCE_SCAN_CYCLE == 0 ||
+                    total_ns > 100000000UL) {
+                    dti->skip_ro_vmas = false;
+                } else {
+                    dti->skip_ro_vmas = true;
+                }
                 ret = clear_soft_dirty_once(dti);
                 end = ktime_get();
                 delta_ns = ktime_to_ns(ktime_sub(end, start));
@@ -845,10 +851,10 @@ static int wp_fault_track(void *data) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
                 } else {
-                    // 每2s统计一次平均执行时间
+                    // 每1s统计一次平均执行时间
                     i++;
                     total_ns += delta_ns;
-                    if (total_ns >= 2000000000 || i >=200) {
+                    if (total_ns >= 1000000000 || i >=200) {
                         printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / i);
                         total_ns = 0;
                         i = 1;
@@ -874,6 +880,7 @@ static int wp_fault_track(void *data) {
                 // 启动新的定时器
                 kt = ktime_set(0, dti->delay_timer);
                 hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
+                dti->cycle_count++;  // 每次执行后增加周期计数
             } else {
                 spin_unlock(&dti->timer_lock);
             }
@@ -946,6 +953,8 @@ static int start_dirty_track(pid_t pid) {
     dti->dirty_map_updated = false;
     dti->delay_timer = INIT_DELAY;
     dti->delay_penalty = 1;
+    dti->cycle_count = 0;
+    dti->skip_ro_vmas = false;  // 首次执行时不跳过 RO VMA
 
     // 初始化优先停止任务的相关字段
     dti->stop_requested = false;
