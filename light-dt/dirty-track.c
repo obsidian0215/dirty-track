@@ -57,7 +57,7 @@ struct pid_check {
 // 页表项复位的最大延时，单位为ns --> 1s
 #define MAX_DELAY 1000000000
 // 强制全地址扫描周期
-#define FORCE_SCAN_CYCLE 50
+#define FORCE_SCAN_CYCLE 10
 // 最大可跟踪进程数
 #define MAX_TRACKED_PROCESSES 24
 
@@ -82,7 +82,6 @@ typedef struct dirty_track {
     bool dirty_map_updated;                 // 是否更新过dirty-map
 
     /* clear-soft-dirty循环相关字段 */
-    bool soft_cleared;                      // 是否清除过soft-dirty位
     unsigned long delay_timer;              // 页表项处理延时，单位为ns
     unsigned int delay_penalty;             // 延迟惩罚因子，初始为1
     struct hrtimer timer;                   // 脏页追踪内核线程的高精度定时器
@@ -280,6 +279,11 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
     if (updated && !dti->dirty_map_updated)
         dti->dirty_map_updated = true;
 
+    if (!dti->skip_ro_vmas) {
+        // 不跳过RO VMA，则强制清空soft-dirty位
+        return true;
+    }
+
     return updated;
 }
 
@@ -313,7 +317,12 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
         }
         return true;
     } else {
-        return false;
+        if (!dti->skip_ro_vmas) {
+            // 不跳过RO VMA，则强制清空soft-dirty位
+            return true;
+        }
+        else
+            return false;
     }
 }
 
@@ -386,9 +395,7 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
         //     // spin_unlock(ptl);
         //     goto no_clear;
         // }
-
-        if (dti->soft_cleared)
-            need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);
+        need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);
 
 clear:
         if (need_clear)
@@ -403,10 +410,8 @@ no_clear:
 
     pte = pte_offset_map_lock(dti->mm, pmd, addr, &ptl);
     for (; addr != end; pte++, addr += PAGE_SIZE) {
-        need_clear = true;
         // ptent = ptep_get(pte);
-        if (dti->soft_cleared)
-            need_clear = check_pte_update_dirty_map(dti, pte, addr, vma);
+        need_clear = check_pte_update_dirty_map(dti, pte, addr, vma);
 
         if (need_clear)
             clear_pte_soft_dirty(pte, addr, vma);
@@ -779,16 +784,15 @@ static int wp_fault_track(void *data) {
     if (!ret) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         // dti->track_duration_ns += delta_ns;
-        if (delta_ns < INIT_DELAY / 10) {
-            default_delay = 9 * delta_ns;
-        } else if (delta_ns >= INIT_DELAY / 3) {
-            default_delay = delta_ns + INIT_DELAY;
+        if (delta_ns <= INIT_DELAY / 10) {
+            default_delay = 5 * delta_ns;
+        } else if (delta_ns <= INIT_DELAY / 3) {
+            default_delay = delta_ns + INIT_DELAY / 5;
         } else {
             default_delay = INIT_DELAY;
         }
         total_ns += delta_ns;
         dti->delay_timer = default_delay;
-        dti->soft_cleared = true;
         // 设置初始定时器超时
         kt = ktime_set(0, default_delay);
         hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
@@ -836,9 +840,9 @@ static int wp_fault_track(void *data) {
                 // 执行定时器到期后的任务
                 dti->dirty_map_updated = false;
                 start = ktime_get();
-                // 计算是否跳过RO VMA: 每50个周期或累计时间超过100ms则遍历一次全地址空间
+                // 计算是否跳过RO VMA: 每15个周期或累计时间超过50ms则遍历一次全地址空间
                 if (dti->cycle_count % FORCE_SCAN_CYCLE == 0 ||
-                    total_ns > 100000000UL) {
+                    total_ns > 5000000UL) {
                     dti->skip_ro_vmas = false;
                 } else {
                     dti->skip_ro_vmas = true;
@@ -851,7 +855,7 @@ static int wp_fault_track(void *data) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
                 } else {
-                    // 每1s统计一次平均执行时间
+                    // 每1s或200个周期统计一次平均执行时间
                     i++;
                     total_ns += delta_ns;
                     if (total_ns >= 1000000000 || i >=200) {
@@ -868,12 +872,24 @@ static int wp_fault_track(void *data) {
                     if (dti->delay_timer > MAX_DELAY) {
                         dti->delay_timer = MAX_DELAY;
                     }
-                } else {
+                } else if (!dti->skip_ro_vmas) {
+                    // 强制全扫描后，恢复初始延时和惩罚因子
                     dti->delay_penalty = 1;
                     if (delta_ns < dti->delay_timer / 10) {
-                        dti->delay_timer = 9 * delta_ns;
-                    } else if (delta_ns >= dti->delay_timer / 3) {
-                        dti->delay_timer += delta_ns;
+                        dti->delay_timer = 7 * delta_ns;
+                    } else if (delta_ns <= dti->delay_timer / 3) {
+                        dti->delay_timer = delta_ns + dti->delay_timer / 5;
+                    } else {
+                        dti->delay_timer = min(INIT_DELAY, dti->delay_timer);
+                    }
+                } else {
+                    // 非强制全扫描后，逐步减少延时和惩罚因子
+                    if (dti->delay_penalty > 1)
+                        dti->delay_penalty /= 2;
+                    if (dti->delay_timer > default_delay) {
+                        dti->delay_timer -= default_delay / 10;
+                        if (dti->delay_timer < default_delay)
+                            dti->delay_timer = default_delay;
                     }
                 }
 
@@ -949,7 +965,6 @@ static int start_dirty_track(pid_t pid) {
         return -ENOMEM;
 
     // 初始化控制字段
-    dti->soft_cleared = false;
     dti->dirty_map_updated = false;
     dti->delay_timer = INIT_DELAY;
     dti->delay_penalty = 1;
