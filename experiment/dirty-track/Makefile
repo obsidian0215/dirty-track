@@ -12,7 +12,7 @@ C_TARGETS=user-read-dirtymap user-read-timestamp user-read-warmlist dirty-track-
 PYTHON_SCRIPTS=dirty-track-comp.py python-jit-emu.py
 
 # External dependencies
-SOFT_DIRTY_TARGET=../soft-dirty/soft-dirty
+SOFT_DIRTY_TARGET=../../soft-dirty/soft-dirty
 KERNEL_MODULE_TARGET=/lib/modules/$(shell uname -r)/extra/dirty-track.ko
 
 # Default target
@@ -72,22 +72,17 @@ dependencies: check-soft-dirty check-kernel-module
 check-soft-dirty:
 	@if [ ! -f $(SOFT_DIRTY_TARGET) ]; then \
 		echo "Searching for soft-dirty executable or source..."; \
-		if [ -f ../soft-dirty/soft-dirty.c ] || [ -f ../../soft-dirty/soft-dirty.c ]; then \
-			if [ -f ../soft-dirty/soft-dirty.c ]; then \
-				$(CC) $(CFLAGS) -o $(SOFT_DIRTY_TARGET) ../soft-dirty/soft-dirty.c $(LDFLAGS); \
-			else \
-				$(CC) $(CFLAGS) -o $(SOFT_DIRTY_TARGET) ../../soft-dirty/soft-dirty.c $(LDFLAGS); \
-			fi; \
+		if [ -f ../../soft-dirty/soft-dirty.c ]; then \
+			$(CC) $(CFLAGS) -o $(SOFT_DIRTY_TARGET) ../../soft-dirty/soft-dirty.c $(LDFLAGS); \
 			echo "[OK] Built soft-dirty program from source"; \
-		elif [ -x ../soft-dirty/soft-dirty ] && [ -f ../soft-dirty/soft-dirty ]; then \
-			cp ../soft-dirty/soft-dirty $(SOFT_DIRTY_TARGET); \
+		elif [ -x ../../soft-dirty/soft-dirty ] && [ -f ../../soft-dirty/soft-dirty ]; then \
+			cp ../../soft-dirty/soft-dirty $(SOFT_DIRTY_TARGET); \
 			echo "[OK] Copied soft-dirty executable"; \
 		else \
 			echo "[WARN] Soft-dirty not found in expected locations:"; \
-			echo "   - ../soft-dirty/soft-dirty.c"; \
-			echo "   - ../../soft-dirty/soft-dirty.c"; \
-			echo "   - ../soft-dirty/soft-dirty"; \
-			echo "   Build it manually: cd /path/to/soft-dirty && gcc -o soft-dirty soft-dirty.c"; \
+			echo "   - ../../soft-dirty/soft-dirty.c (source)"; \
+			echo "   - ../../soft-dirty/soft-dirty (executable)"; \
+			echo "   Build it manually: cd ../../soft-dirty && gcc -o soft-dirty soft-dirty.c"; \
 		fi \
 	else \
 		echo "[OK] Soft-dirty program already exists at $(SOFT_DIRTY_TARGET)"; \
@@ -181,8 +176,8 @@ help-build:
 	@echo "  - Root access for kernel module loading"
 	@echo ""
 	@echo "## External Dependencies:"
-	@echo "  - dirty-track kernel module (in ../light-dt/)"
-	@echo "  - soft-dirty userspace tool (in ../soft-dirty/)"
+	@echo "  - dirty-track kernel module (in ../../light-dt/)"
+	@echo "  - soft-dirty userspace tool (in ../../soft-dirty/)"
 	@echo ""
 	@echo "## Build Process:"
 	@echo "  1. make dependencies     # Check and build external tools"
@@ -193,9 +188,9 @@ help-run:
 	@echo "RUNTIME HELP:"
 	@echo "============="
 	@echo "## Before Running Tests:"
-	@echo "  sudo make -C ../light-dt install    # Load kernel module"
-	@echo "  lsmod | grep dirty_track            # Confirm module loaded"
-	@echo "  ls -la /dev/dirty-track             # Confirm device file"
+	@echo "  sudo make -C ../../light-dt install   # Load kernel module"
+	@echo "  lsmod | grep dirty_track              # Confirm module loaded"
+	@echo "  ls -la /dev/dirty-track               # Confirm device file"
 	@echo ""
 	@echo "## Test Execution:"
 	@echo "  make test-comprehensive             # Full comparison test"
@@ -211,8 +206,8 @@ help-clean:
 	@echo "==========="
 	@echo "## Cleaning Build Artifacts:"
 	@echo "  make clean                      # Remove built programs"
-	@echo "  sudo make -C ../light-dt clean # Clean kernel module"
-	@echo "  rm -rf /tmp/dirty-memory-test   # Remove test results"
+	@echo "  sudo make -C ../../light-dt clean # Clean kernel module"
+	@echo "  rm -rf /tmp/dirty-memory-test    # Remove test results"
 	@echo ""
 	@echo "## Full Cleanup:"
 	@echo "  make distclean                 # Remove everything"
@@ -240,7 +235,7 @@ clean-all: clean clean-results clean-kernel
 
 distclean: clean-all
 	@echo "Full cleanup completed"
-	@echo "Note: External tools in ../soft-dirty/ and ../light-dt/ not cleaned"
+	@echo "Note: External tools in ../../soft-dirty/ and ../../light-dt/ not cleaned"
 
 # Status and information
 .PHONY: status info version
@@ -249,7 +244,7 @@ status:
 	@echo "===================================="
 	@echo "C Programs:"
 	@for prog in $(C_TARGETS); do \
-		if [ -f $$prog ]; then echo "  ✓ $$prog (built)"; \
+		if [ -f $$prog ]; then echo "  [OK] $$prog (built)"; \
 		else echo "  [NOT BUILT] $$prog (not built)"; fi; \
 	done
 	@echo "Python Scripts:"
