@@ -64,8 +64,8 @@ int ioctl_stop_tracking(int fd, pid_t pid) {
 typedef struct {
     char test_name[64];
     char description[256];
-    int expected_dirty_pages;
-    void (*test_func)(void);
+    int cycles;
+    void (*test_func)(int cycles);
 } test_scenario_t;
 
 // 结果统计
@@ -80,7 +80,7 @@ typedef struct {
 } test_result_t;
 
 // 测试场景1：权限变化测试
-void run_permission_change_test(void) {
+void run_permission_change_test(int cycles) {
     printf("\n[Test] EXECUTING PERMISSION CHANGE TEST\n");
 
     void *test_mapping = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -91,32 +91,66 @@ void run_permission_change_test(void) {
     }
 
     printf("  Created readonly mapping at %p\n", test_mapping);
+    printf("  Running with %d cycles for dirty page generation\n", cycles);
 
-    // 验证映射是否可访问 - 这里不会写入，但会触发 dirty-track 的权限监控
-    printf(" Mapping is accessible, proceeding with permission change\n");
-
-    // 改变权限为可写，但不写入
-    if (mprotect(test_mapping, 4096, PROT_READ | PROT_WRITE) == 0) {
-        printf("  Changed permission to writable\n");
-        printf("  NOTE: No actual write operation performed\n");
-    } else {
-        perror("  Failed to change permission");
+    // 第一阶段：将权限改为可写以建立页表项
+    printf("  Phase 1: Change to writable to establish page table entries\n");
+    if (mprotect(test_mapping, 4096, PROT_READ | PROT_WRITE) != 0) {
+        perror("    Failed to change permission to read-write for PTE setup");
+        munmap(test_mapping, 4096);
+        return;
     }
 
-    // 等待一段时间观察dirty-track行为
-    sleep(2);
+    // 建立页表项的写操作
+    char *ptr = (char *)test_mapping;
+    for (int page = 0; page < 1; page++) {  // 只写第一页以建立页表项
+        ptr[page] = 'A';  // 写入一个字节
+        printf("    Wrote byte 0x%02x at offset %d\n", ptr[page], page);
+    }
+
+    // 改变权限为只读 (模拟实时权限变化)
+    printf("  Phase 2: Changing permissions to read-only\n");
+    if (mprotect(test_mapping, 4096, PROT_READ) == 0) {
+        printf("    Changed permission to readonly\n");
+    } else {
+        perror("    Failed to change permission to readonly");
+        munmap(test_mapping, 4096);
+        return;
+    }
+
+    // 第二阶段：大量循环写入以触发dirty-tracking
+    printf("  Phase 3: Cyclic write operations to trigger dirty tracking\n");
+    if (mprotect(test_mapping, 4096, PROT_READ | PROT_WRITE) == 0) {
+        printf("    Changed permission back to read-write for dirty-tracking\n");
+
+        // 执行指定次数（cycles）的写入循环
+        for (int cycle = 0; cycle < cycles; cycle++) {
+            int offset = cycle % 4096;
+            ptr[offset] = (char)(cycle % 256);
+            if (cycle < 10 || cycle % (cycles / 10 + 1) == 0) {  // 自适应显示进度
+                printf("    Cycle %d: Wrote 0x%02x at offset %d\n", cycle + 1, ptr[offset], offset);
+            }
+        }
+        printf("    Completed %d write cycles to generate dirty pages\n", cycles);
+    } else {
+        perror("    Failed to change permission to read-write");
+        munmap(test_mapping, 4096);
+        return;
+    }
+
+    sleep(1);  // 短暂等待确保light-dt处理完成
 
     munmap(test_mapping, 4096);
-    printf("  Permission change test completed\n");
+    printf("  Permission change test completed with %d dirty writes\n", cycles);
 }
 
 // 测试场景2：JIT代码修改测试
-void run_jit_code_test(void) {
+void run_jit_code_test(int cycles) {
     printf("\n[Test] EXECUTING JIT CODE MODIFICATION TEST\n");
 
     // 创建RWX内存（JIT样式）
     void *code_mapping = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code_mapping == MAP_FAILED) {
         perror("Failed to create code mapping");
         printf("  [WARN] RWX mmap failed, skipping JIT simulation\n");
@@ -124,6 +158,7 @@ void run_jit_code_test(void) {
     }
 
     printf("  Created RWX mapping at %p\n", code_mapping);
+    printf("  Running JIT test with %d optimization cycles\n", cycles);
 
     // 构建简单的x86-64指令序列
     unsigned char machine_code[] = {
@@ -131,41 +166,87 @@ void run_jit_code_test(void) {
         0xC3                                            // ret
     };
 
-    // 写入初始代码
-    memcpy(code_mapping, machine_code, sizeof(machine_code));
-    printf("  Wrote initial machine code (mov rax, 42; ret)\n");
-
-    // 模拟JIT优化 - 修改立即数
+    // 第一阶段：多代码段写入
+    printf("  Phase 1: Writing multiple code segments\n");
     unsigned char *code_ptr = (unsigned char *)code_mapping;
-    code_ptr[3] = 0x64;  // 42 -> 100 (0x64)
-    code_ptr[4] = 0x00;
-    code_ptr[5] = 0x00;
-    code_ptr[6] = 0x00;
+    const int NUM_SEGMENTS = 10;
 
-    printf("  Simulated JIT optimization (changed to mov rax, 100)\n");
+    // 确保页表项建立 - 先写入一个字节
+    code_ptr[0] = machine_code[0];
+    printf("    Initial byte written to establish PTE\n");
 
-    // 移除执行权限（模拟JIT完成）
-    if (mprotect(code_mapping, 4096, PROT_READ | PROT_WRITE) == 0) {
-        printf("  Changed to read-write only (JIT completion)\n");
+    // 写入初始代码段
+    for (int i = 0; i < NUM_SEGMENTS; i++) {
+        memcpy(code_ptr + i * sizeof(machine_code), machine_code, sizeof(machine_code));
+        if (i < 5) {  // 只打印前5个
+            printf("    Copied machine code segment %d\n", i + 1);
+        }
+    }
+    printf("    Total: %d code segments prepared\n", NUM_SEGMENTS);
+
+    // 第二阶段：JIT优化循环
+    printf("  Phase 2: JIT optimization loops\n");
+
+    for (int cycle = 0; cycle < cycles; cycle++) {
+        // 选择一个代码段进行修改
+        int segment_idx = cycle % NUM_SEGMENTS;
+        unsigned char *segment_start = code_ptr + segment_idx * sizeof(machine_code);
+        unsigned long new_value = cycle + 42;  // 从42开始递增
+
+        // 修改指令中的立即数
+        segment_start[0] = 0x48;  // mov rax, imm64
+        segment_start[1] = 0xC7;
+        segment_start[2] = 0xC0;
+        segment_start[3] = (new_value >> 0) & 0xFF;   // 低8位
+        segment_start[4] = (new_value >> 8) & 0xFF;   // 8-15位
+        segment_start[5] = (new_value >> 16) & 0xFF;  // 16-23位
+        segment_start[6] = (new_value >> 24) & 0xFF;  // 24-31位
+        segment_start[7] = 0xC3;  // ret
+
+        if (cycle < 5 || cycle % (cycles / 10 + 1) == 0) {  // 自适应显示进度
+            printf("    JIT Cycle %d: Modified segment %d to mov rax, %lu\n",
+                   cycle + 1, segment_idx, new_value);
+        }
     }
 
+    printf("  Completed %d JIT optimization loops across %d code segments\n",
+           cycles, NUM_SEGMENTS);
+
+    // 第三阶段：最终权限调整模拟JIT完成
+    printf("  Phase 3: Final permission adjustments\n");
+    if (mprotect(code_mapping, 4096, PROT_READ | PROT_WRITE) == 0) {
+        printf("    Changed to read-write only (JIT completion)\n");
+
+        // 最后几轮只读修改，观察权限变化对dirty-tracking的影响
+        const int FINAL_WRITES = 10;
+        for (int final_write = 0; final_write < FINAL_WRITES; final_write++) {
+            code_ptr[final_write] = (unsigned char)final_write;
+            printf("    Final modification %d: Wrote 0x%02x at position %d\n",
+                   final_write + 1, final_write, final_write);
+        }
+        printf("    Added %d final modifications\n", FINAL_WRITES);
+    }
+
+    sleep(1);  // 短暂等待确保light-dt处理完成
+
     munmap(code_mapping, 4096);
-    printf("  JIT code modification test completed\n");
+    printf("  JIT code modification test completed with %d optimizations\n",
+           cycles + 10);
 }
 
 // 测试场景定义
 test_scenario_t test_scenarios[] = {
     {
         "permission-change",
-        "Testing permission changes on readonly memory areas",
-        0,
-        run_permission_change_test
+        "Testing permission changes with cyclic writes",
+        0,  // cycles will be set dynamically
+        NULL // test_func will be set dynamically
     },
     {
         "jit-code-modification",
-        "Testing JIT-style code generation and modification monitoring",
-        1,
-        run_jit_code_test
+        "Testing JIT-style code generation with optimization loops",
+        0,  // cycles will be set dynamically
+        NULL // test_func will be set dynamically
     }
 };
 
@@ -273,11 +354,8 @@ int run_test_scenario(test_scenario_t *scenario, int device_fd, pid_t pid, char 
         return -1;
     }
 
-    // 等待准备
-    sleep(2);
-
     // 执行测试
-    scenario->test_func();
+    scenario->test_func(scenario->cycles);
 
     // 等待light-dt处理
     sleep(2);
@@ -302,11 +380,9 @@ int run_test_scenario(test_scenario_t *scenario, int device_fd, pid_t pid, char 
     if (soft_dirty_pid < 0) {
         printf("  [WARN] Failed to start soft-dirty monitoring\n");
     } else {
-        // 等待准备
-        sleep(2);
 
         // 重新执行相同的测试
-        scenario->test_func();
+        scenario->test_func(scenario->cycles);
 
         // 等待soft-dirty处理（给更多时间来完成监控和写入）
         sleep(2);
@@ -357,15 +433,16 @@ int analyze_comparison_results(char *result_dir) {
 
         printf(" Light-dt files: %d", light_dt_files);
         printf(" | Soft-dirty files: %d", soft_dirty_files);
-        printf(" | Expected dirty pages: %d", scenario->expected_dirty_pages);
+        printf(" | Cycles used: %d", scenario->cycles);
         printf(" | %s", scenario->description);
     }
 
     printf("\n\n RECOMMENDATIONS:\n");
-    printf("   - Compare actual dirty page counts vs expected\n");
-    printf("   - Check if permission changes alone trigger monitoring\n");
-    printf("   - Verify JIT-style code modifications are captured\n");
-    printf("   - Analyze performance characteristics of each scenario\n");
+    printf("   - Compare actual dirty page counts vs expected high-volume writes\n");
+    printf("   - Check if cyclic write patterns are properly tracked\n");
+    printf("   - Verify JIT-style sequential modifications are captured\n");
+    printf("   - Compare light-dt vs soft-dirty detection accuracy with real memory access\n");
+    printf("   - Analyze the impact of page table entry establishment timing\n");
 
     return 0;
 }
@@ -448,10 +525,27 @@ int main(int argc, char *argv[]) {
     pid_t test_pid = getpid();
     char result_dir[512];
 
-    setuid(getuid());  // 确保不是 root 权限
+    // 解析命令行参数，设置循环次数
+    int cycles = 20;  // 默认循环次数
+
+    if (argc >= 2) {
+        cycles = atoi(argv[1]);
+        if (cycles <= 0) {
+            printf("Invalid cycle count: %s, using default: %d\n", argv[1], 50);
+            cycles = 20;
+        }
+    }
+
+    // 动态设置测试场景参数
+    test_scenarios[0].cycles = cycles;
+    test_scenarios[0].test_func = run_permission_change_test;
+    test_scenarios[1].cycles = cycles;
+    test_scenarios[1].test_func = run_jit_code_test;
 
     printf("[DIRTY-TRACK] MONITORING METHOD COMPARISON TEST\n");
     printf("Comparing kernel-based (light-dt) vs userspace (soft-dirty) dirty tracking\n");
+    printf("Test cycles per scenario: %d (default: %d)\n", cycles, 50);
+    printf("Usage: %s [cycles]\n", argv[0]);
     printf("Test scenarios: permission-change vs JIT code modification\n");
     printf("======================================================================\n");
     printf("\n");

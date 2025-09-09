@@ -52,12 +52,12 @@ struct pid_check {
 #define IOCTL_CHECK_PID _IOWR(DIRTY_TRACK_MAGIC, 4, struct pid_check)
 #define IOCTL_GET_DIRTY_MAP_PATH _IOR(DIRTY_TRACK_MAGIC, 5, char[256])
 
-// 页表项复位的初始延时，单位为ns --> 1ms
-#define INIT_DELAY 1000000
-// 页表项复位的最大延时，单位为ns --> 1s
-#define MAX_DELAY 1000000000
+// 页表项复位的初始延时，单位为ns --> 60us
+#define INIT_DELAY 600000
+// 页表项复位的最大延时，单位为ns --> 600ms
+#define MAX_DELAY 600000000
 // 强制全地址扫描周期
-#define FORCE_SCAN_CYCLE 10
+#define FORCE_SCAN_CYCLE 5
 // 最大可跟踪进程数
 #define MAX_TRACKED_PROCESSES 24
 
@@ -87,8 +87,8 @@ typedef struct dirty_track {
     struct hrtimer timer;                   // 脏页追踪内核线程的高精度定时器
     bool timer_fired;                       // 定时器是否触发
     spinlock_t timer_lock;                  // 保护timer_fired的自旋锁
-    unsigned int cycle_count;               // 清除周期计数
-    bool skip_ro_vmas;                      // 是否跳过只读 VMA 遍历
+    bool skip_ro_vmas;                      // 是否跳过只读VMA
+    bool first_scan;                        // 是否为首次扫描
 
     /* 优先停止任务的相关字段 */
     bool stop_requested;                    // 指示clear_soft_dirty循环停止的标志
@@ -250,41 +250,66 @@ static inline bool check_pmd_update_dirty_map(dirty_track_t *dti, pmd_t *pmdp,
     unsigned long pmd_start = addr;
     unsigned long pmd_end = addr + PMD_SIZE; // PMD_SIZE通常为2MB
     unsigned long page_addr;
-    bool updated = false;
 
-    if ((pmd_present(pmd) && pmd_soft_dirty(pmd)) || (is_swap_pmd(pmd) && pmd_swp_soft_dirty(pmd))) {
-        for (page_addr = pmd_start; page_addr < pmd_end; page_addr += PAGE_SIZE) {
-            dirty_address_t *addr_dirty;
+    if (pmd_present(pmd)) {
+        if (pmd_soft_dirty(pmd)) {
+            if (!dti->dirty_map_updated)
+                dti->dirty_map_updated = true;
 
-            // 从xarray中加载对应4K页面的记录
-            addr_dirty = xa_load(&dti->dirty_xarray, page_addr);
-            if (addr_dirty) {
-                // 写入错误次数加1
-                addr_dirty->write_count++;
-            } else {
-                // 初始化新的4K页记录并加入xarray
-                addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
-                if (!addr_dirty) {
-                    printk(KERN_ERR "No memory for new entry of dirty-map.\n");
-                    return true;
+            // Process all sub-pages within the huge page
+            for (page_addr = pmd_start; page_addr < pmd_end; page_addr += PAGE_SIZE) {
+                if (page_addr < pmd_end && page_addr >= vma->vm_start && page_addr < vma->vm_end) {
+                    dirty_address_t *addr_dirty;
+
+                    addr_dirty = xa_load(&dti->dirty_xarray, page_addr);
+                    if (addr_dirty) {
+                        addr_dirty->write_count++;
+                    } else {
+                        addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
+                        if (!addr_dirty) {
+                            pr_err("Failed to allocate dirty-address entry for huge page\n");
+                            return true;
+                        }
+                        addr_dirty->write_count = 1;
+                        xa_store(&dti->dirty_xarray, page_addr, addr_dirty, GFP_KERNEL);
+                    }
                 }
-                addr_dirty->write_count = 1;
-                xa_store(&dti->dirty_xarray, page_addr, addr_dirty, GFP_KERNEL);
             }
-
-            updated = true;
+            return true;
         }
     }
+    // Handle swap entries for PMD level
+    else if (is_swap_pmd(pmd)) {
+        if (pmd_swp_soft_dirty(pmd)) {
+            if (!dti->dirty_map_updated)
+                dti->dirty_map_updated = true;
 
-    if (updated && !dti->dirty_map_updated)
-        dti->dirty_map_updated = true;
+            // Handle huge migration page writes
+            for (page_addr = pmd_start; page_addr < pmd_end; page_addr += PAGE_SIZE) {
+                if (page_addr < pmd_end && page_addr >= vma->vm_start && page_addr < vma->vm_end) {
+                    dirty_address_t *addr_dirty;
 
-    if (!dti->skip_ro_vmas) {
-        // 不跳过RO VMA，则强制清空soft-dirty位
+                    addr_dirty = xa_load(&dti->dirty_xarray, page_addr);
+                    if (!addr_dirty) {
+                        addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
+                        if (!addr_dirty)
+                            break;
+                        addr_dirty->write_count = 1;
+                        xa_store(&dti->dirty_xarray, page_addr, addr_dirty, GFP_KERNEL);
+                    } else {
+                        addr_dirty->write_count++;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    // 不跳过RO VMA，则强制清空soft-dirty位
+    else if (!dti->skip_ro_vmas) {
         return true;
     }
 
-    return updated;
+    return false;
 }
 
 // 检查pte的soft dirty标志位是否设置
@@ -295,35 +320,58 @@ static inline bool check_pte_update_dirty_map(dirty_track_t *dti, pte_t *ptep,
     pte_t pte = *ptep;
     dirty_address_t *addr_dirty;
 
-    if ((pte_present(pte) && pte_soft_dirty(pte)) || (is_swap_pte(pte) && pte_swp_soft_dirty(pte))) {
-        // 标记dirty-map被更新
-        if (!dti->dirty_map_updated)
-            dti->dirty_map_updated = true;
+ // Regular present pages
+    if (pte_present(pte)) {
+        if (pte_soft_dirty(pte)) {
+            // Mark dirty-map as updated
+            if (!dti->dirty_map_updated)
+                dti->dirty_map_updated = true;
 
-        // 从pid对应的xarray中查找该地址对应页的写错误次数
-        addr_dirty = xa_load(&dti->dirty_xarray, addr);
-        if (addr_dirty) {
-            // 此次页错误为soft-dirty，则写错误次数+1
-            addr_dirty->write_count++;
-        } else {
-            // 初始化新的页记录并加入dirty-map
-            addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
-            if (!addr_dirty) {
-                printk(KERN_ERR "No memory for new entry of dirty-map.\n");
-                return true;
+            // Update dirty-map entry
+            addr_dirty = xa_load(&dti->dirty_xarray, addr);
+            if (addr_dirty) {
+                addr_dirty->write_count++;
+            } else {
+                addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
+                if (!addr_dirty) {
+                    pr_err("Failed to allocate dirty-address entry\n");
+                    return true;
+                }
+                addr_dirty->write_count = 1;
+                xa_store(&dti->dirty_xarray, addr, addr_dirty, GFP_KERNEL);
             }
-            addr_dirty->write_count = 1;
-            xa_store(&dti->dirty_xarray, addr, addr_dirty, GFP_KERNEL);
-        }
-        return true;
-    } else {
-        if (!dti->skip_ro_vmas) {
-            // 不跳过RO VMA，则强制清空soft-dirty位
             return true;
         }
-        else
-            return false;
     }
+    // Handle swap pages
+    else if (is_swap_pte(pte)) {
+        // swp_entry_t swp_entry = pte_to_swp_entry(pte);
+
+        // Check if swap PTE has soft-dirty bit set
+        if (pte_swp_soft_dirty(pte)) {
+            if (!dti->dirty_map_updated)
+                dti->dirty_map_updated = true;
+
+            // Handle swap page write tracking
+            addr_dirty = xa_load(&dti->dirty_xarray, addr);
+            if (!addr_dirty) {
+                addr_dirty = kzalloc(sizeof(*addr_dirty), GFP_KERNEL);
+                if (!addr_dirty)
+                    return false;
+                addr_dirty->write_count = 1;
+                xa_store(&dti->dirty_xarray, addr, addr_dirty, GFP_KERNEL);
+            } else {
+                addr_dirty->write_count++;
+            }
+            return true;
+        }
+    }
+    // 不跳过RO VMA，则强制清空soft-dirty位
+    else if (!dti->skip_ro_vmas) {
+        return true;
+    }
+
+    return false;
 }
 
 /* clear soft-dirty's */
@@ -361,6 +409,15 @@ static inline void clear_pte_soft_dirty(pte_t *pte, unsigned long addr,
 
 		if (pte_is_pinned(vma, addr, ptent))
 			return;
+
+        // 添加详细日志
+        // if (pte_soft_dirty(ptent)) {
+        //     bool vm_readonly = !(vma->vm_flags & VM_WRITE);
+        //     if (vm_readonly) {
+        //         printk("%s [PID %d] Clearing RO page soft-dirty: addr=0x%lx, vm_flags=0x%x\n",
+        //                __func__, current->pid, addr, vma->vm_flags);
+        //     }
+        // }
 		old_pte = ptep_modify_prot_start(vma, addr, pte);
 		ptent = pte_wrprotect(old_pte);
 		ptent = pte_clear_soft_dirty(ptent);
@@ -395,10 +452,12 @@ static int handle_pmd_range_wp(pmd_t *pmd, unsigned long addr,
         //     // spin_unlock(ptl);
         //     goto no_clear;
         // }
-        need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);
+        // 首次扫描时，强制清除所有pmd的soft-dirty位
+        if (!dti->first_scan)
+            need_clear = check_pmd_update_dirty_map(dti, pmd, addr, vma);
 
 clear:
-        if (need_clear)
+        if (need_clear || dti->first_scan)
             clear_pmd_soft_dirty(pmd, addr, vma);
 no_clear:
         spin_unlock(ptl);
@@ -411,9 +470,10 @@ no_clear:
     pte = pte_offset_map_lock(dti->mm, pmd, addr, &ptl);
     for (; addr != end; pte++, addr += PAGE_SIZE) {
         // ptent = ptep_get(pte);
-        need_clear = check_pte_update_dirty_map(dti, pte, addr, vma);
-
-        if (need_clear)
+        if (!dti->first_scan)
+            need_clear = check_pte_update_dirty_map(dti, pte, addr, vma);
+        // 首次扫描时，强制清除所有pte的soft-dirty位
+        if (need_clear || dti->first_scan)
             clear_pte_soft_dirty(pte, addr, vma);
     }
     pte_unmap_unlock(pte - 1, ptl);
@@ -766,7 +826,7 @@ static void post_kthread_stop(dirty_track_t *dti) {
 static int wp_fault_track(void *data) {
     dirty_track_t *dti = (dirty_track_t *)data;
     pid_t pid = dti->pid;
-    int ret = 0, i = 1;
+    int ret = 0, cycle = 1, i = 1;
     unsigned long default_delay;
     ktime_t start, end, kt;
     s64 delta_ns, total_ns = 0;
@@ -785,13 +845,14 @@ static int wp_fault_track(void *data) {
         printk(KERN_INFO "[PID %d]first clear_soft_dirty_once's execution time: %lld ns\n", pid, delta_ns);
         // dti->track_duration_ns += delta_ns;
         if (delta_ns <= INIT_DELAY / 10) {
-            default_delay = 5 * delta_ns;
+            default_delay = 9 * delta_ns;
         } else if (delta_ns <= INIT_DELAY / 3) {
             default_delay = delta_ns + INIT_DELAY / 5;
         } else {
             default_delay = INIT_DELAY;
         }
         total_ns += delta_ns;
+        dti->first_scan = false;
         dti->delay_timer = default_delay;
         // 设置初始定时器超时
         kt = ktime_set(0, default_delay);
@@ -840,10 +901,12 @@ static int wp_fault_track(void *data) {
                 // 执行定时器到期后的任务
                 dti->dirty_map_updated = false;
                 start = ktime_get();
-                // 计算是否跳过RO VMA: 每15个周期或累计时间超过50ms则遍历一次全地址空间
-                if (dti->cycle_count % FORCE_SCAN_CYCLE == 0 ||
-                    total_ns > 5000000UL) {
+                // 计算是否跳过RO VMA: 每5次遍历或累计遍历1ms则遍历一次全地址空间
+                if (cycle % FORCE_SCAN_CYCLE == 0 ||
+                    total_ns > i * 100000UL) {
                     dti->skip_ro_vmas = false;
+                    if (total_ns > i * 100000UL)
+                        i++;
                 } else {
                     dti->skip_ro_vmas = true;
                 }
@@ -855,48 +918,55 @@ static int wp_fault_track(void *data) {
                     printk(KERN_ERR "[PID %d]clear_soft_dirty_once encountered an error: %d\n", dti->pid, ret);
                     break;
                 } else {
-                    // 每1s或200个周期统计一次平均执行时间
-                    i++;
+                    // 每累计遍历100ms或100次遍历统计一次平均执行时间
+                    cycle++;    // 每次执行后增加周期计数
                     total_ns += delta_ns;
-                    if (total_ns >= 1000000000 || i >=200) {
-                        printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / i);
+                    if (total_ns >= 100000000 || cycle % 100 == 0) {
+                        printk(KERN_INFO "[PID %d]clear_soft_dirty_once execution time: %lld ns\n", dti->pid, total_ns / cycle);
                         total_ns = 0;
+                        cycle = 1;
                         i = 1;
                     }
                 }
 
                 // 动态调整定时器超时时间
-                if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
+                if (!dti->skip_ro_vmas) {
+                    // 强制全扫描后，恢复初始延时和惩罚因子
+                    dti->delay_penalty = 1;
+                    if (delta_ns < dti->delay_timer / 10) {
+                        dti->delay_timer = 9 * delta_ns;
+                    } else if (delta_ns <= dti->delay_timer / 3) {
+                        dti->delay_timer = delta_ns + dti->delay_timer / 5;
+                    } else {
+                        dti->delay_timer = max(INIT_DELAY, delta_ns + dti->delay_timer);
+                    }
+                } else if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
+                    printk("[PID %d]No dirty pages detected in this scan, increasing delay\n", dti->pid);
                     dti->delay_penalty *= 2;
                     dti->delay_timer = dti->delay_timer * dti->delay_penalty;
                     if (dti->delay_timer > MAX_DELAY) {
                         dti->delay_timer = MAX_DELAY;
                     }
-                } else if (!dti->skip_ro_vmas) {
-                    // 强制全扫描后，恢复初始延时和惩罚因子
-                    dti->delay_penalty = 1;
-                    if (delta_ns < dti->delay_timer / 10) {
-                        dti->delay_timer = 7 * delta_ns;
-                    } else if (delta_ns <= dti->delay_timer / 3) {
-                        dti->delay_timer = delta_ns + dti->delay_timer / 5;
-                    } else {
-                        dti->delay_timer = min(INIT_DELAY, dti->delay_timer);
-                    }
                 } else {
-                    // 非强制全扫描后，逐步减少延时和惩罚因子
-                    if (dti->delay_penalty > 1)
-                        dti->delay_penalty /= 2;
-                    if (dti->delay_timer > default_delay) {
-                        dti->delay_timer -= default_delay / 10;
+                    // 非强制全扫描且有更新后，调整延迟使delta_ns稳定在十分之一到三分之一之间
+                    if (delta_ns < dti->delay_timer / 10) {
+                        // 执行时间太短，增加等待时间以使比例合适
+                        dti->delay_timer += (dti->delay_timer / 5 - delta_ns) / 2;  // 简单PID-like增量
+                        if (dti->delay_timer > MAX_DELAY) dti->delay_timer = MAX_DELAY;
+                    } else if (delta_ns > (dti->delay_timer / 3)) {
+                        // 执行时间太长，减少等待时间以提高执行频率
+                        dti->delay_timer -= (delta_ns - dti->delay_timer / 5) / 2;
                         if (dti->delay_timer < default_delay)
                             dti->delay_timer = default_delay;
                     }
+                    // 保持惩罚因子
+                    if (dti->delay_penalty > 1)
+                        dti->delay_penalty /= 2;
                 }
 
                 // 启动新的定时器
                 kt = ktime_set(0, dti->delay_timer);
                 hrtimer_start(&dti->timer, kt, HRTIMER_MODE_REL);
-                dti->cycle_count++;  // 每次执行后增加周期计数
             } else {
                 spin_unlock(&dti->timer_lock);
             }
@@ -968,8 +1038,8 @@ static int start_dirty_track(pid_t pid) {
     dti->dirty_map_updated = false;
     dti->delay_timer = INIT_DELAY;
     dti->delay_penalty = 1;
-    dti->cycle_count = 0;
-    dti->skip_ro_vmas = false;  // 首次执行时不跳过 RO VMA
+    dti->first_scan = true;
+    dti->skip_ro_vmas = false;  // 首次执行时不跳过RO VMA
 
     // 初始化优先停止任务的相关字段
     dti->stop_requested = false;
