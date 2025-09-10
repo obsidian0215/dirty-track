@@ -292,51 +292,81 @@ class VideoCacheEnhancedBench:
         r = redis.Redis(connection_pool=pool, decode_responses=True)
         end_time = time.time() + duration
 
+        op_count = 0
+        last_debug_time = time.time()
+
         while time.time() < end_time and not self._stop.is_set():
 
             op_rand = random.randint(1, 100)
             start = time.perf_counter()
 
+            # Periodic debug output to verify thread is active
+            current_debug_time = time.time()
+            if current_debug_time - last_debug_time >= 5.0:  # Every 5 seconds
+                logger.info(f"Thread active: processed {op_count} operations so far (total success: {self.success})")
+                last_debug_time = current_debug_time
+
             try:
                 if op_rand <= write_pct:
                     # Write path
+                    logger.debug(f"Executing write operation (thread)")
                     res = self._make_result()
                     key = res["frame_id"]
                     payload = json.dumps(res)
 
                     if random.randint(1, 100) <= fallback_rate:
                         # Fallback to persistent storage
-                        r.hset(self.persist_hash, key, payload)
-                        lat = (time.perf_counter() - start) * 1000.0
-                        with self.lock:
-                            self.latencies_ms.append(lat)
-                            self.success += 1
+                        try:
+                            r.hset(self.persist_hash, key, payload)
+                            lat = (time.perf_counter() - start) * 1000.0
+                            with self.lock:
+                                self.latencies_ms.append(lat)
+                                self.success += 1
+                                op_count += 1
+                            logger.debug(f"HSET operation success: {self.success} operations")
+                        except Exception as e:
+                            logger.warning(f"HSET operation failed: {e}")
                     else:
                         # Normal cache write
-                        r.set(key, payload, ex=self.cache_ttl)
-                        lat = (time.perf_counter() - start) * 1000.0
-                        with self.lock:
-                            self.latencies_ms.append(lat)
-                            self.success += 1
+                        try:
+                            r.set(key, payload, ex=self.cache_ttl)
+                            lat = (time.perf_counter() - start) * 1000.0
+                            with self.lock:
+                                self.latencies_ms.append(lat)
+                                self.success += 1
+                                op_count += 1
+                            logger.debug(f"SET operation success: {self.success} operations")
+                        except Exception as e:
+                            logger.warning(f"SET operation failed: {e}")
 
                         # Optional immediate read verification
                         if random.randint(1, 100) <= do_get_pct:
-                            gstart = time.perf_counter()
-                            _ = r.get(key)
-                            glat = (time.perf_counter() - gstart) * 1000.0
-                            with self.lock:
-                                self.latencies_ms.append(glat)
-                                self.success += 1
+                            try:
+                                gstart = time.perf_counter()
+                                _ = r.get(key)
+                                glat = (time.perf_counter() - gstart) * 1000.0
+                                with self.lock:
+                                    self.latencies_ms.append(glat)
+                                    self.success += 1
+                                    op_count += 1
+                                logger.debug(f"GET operation success: {self.success} operations")
+                            except Exception as e:
+                                logger.warning(f"GET operation failed: {e}")
                 else:
                     # Read path
                     camera_id = f"cam-{random.randint(1, self.camera_count)}"
                     key = f"frame-{random.randint(1000000, 9999999)}"
                     start = time.perf_counter()
-                    _ = r.get(key)
-                    lat = (time.perf_counter() - start) * 1000.0
-                    with self.lock:
-                        self.latencies_ms.append(lat)
-                        self.success += 1
+                    try:
+                        _ = r.get(key)
+                        lat = (time.perf_counter() - start) * 1000.0
+                        with self.lock:
+                            self.latencies_ms.append(lat)
+                            self.success += 1
+                            op_count += 1
+                        logger.debug(f"GET operation success: {self.success} operations")
+                    except Exception as e:
+                        logger.warning(f"GET operation failed: {e}")
 
             except Exception as e:
                 with self.lock:
@@ -349,7 +379,9 @@ class VideoCacheEnhancedBench:
     def run(self, threads: int = 4, duration: int = 10, write_pct: int = 80,
            fallback_rate: int = 5, do_get_pct: int = 0):
         """Start benchmark test"""
+        logger.info("Initializing Redis connection pool...")
         pool = self._init_connection_pool()
+        logger.info("Redis connection pool initialized successfully")
 
         # Record test start time for precise elapsed time calculation
         start_time = time.time()
@@ -375,6 +407,7 @@ class VideoCacheEnhancedBench:
                        threads, duration, self.inference_model, self.camera_count, self.payload_size_kb)
 
             # Wait for threads to finish
+            logger.info("Waiting for worker threads to complete...")
             for t in tlist:
                 # Give threads enough time to finish gracefully (duration + 10 seconds buffer)
                 t.join(timeout=max(duration + 10, 30))  # At least 30 seconds timeout
@@ -382,7 +415,7 @@ class VideoCacheEnhancedBench:
                     logger.warning("Worker thread %s is still alive, continuing with cleanup", t.name)
                     # Note: daemon threads will be automatically terminated when main process exits
 
-            logger.info("Workers finished")
+            logger.info("All worker threads completed")
             self._print_summary(duration)
 
         except KeyboardInterrupt:

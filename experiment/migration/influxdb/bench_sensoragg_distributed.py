@@ -91,6 +91,7 @@ class SensorNetworkBench:
         if self.network_topology == "mesh":
             # 网状网络：每个节点与多个邻居连接
             nodes_count = self.sensor_density * 10
+            # 第一步：创建所有节点
             for i in range(nodes_count):
                 node_id = f"sensor_node_{i:03d}"
                 self.network_nodes[node_id] = {
@@ -99,12 +100,15 @@ class SensorNetworkBench:
                     "last_broadcast": 0,
                     "role": random.choice(["coordinator", "router", "sensor"])
                 }
-                # 每个节点连接3-8个随机邻居
-                neighbors = set()
-                for _ in range(random.randint(3, 8)):
-                    neighbor = random.choice(list(self.network_nodes.keys() - {node_id, *neighbors}))
-                    neighbors.add(neighbor)
-                self.node_connections[node_id] = neighbors
+                self.node_connections[node_id] = set()
+
+            # 第二步：为每个节点分配邻居
+            for node_id in self.network_nodes:
+                if len(self.network_nodes) > 1:
+                    available_neighbors = set(self.network_nodes.keys()) - {node_id}
+                    num_neighbors = min(random.randint(3, 8), len(available_neighbors))
+                    neighbors = set(random.sample(list(available_neighbors), num_neighbors))
+                    self.node_connections[node_id] = neighbors
 
         elif self.network_topology == "tree":
             # 树状网络：层级结构
