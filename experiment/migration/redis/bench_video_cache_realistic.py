@@ -371,126 +371,120 @@ class VideoCacheRealisticBench:
         if current_time - self.last_report_time >= self.monitor_interval:
             # Correct elapsed time calculation
             elapsed = current_time - self.start_time
-            success_count = self.success
-            new_operations = success_count - self.last_success_count
+            with self.lock:
+                success_count = self.success
+                new_operations = success_count - self.last_success_count
 
-            if new_operations >= 0:
-                throughput_ops_sec = new_operations / (current_time - self.last_report_time)
+                if new_operations >= 0:
+                    throughput_ops_sec = new_operations / (current_time - self.last_report_time)
 
-                # Calculate latency statistics
-                recent_latencies = []
-                with self.lock:
+                    # Calculate latency statistics
                     if self.latencies_ms:
                         recent_count = min(1000, len(self.latencies_ms))
                         recent_latencies = self.latencies_ms[-recent_count:]
 
-                if recent_latencies:
-                    recent_latencies.sort()
-                    avg_lat = statistics.mean(recent_latencies)
-                    p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
-                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
-                else:
-                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                        if recent_latencies:
+                            recent_latencies.sort()
+                            avg_lat = statistics.mean(recent_latencies)
+                            p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
+                            logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                        else:
+                            logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                    else:
+                        logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
 
-                self.last_report_time = current_time
-                self.last_success_count = success_count
+                    self.last_report_time = current_time
+                    self.last_success_count = success_count
 
     def _worker(self, duration: float, write_pct: int, fallback_rate: int,
-               do_get_pct: int, pool):
+               do_get_pct: int, pool, total_threads: int):
         """Worker thread containing all read/write logic with realistic framerate control"""
         r = redis.Redis(connection_pool=pool, decode_responses=True)
         end_time = time.time() + duration
 
-        # Calculate realistic frame generation intervals
-        # Each thread will simulate multiple cameras to achieve realistic throughput
-        cameras_per_thread = max(1, min(self.camera_count // 4, 8))  # 1-8 cameras per thread
-        frame_interval = 1.0 / (self.framerate / cameras_per_thread)  # Interval for each frame batch
-        last_frame_time = time.time()
+        # Improved frame generation with higher concurrency
+        # Allow more cameras per thread and optimize processing intervals
+        cameras_per_thread = max(1, self.camera_count // total_threads)  # Distribute cameras across threads
 
-        logger.info(f"Thread simulating {cameras_per_thread} cameras at {self.framerate}fps (interval: {frame_interval:.3f}s)")
+        # Calculate target operations per second for the thread based on framerate
+        target_ops_per_second = self.framerate * cameras_per_thread
+        min_inter_operation_delay = 1.0 / target_ops_per_second  # Minimum delay between operations
+        last_operation_time = time.time()
+
+        logger.info(f"Thread targeting {target_ops_per_second:.1f} ops/sec (cameras: {cameras_per_thread}, effective: {1.0/min_inter_operation_delay:.3f}s)")
 
         while time.time() < end_time and not self._stop.is_set():
             current_time = time.time()
 
-            # Check if it's time to generate new frames based on framerate
-            if current_time - last_frame_time >= frame_interval:
-                # Generate frames for assigned cameras this cycle
-                frames_to_process = min(cameras_per_thread, self.camera_count)
-                frames_processed = 0
+            # Control operation rate based on target framerate
+            time_since_last_op = current_time - last_operation_time
+            if time_since_last_op >= min_inter_operation_delay:
 
-                for _ in range(frames_to_process):
-                    op_rand = random.randint(1, 100)
-                    start = time.perf_counter()
-                    processing_delay = 0
+                # Process operation with rate limiting
+                op_rand = random.randint(1, 100)
+                start = time.perf_counter()
 
-                    try:
-                        if op_rand <= write_pct:
-                            # Write path - simulate video frame processing
-                            processing_delay = random.gauss(16.7, 3.3) / 1000.0  # ~17ms ai inference at 30fps
-                            time.sleep(processing_delay)  # Simulate AI processing time
+                try:
+                    if op_rand <= write_pct:
+                        # Write path - simulate video frame processing
+                        # Reduce AI inference time from ~17ms to ~3-5ms to allow higher throughput
+                        processing_delay = random.gauss(2.0, 1.0) / 1000.0  # ~2ms AI inference for high throughput
+                        time.sleep(processing_delay)  # Simulate AI processing time
 
-                            res = self._make_result()
-                            key = res["frame_id"]
-                            payload = json.dumps(res)
+                        res = self._make_result()
+                        key = res["frame_id"]
+                        payload = json.dumps(res)
 
-                            if random.randint(1, 100) <= fallback_rate:
-                                # Fallback to persistent storage
-                                r.hset(self.persist_hash, key, payload)
-                                lat = (time.perf_counter() - start) * 1000.0
-                                with self.lock:
-                                    self.latencies_ms.append(lat)
-                                    self.success += 1
-                            else:
-                                # Normal cache write
-                                r.set(key, payload, ex=self.cache_ttl)
-                                lat = (time.perf_counter() - start) * 1000.0
-                                with self.lock:
-                                    self.latencies_ms.append(lat)
-                                    self.success += 1
-
-                                # Optional immediate read verification
-                                if random.randint(1, 100) <= do_get_pct:
-                                    gstart = time.perf_counter()
-                                    _ = r.get(key)
-                                    glat = (time.perf_counter() - gstart) * 1000.0
-                                    with self.lock:
-                                        self.latencies_ms.append(glat)
-                                        self.success += 1
+                        if random.randint(1, 100) <= fallback_rate:
+                            # Fallback to persistent storage
+                            r.hset(self.persist_hash, key, payload)
+                            lat = (time.perf_counter() - start) * 1000.0
+                            with self.lock:
+                                self.latencies_ms.append(lat)
+                                self.success += 1
                         else:
-                            # Read path
-                            camera_id = f"cam-{random.randint(1, self.camera_count)}"
-                            key = f"frame-{random.randint(1000000, 9999999)}"
-                            _ = r.get(key)
+                            # Normal cache write
+                            r.set(key, payload, ex=self.cache_ttl)
                             lat = (time.perf_counter() - start) * 1000.0
                             with self.lock:
                                 self.latencies_ms.append(lat)
                                 self.success += 1
 
-                        frames_processed += 1
-
-                    except Exception as e:
+                            # Optional immediate read verification
+                            if random.randint(1, 100) <= do_get_pct:
+                                gstart = time.perf_counter()
+                                _ = r.get(key)
+                                glat = (time.perf_counter() - gstart) * 1000.0
+                                with self.lock:
+                                    self.latencies_ms.append(glat)
+                                    self.success += 1
+                    else:
+                        # Read path
+                        camera_id = f"cam-{random.randint(1, self.camera_count)}"
+                        key = f"frame-{random.randint(1000000, 9999999)}"
+                        _ = r.get(key)
+                        lat = (time.perf_counter() - start) * 1000.0
                         with self.lock:
-                            self.fail += 1
-                        time.sleep(0.01)
+                            self.latencies_ms.append(lat)
+                            self.success += 1
 
-                # Update frame timing for next cycle
-                last_frame_time = current_time
+                except Exception as e:
+                    with self.lock:
+                        self.fail += 1
+                    time.sleep(0.01)
 
-                # Brief yield to prevent overwhelming the system
-                if frames_processed > 0:
-                    time.sleep(0.001)  # 1ms yield between frame batches
+                # Update last operation time for rate control
+                last_operation_time = current_time
 
             else:
-                # Wait until next frame generation time
-                remaining_time = frame_interval - (current_time - last_frame_time)
-                if remaining_time > 0:
-                    time.sleep(min(remaining_time, 0.01))  # Max 10ms wait
+                # Brief yield to prevent CPU spinning when rate limiting
+                time.sleep(min(0.005, min_inter_operation_delay - time_since_last_op))
 
             # Periodic monitoring output
             self._periodic_monitoring(duration)
 
-    def run(self, threads: int = 16, duration: int = 120, write_pct: int = 80,
-           fallback_rate: int = 5, do_get_pct: int = 0):
+    def run(self, threads: int = 16, duration: int = 120, write_pct: int = 90,
+           fallback_rate: int = 0, do_get_pct: int = 5):
         """Start benchmark test"""
         pool = self._init_connection_pool()
 
@@ -510,7 +504,7 @@ class VideoCacheRealisticBench:
 
             for _ in range(threads):
                 t = threading.Thread(target=self._worker, args=(duration, write_pct,
-                                   fallback_rate, do_get_pct, pool), daemon=True)
+                                   fallback_rate, do_get_pct, pool, threads), daemon=True)
                 t.start()
                 tlist.append(t)
 
@@ -586,7 +580,7 @@ def main():
                        help="Number of objects per frame (default: 8 for realistic load)")
 
     # Data authenticity
-    parser.add_argument("--camera-count", default=100, type=int,
+    parser.add_argument("--camera-count", default=20, type=int,
                        help="Number of cameras in simulation (default: 100)")
     parser.add_argument("--inference-model", default="yolov5_medium",
                        choices=["yolov5_small", "yolov5_medium", "ssd_mobile"],
@@ -610,10 +604,10 @@ def main():
     # Enhanced load parameters
     parser.add_argument("--threads", default=16, type=int, help="Worker threads (default: 16)")
     parser.add_argument("--duration", default=120, type=int, help="Test duration in seconds (default: 120s)")
-    parser.add_argument("--write-pct", default=80, type=int, help="Write operation percentage")
-    parser.add_argument("--fallback-rate", default=5, type=int,
+    parser.add_argument("--write-pct", default=90, type=int, help="Write operation percentage")
+    parser.add_argument("--fallback-rate", default=0, type=int,
                        help="Fallback to persistence percentage")
-    parser.add_argument("--do-get-pct", default=0, type=int,
+    parser.add_argument("--do-get-pct", default=5, type=int,
                        help="Immediate get after set percentage")
 
     args = parser.parse_args()

@@ -261,29 +261,30 @@ class VideoCacheEnhancedBench:
         if current_time - self.last_report_time >= self.monitor_interval:
             # Correct elapsed time calculation
             elapsed = current_time - self.start_time
-            success_count = self.success
-            new_operations = success_count - self.last_success_count
+            with self.lock:
+                success_count = self.success
+                new_operations = success_count - self.last_success_count
 
-            if new_operations >= 0:
-                throughput_ops_sec = new_operations / (current_time - self.last_report_time)
+                if new_operations >= 0:
+                    throughput_ops_sec = new_operations / (current_time - self.last_report_time)
 
-                # Calculate latency statistics
-                recent_latencies = []
-                with self.lock:
+                    # Calculate latency statistics
                     if self.latencies_ms:
                         recent_count = min(1000, len(self.latencies_ms))
                         recent_latencies = self.latencies_ms[-recent_count:]
 
-                if recent_latencies:
-                    recent_latencies.sort()
-                    avg_lat = statistics.mean(recent_latencies)
-                    p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
-                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
-                else:
-                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                        if recent_latencies:
+                            recent_latencies.sort()
+                            avg_lat = statistics.mean(recent_latencies)
+                            p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
+                            logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                        else:
+                            logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+                    else:
+                        logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
 
-                self.last_report_time = current_time
-                self.last_success_count = success_count
+                    self.last_report_time = current_time
+                    self.last_success_count = success_count
 
     def _worker(self, duration: float, write_pct: int, fallback_rate: int,
                do_get_pct: int, pool):
@@ -299,33 +300,33 @@ class VideoCacheEnhancedBench:
             try:
                 if op_rand <= write_pct:
                     # Write path
-                        res = self._make_result()
-                        key = res["frame_id"]
-                        payload = json.dumps(res)
+                    res = self._make_result()
+                    key = res["frame_id"]
+                    payload = json.dumps(res)
 
-                        if random.randint(1, 100) <= fallback_rate:
-                            # Fallback to persistent storage
-                            r.hset(self.persist_hash, key, payload)
-                            lat = (time.perf_counter() - start) * 1000.0
-                            with self.lock:
-                                self.latencies_ms.append(lat)
-                                self.success += 1
-                        else:
-                            # Normal cache write
-                            r.set(key, payload, ex=self.cache_ttl)
-                            lat = (time.perf_counter() - start) * 1000.0
-                            with self.lock:
-                                self.latencies_ms.append(lat)
-                                self.success += 1
+                    if random.randint(1, 100) <= fallback_rate:
+                        # Fallback to persistent storage
+                        r.hset(self.persist_hash, key, payload)
+                        lat = (time.perf_counter() - start) * 1000.0
+                        with self.lock:
+                            self.latencies_ms.append(lat)
+                            self.success += 1
+                    else:
+                        # Normal cache write
+                        r.set(key, payload, ex=self.cache_ttl)
+                        lat = (time.perf_counter() - start) * 1000.0
+                        with self.lock:
+                            self.latencies_ms.append(lat)
+                            self.success += 1
 
-                            # Optional immediate read verification
-                            if random.randint(1, 100) <= do_get_pct:
-                                gstart = time.perf_counter()
-                                _ = r.get(key)
-                                glat = (time.perf_counter() - gstart) * 1000.0
-                                with self.lock:
-                                    self.latencies_ms.append(glat)
-                                    self.success += 1
+                        # Optional immediate read verification
+                        if random.randint(1, 100) <= do_get_pct:
+                            gstart = time.perf_counter()
+                            _ = r.get(key)
+                            glat = (time.perf_counter() - gstart) * 1000.0
+                            with self.lock:
+                                self.latencies_ms.append(glat)
+                                self.success += 1
                 else:
                     # Read path
                     camera_id = f"cam-{random.randint(1, self.camera_count)}"
@@ -342,7 +343,7 @@ class VideoCacheEnhancedBench:
                     self.fail += 1
                 time.sleep(0.01)
 
-            # Periodic monitoring output
+            # Periodic monitoring output - moved outside try-except to ensure it's always called
             self._periodic_monitoring(duration)
 
     def run(self, threads: int = 4, duration: int = 10, write_pct: int = 80,
