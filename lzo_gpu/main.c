@@ -4,6 +4,8 @@
 #include <string.h>
 #include <stdint.h>
 
+static char argv0[256]; // 存储程序名
+
 /*
 * 压缩文件格式：
 uint16  magic     = 0x4C5A   // 'L''Z'
@@ -387,8 +389,6 @@ static cl_program load_or_build_program(const char* cl_path, const char* kernel_
     free(cl_src);
     return program;
 }
-
-static char argv0[256]; // 存储程序名
 
 int main(int argc, char** argv)
 {
