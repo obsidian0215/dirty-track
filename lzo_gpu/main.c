@@ -142,7 +142,35 @@ static char* read_file(const char* path, size_t* sz_out)
         // 从文件读取
         fp = fopen(path, "rb");
         if (!fp) {
-            perror(path); exit(1);
+            // 如果相对路径失败，尝试相对于可执行文件的路径
+            // 这是为了处理当程序在不同目录运行时的.cl文件查找问题
+            char* exec_path = malloc(1024);
+            if (exec_path) {
+                // 构建相对于可执行文件的路径
+                char* exec_dir = malloc(1024);
+                if (exec_dir) {
+                    // 获取可执行文件目录
+                    strcpy(exec_dir, argv0); // argv0是全局变量，存储程序名
+                    char* last_slash = strrchr(exec_dir, '/');
+                    if (last_slash) {
+                        *last_slash = '\0';
+                        // 构建新路径：exec_dir/../lzo_gpu/filename
+                        char full_path[1024];
+                        snprintf(full_path, sizeof(full_path), "%s/../lzo_gpu/%s", exec_dir, path);
+
+                        fp = fopen(full_path, "rb");
+                        if (fp) {
+                            printf("Found %s at %s\n", path, full_path);
+                        }
+                        free(exec_dir);
+                    }
+                }
+                free(exec_path);
+            }
+
+            if (!fp) {
+                perror(path); exit(1);
+            }
         }
         fseek(fp, 0, SEEK_END);
         sz = ftell(fp);
@@ -360,8 +388,13 @@ static cl_program load_or_build_program(const char* cl_path, const char* kernel_
     return program;
 }
 
+static char argv0[256]; // 存储程序名
+
 int main(int argc, char** argv)
 {
+    // 保存程序名用于路径解析
+    strcpy(argv0, argv[0]);
+
     int is_stdin = 0;
     int is_stdout = 0;
 

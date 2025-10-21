@@ -437,7 +437,7 @@ def xfer_pre_dump(parent_path, i):
         # 先创建tar文件
         cmd_tar = f"tar -cf {tar_name} -C {parent_path} ."
         # 再使用lzo_gpu压缩
-        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "lzo_gpu/lzo_gpu")
         cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {archive_name}"
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
@@ -622,50 +622,46 @@ def xfer_final(image_path):
     print("开始传输 FINAL DUMP")
 
     if compress == 0:
-        # 无压缩
-        cmd_tar = f"tar -cf - -C {image_path} ."
+        # 无压缩模式，计算目录大小作为传输大小
+        size = getdirsize(image_path)
+        print(f"Final dump size: {size} bytes")
+        print("无压缩模式，跳过传输（单机版本）")
     elif compress >= 1 and compress <= 4:
-        # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件
-        tar_name = os.path.join(mig_base, "final_dump.tar")
-        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
-        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+        # 使用lzo_gpu压缩并计算传输时间
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "lzo_gpu/lzo_gpu")
 
-        # 先创建tar文件
-        cmd_create_tar = f"tar -cf {tar_name} -C {image_path} ."
-        ret = os.system(cmd_create_tar)
+        # 创建临时文件来存储压缩结果
+        temp_lzo = os.path.join(mig_base, "temp_final.lzo")
+
+        # 创建管道命令：tar -> lzo_gpu压缩 -> 保存到临时文件
+        cmd = f"tar -cf - -C {image_path} . | {lzo_gpu_path} -{compress} - > {temp_lzo}"
+
+        start = time.perf_counter() * 1000
+        ret = os.system(cmd)
+        end = time.perf_counter() * 1000
+
         if ret != 0:
-            exit_code = ret >> 8
-            print(f"Create final tar failed, ExitCode: {exit_code}")
-            raise RuntimeError("tar final dump failed")
+            print(f"压缩传输失败，退出码: {ret}")
+            error()
 
-        # 再压缩为lzo
-        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {lzo_name}"
-        ret = os.system(cmd_compress)
-        if ret != 0:
-            exit_code = ret >> 8
-            print(f"LZO compress final dump failed, ExitCode: {exit_code}")
-            raise RuntimeError("lzo_gpu compress final dump failed")
+        # 计算压缩后的大小
+        if os.path.exists(temp_lzo):
+            compressed_size = os.path.getsize(temp_lzo)
+            original_size = getdirsize(image_path)
 
-        # 删除临时tar文件
-        try:
-            os.remove(tar_name)
-        except OSError as e:
-            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
+            if original_size > 0:
+                compression_ratio = (1 - compressed_size / original_size) * 100
+                print(f"Final dump compressed: {original_size} -> {compressed_size} bytes ({compression_ratio:.2f}% compression)")
 
-        # 传输lzo文件
-        cmd_tar = f"cat {lzo_name}"
+            # 清理临时文件
+            os.remove(temp_lzo)
+        else:
+            compressed_size = 0
+
+        print(f"Final dump compressed xfer: {(end - start):.3f} ms")
+        mig_time += (end - start)
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
-
-    start = time.perf_counter() * 1000
-    ret = os.system(cmd_tar)
-    end = time.perf_counter() * 1000
-
-    print(f"Final dump xfer: {(end - start):.3f} ms")
-    mig_time += (end - start)
-
-    if ret != 0:
-        error()
 
 def migrate(container, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args, compress):
     global rst_time
