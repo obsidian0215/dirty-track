@@ -438,7 +438,7 @@ def xfer_pre_dump(parent_path, i):
         cmd_tar = f"tar -cf {tar_name} -C {parent_path} ."
         # 再使用lzo_gpu压缩
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        lzo_gpu_path = os.path.join(script_dir, "../lzo_gpu/lzo_gpu")
+        lzo_gpu_path = os.path.join(script_dir, "lzo_gpu/lzo_gpu")
         cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {archive_name}"
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
