@@ -273,9 +273,22 @@ static void save_program_binary(cl_program program, const char* cl_path) {
         return;
     }
 
-    /* 创建二进制文件名 */
+    /* 创建二进制文件名 - 相对于可执行文件 */
     char binary_path[512];
-    snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+    char* exec_dir = malloc(1024);
+    if (exec_dir) {
+        strcpy(exec_dir, argv0);
+        char* last_slash = strrchr(exec_dir, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+            snprintf(binary_path, sizeof(binary_path), "%s/../lzo_gpu/%s.bin", exec_dir, cl_path);
+        } else {
+            snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+        }
+        free(exec_dir);
+    } else {
+        snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+    }
 
     FILE* fp = fopen(binary_path, "wb");
     if (fp) {
@@ -290,7 +303,22 @@ static void save_program_binary(cl_program program, const char* cl_path) {
 /* 从文件加载程序二进制 */
 static cl_program load_program_binary(const char* cl_path, cl_context context, cl_device_id device) {
     char binary_path[512];
-    snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+
+    // 构建相对于可执行文件的路径
+    char* exec_dir = malloc(1024);
+    if (exec_dir) {
+        strcpy(exec_dir, argv0);
+        char* last_slash = strrchr(exec_dir, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+            snprintf(binary_path, sizeof(binary_path), "%s/../lzo_gpu/%s.bin", exec_dir, cl_path);
+        } else {
+            snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+        }
+        free(exec_dir);
+    } else {
+        snprintf(binary_path, sizeof(binary_path), "%s.bin", cl_path);
+    }
 
     FILE* fp = fopen(binary_path, "rb");
     if (!fp) return NULL;
@@ -365,7 +393,7 @@ static cl_program load_or_build_program(const char* cl_path, const char* kernel_
         exit(1);
     }
 
-    const char* cl_opts = "-cl-std=CL3.0";
+    const char* cl_opts = "-cl-std=CL3.0 -I .";
     cl_int err = clBuildProgram(program, 1, &dev, cl_opts, NULL, NULL);
     if (err != CL_SUCCESS) {
         print_buildlog(program, dev);
