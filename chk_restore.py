@@ -63,6 +63,7 @@ container_pids = []
 mig_time = 0.0
 chk_time = 0.0
 rst_time = 0.0
+compress = 0
 
 
 # 初始化迭代和处理过的dirtymap文件
@@ -419,6 +420,82 @@ def pre_dump(mig_base, container, i, dirtymap):
     if ret != 0:
         error()
 
+def xfer_pre_dump(parent_path, i):
+    """传输预拷贝数据"""
+    global mig_time
+
+    print(f"开始传输 PRE-DUMP {i}")
+
+    if compress == 0:
+        # 无压缩，直接传输
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
+    elif compress >= 1 and compress <= 4:
+        # 使用lzo_gpu压缩
+        tar_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.lzo")
+        # 先创建tar文件
+        cmd_tar = f"tar -cf {tar_name} -C {parent_path} ."
+        # 再使用lzo_gpu压缩
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {archive_name}"
+    else:
+        raise ValueError(f"不支持的压缩等级: {compress}")
+
+    start = time.perf_counter() * 1000
+
+    if compress == 0:
+        # 无压缩，直接创建tar文件
+        ret = os.system(cmd_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create tar pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"tar pre_dump_{i} failed")
+    else:
+        # 有压缩：先创建tar文件，再压缩
+        ret = os.system(cmd_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create tar pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"tar pre_dump_{i} failed")
+
+        # 检查tar文件是否存在
+        if not os.path.exists(tar_name):
+            raise FileNotFoundError(f"TAR file {tar_name} not found")
+
+        # 再进行lzo压缩
+        ret = os.system(cmd_compress)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"LZO compress pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"lzo_gpu compress pre_dump_{i} failed")
+
+        # 删除中间的tar文件
+        try:
+            os.remove(tar_name)
+        except OSError as e:
+            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
+
+    end = time.perf_counter() * 1000
+
+    if not os.path.exists(archive_name):
+        raise FileNotFoundError(f"Archive file {archive_name} not found")
+
+    size = os.path.getsize(archive_name)
+    if size == 0:
+        raise ValueError(f"pre_dump_{i} archive size is 0")
+
+    print(f"Pre-dump {i} archive: {size} Bytes, {(end - start):.3f} ms")
+
+    # 计算压缩率
+    if compress > 0:
+        original_size = getdirsize(parent_path)
+        if original_size > 0:
+            compression_ratio = (1 - size / original_size) * 100
+            print(f"压缩率: {compression_ratio:.2f}% ({original_size} -> {size} bytes)")
+
+    mig_time += (end - start)
+
 #create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
 #dump is stored in the image directory.
 #in case of pre-dump present, specify it is in the parent directory.
@@ -514,6 +591,9 @@ def iterate_predump(mig_base, parent_path, max_iter, dirtymap):
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
 
+        # 传输当前迭代的pre-dump
+        xfer_pre_dump(last_path, last_iter)
+
         dir_size = convert_byte(getdirsize(parent_path[last_iter], 'pages'))
         print('the total size of {} with pattern {} is {}{}'\
                 .format(last_path, 'pages', dir_size[0], dir_size[1]))
@@ -535,7 +615,59 @@ def iterate_predump(mig_base, parent_path, max_iter, dirtymap):
             break
     return last_iter
 
-def migrate(container, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args):
+def xfer_final(image_path):
+    """传输最终转储数据"""
+    global mig_time
+
+    print("开始传输 FINAL DUMP")
+
+    if compress == 0:
+        # 无压缩
+        cmd_tar = f"tar -cf - -C {image_path} ."
+    elif compress >= 1 and compress <= 4:
+        # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件
+        tar_name = os.path.join(mig_base, "final_dump.tar")
+        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+
+        # 先创建tar文件
+        cmd_create_tar = f"tar -cf {tar_name} -C {image_path} ."
+        ret = os.system(cmd_create_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create final tar failed, ExitCode: {exit_code}")
+            raise RuntimeError("tar final dump failed")
+
+        # 再压缩为lzo
+        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {lzo_name}"
+        ret = os.system(cmd_compress)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"LZO compress final dump failed, ExitCode: {exit_code}")
+            raise RuntimeError("lzo_gpu compress final dump failed")
+
+        # 删除临时tar文件
+        try:
+            os.remove(tar_name)
+        except OSError as e:
+            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
+
+        # 传输lzo文件
+        cmd_tar = f"cat {lzo_name}"
+    else:
+        raise ValueError(f"不支持的压缩等级: {compress}")
+
+    start = time.perf_counter() * 1000
+    ret = os.system(cmd_tar)
+    end = time.perf_counter() * 1000
+
+    print(f"Final dump xfer: {(end - start):.3f} ms")
+    mig_time += (end - start)
+
+    if ret != 0:
+        error()
+
+def migrate(container, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args, compress):
     global rst_time
     base_path = runc_base + container
     mig_base = base_path + "/migrate"
@@ -669,7 +801,7 @@ def migrate(container, pre, post, replay, rootfs, max_iter, dirtymap, time_const
     #         # todo: 创建转发路由
 
     #         # 最后传输容器剩余状态
-    #         xfer_final(image_path, dest, mig_base)
+    #         xfer_final(image_path, mig_base)
     #         dir_size = convert_byte(getdirsize(image_path))
     #         print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
@@ -737,6 +869,8 @@ parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
+parser.add_argument('-z', '--compress', type=int, choices=[0, 1, 2, 3, 4], default=0,
+                    help="compression level: 0=off, 1=fastest(2K), 2=fast(4K), 3=standard(16K), 4=best(32K)")
 # 使用简化方案：所有剩余参数都传递给 runc
 args, remaining = parser.parse_known_args()
 
@@ -785,6 +919,7 @@ if __name__ == '__main__':
     replay = False
     rootfs = True
     dirtymap = False
+    compress = args.compress
     # runc_args 已经在 parse_custom_args 中获得，不需要再从 args 对象获取
     if hasattr(args, 'time_constraint') and args.time_constraint:
         time_constraint = args.time_constraint
@@ -840,7 +975,11 @@ if __name__ == '__main__':
 
     # 开始热迁移
     migrate(container, pre, post, replay, rootfs,
-                    max_iter, dirtymap, time_constraint, runc_args)
+                    max_iter, dirtymap, time_constraint, runc_args, compress)
+
+    # 传输最终转储（如果有）
+    if not diskless:
+        xfer_final(mig_base + "/image")
 
     if diskless:
         print('total checkpoint and transfer time is {:.3f}ms'.format(chk_time))

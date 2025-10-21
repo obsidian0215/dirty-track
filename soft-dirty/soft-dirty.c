@@ -30,6 +30,10 @@ size_t dirty_page_capacity = 0;
 // 全局变量：存储上一次 track_dirty_pages 运行的时间（纳秒）
 long last_run_duration_ns = 0;
 
+// 全局变量：存储总运行时间和迭代次数，用于计算整体平均值
+unsigned long total_run_duration_ns_all = 0;
+int total_iterations = 0;
+
 // 标志位，用于捕获 Ctrl+C
 volatile sig_atomic_t stop = 0;
 
@@ -373,6 +377,10 @@ int main(int argc, char *argv[]) {
         // 累积运行时间，每2s重置并输出平均运行时间
         total_run_duration_ns += last_run_duration_ns;
         i++;
+
+        // 累积到全局统计
+        total_run_duration_ns_all += last_run_duration_ns;
+        total_iterations++;
         if (total_run_duration_ns >= 2000000000) {
             // 输出运行时间
             printf("Dirty-track run time: %ld ns\n", total_run_duration_ns /i);
@@ -396,6 +404,14 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\n[SOFT-DIRTY] Stopping dirty page tracking for PID %d...\n", pid);
+
+    // 输出总体平均运行时间
+    if (total_iterations > 0) {
+        long avg_run_duration_ns = total_run_duration_ns_all / total_iterations;
+        printf("[SOFT-DIRTY] Average dirty-track run time: %ld ns over %d iterations\n", avg_run_duration_ns, total_iterations);
+    } else {
+        printf("[SOFT-DIRTY] No dirty-track iterations to calculate average\n");
+    }
 
     // 检查是否有脏页被发现
     if (dirty_page_count == 0) {

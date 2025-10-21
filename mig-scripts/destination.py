@@ -112,7 +112,7 @@ def handle_prepare(prepare_info):
     image_path = prepare_info['image_path']
 
     parent_paths = prepare_info.get('parent_path', [])
-    compress = prepare_info.get('compress', False)
+    compress = prepare_info.get('compress', 0)
 
     # 初始化监听端口列表和迭代列表
     for parent in parent_paths:
@@ -141,10 +141,15 @@ def handle_prepare(prepare_info):
             # 启动 ncat 监听并解压的管道命令
             # 命令: nc -lp {port} -q 1 -w 10 | tar -xzf - -C {extract_path}
             # 添加 -w 10 超时，-q 1 在输入结束后退出
-            if compress:
-                cmd = f"nc -lp {port} -q 1 -w 300 | tar -xzf - -C {extract_path}"
-            else:
+            if compress == 0:
+                # 无压缩
                 cmd = f"nc -lp {port} -q 1 -w 300 | tar -xf - -C {extract_path}"
+            elif compress >= 1 and compress <= 4:
+                # 使用lzo_gpu解压：先解压lzo，再解压tar
+                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+                cmd = f"nc -lp {port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
+            else:
+                raise ValueError(f"不支持的压缩等级: {compress}")
             # logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             #print("process id:",process)
@@ -157,10 +162,15 @@ def handle_prepare(prepare_info):
             last_port = port_list[-1]
             # os.makedirs(image_path, exist_ok=True)
             extract_path = image_path
-            if compress:
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xzf - -C {extract_path}"
-            else:
+            if compress == 0:
+                # 无压缩
                 cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
+            elif compress >= 1 and compress <= 4:
+                # 使用lzo_gpu解压：先解压lzo，再解压tar
+                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+                cmd = f"nc -lp {last_port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
+            else:
+                raise ValueError(f"不支持的压缩等级: {compress}")
                 #cmd = f"nc -lp {last_port} "
                 #cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
             # logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")

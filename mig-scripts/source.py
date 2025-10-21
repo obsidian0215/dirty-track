@@ -893,22 +893,58 @@ def xfer_pre_dump(parent_path, dest, i, port):
 
     # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
     # 创建压缩包
-    if compress:
-        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
-        cmd_tar = f"tar -czf {archive_name} -C {parent_path} ."
-    else:
+    if compress == 0:
+        # 无压缩
         archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
         cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
+    elif compress >= 1 and compress <= 4:
+        # 使用lzo_gpu压缩
+        tar_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.lzo")
+        # 先创建tar文件
+        cmd_tar = f"tar -cf {tar_name} -C {parent_path} ."
+        # 再使用lzo_gpu压缩
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {archive_name}"
+    else:
+        raise ValueError(f"不支持的压缩等级: {compress}")
 
     # print(cmd_tar)
     start = time.perf_counter() * 1000
-    ret = os.system(cmd_tar)
-    end = time.perf_counter() * 1000
 
-    if ret != 0:
-        exit_code = ret >> 8
-        print(f"Compress pre_dump_{i} failed, ExitCode: {exit_code}")
-        raise RuntimeError(f"tar pre_dump_{i} failed")
+    if compress == 0:
+        # 无压缩，直接创建tar文件
+        ret = os.system(cmd_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create tar pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"tar pre_dump_{i} failed")
+    else:
+        # 有压缩：先创建tar文件，再压缩
+        ret = os.system(cmd_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create tar pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"tar pre_dump_{i} failed")
+
+        # 检查tar文件是否存在
+        if not os.path.exists(tar_name):
+            raise FileNotFoundError(f"TAR file {tar_name} not found")
+
+        # 再进行lzo压缩
+        ret = os.system(cmd_compress)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"LZO compress pre_dump_{i} failed, ExitCode: {exit_code}")
+            raise RuntimeError(f"lzo_gpu compress pre_dump_{i} failed")
+
+        # 删除中间的tar文件
+        try:
+            os.remove(tar_name)
+        except OSError as e:
+            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
+
+    end = time.perf_counter() * 1000
 
     if not os.path.exists(archive_name):
         raise FileNotFoundError(f"Archive file {archive_name} not found")
@@ -945,10 +981,41 @@ def xfer_final(image_path, dest, compress, port):
 
     # print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
-    if compress:
-        cmd_tar = f"tar -czf - -C {image_path} . | nc -q 0 {dest} {port}"
-    else:
+    if compress == 0:
+        # 无压缩
         cmd_tar = f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
+    elif compress >= 1 and compress <= 4:
+        # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
+        tar_name = os.path.join(mig_base, "final_dump.tar")
+        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
+        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+
+        # 先创建tar文件
+        cmd_create_tar = f"tar -cf {tar_name} -C {image_path} ."
+        ret = os.system(cmd_create_tar)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"Create final tar failed, ExitCode: {exit_code}")
+            raise RuntimeError("tar final dump failed")
+
+        # 再压缩为lzo
+        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {lzo_name}"
+        ret = os.system(cmd_compress)
+        if ret != 0:
+            exit_code = ret >> 8
+            print(f"LZO compress final dump failed, ExitCode: {exit_code}")
+            raise RuntimeError("lzo_gpu compress final dump failed")
+
+        # 删除临时tar文件
+        try:
+            os.remove(tar_name)
+        except OSError as e:
+            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
+
+        # 通过nc传输lzo文件
+        cmd_tar = f"nc -q 0 {dest} {port} < {lzo_name}"
+    else:
+        raise ValueError(f"不支持的压缩等级: {compress}")
     start = time.perf_counter() * 1000
     ret = os.system(cmd_tar)
     end = time.perf_counter() * 1000
@@ -1563,7 +1630,8 @@ parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
 parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
 parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
 parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
-parser.add_argument('-z', '--compress', dest='compress', action='store_true', help="enable compression")
+parser.add_argument('-z', '--compress', type=int, choices=[0, 1, 2, 3, 4], default=0,
+                    help="compression level: 0=off, 1=fastest(2K), 2=fast(4K), 3=standard(16K), 4=best(32K)")
 
 # 处理 --tcp-established 和 --shell-job 等criu参数
 # 将这些参数排除在脚本参数解析之外
@@ -1642,10 +1710,7 @@ if __name__ == '__main__':
     replay = False
     rootfs = True
     dirtymap = False
-    compress = False
-
-    if args.compress:
-        compress = True
+    compress = args.compress
 
     # 检查用户是否确实提供了时间约束参数
     if '--time-constraint' in sys.argv or '-tc' in sys.argv:
@@ -1780,11 +1845,11 @@ if __name__ == '__main__':
         output_values.extend([
             int(round(rpf_handle_time)),
             '{:.2f}'.format(total_uffd_copy)
-            
+
         ])
     if pre:
         output_values.append(int(round(pre_dump_iters)))
-    
+
 
     print('\t'.join(map(str, output_values)))
     if pre:
