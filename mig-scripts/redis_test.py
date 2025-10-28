@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import re
 import subprocess
 import sys
@@ -343,7 +343,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene):
     run_bg_cmd = (
         f"cd {bench_dir} && "
         f"nohup python3 {bench_file} {args_to_str(run_args)} "
-        f"> /tmp/bench_run.log 2>&1 & echo $! > /tmp/bench_client.pid"
+        "> /tmp/bench_run.log 2>&1 & echo $! > /tmp/bench_client.pid"
     )
     run_remote_cmd(run_bg_cmd, CLIENT_IP, ignore_error=False)
     time.sleep(3)
@@ -486,3 +486,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

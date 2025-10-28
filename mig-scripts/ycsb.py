@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import re
 import subprocess
 import sys
@@ -126,9 +126,9 @@ def destination_prepare():
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
     recvtty_cmd = (
-        f"PATH=$PATH:/root/go/bin "
+        "PATH=$PATH:/root/go/bin "
         f"nohup recvtty -m null /runc/containers/{container_name}/console.sock "
-        f"> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_dest.pid"
+        "> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_dest.pid"
     )
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
@@ -497,3 +497,4 @@ if __name__ == "__main__":
                 update_keepalived_priority(70)
                 update_keepalived_priority(30, True, DEST_IP)
             time.sleep(17)  #
+

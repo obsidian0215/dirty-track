@@ -707,7 +707,7 @@ def measure_bandwidth(dest_ip):
     try:
         # 使用 iperf3 进行短时间带宽测量
         result = subprocess.run(
-            ["iperf3", "-c", dest_ip, "-t", "3", "-f", "m", "-J"],
+            ["iperf3", "-c", dest_ip, "-t", "3", "-", "m", "-J"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2202,4 +2202,5 @@ if __name__ == "__main__":
 
     if diskless:
         post_process(max_iter)
+
 

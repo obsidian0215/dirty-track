@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import re
 import subprocess
 import sys
@@ -176,7 +176,7 @@ def source_clean():
     run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
-    # run_cmd(f"rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True) # 如果容器不存在可忽略错误
+    # run_cmd("rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True) # 如果容器不存在可忽略错误
     # run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
     # run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
 
@@ -488,3 +488,4 @@ if __name__ == "__main__":
                 update_keepalived_priority(30, True, DEST_IP)
             time.sleep(17)  #
             # input()
+
