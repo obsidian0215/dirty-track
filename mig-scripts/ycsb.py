@@ -3,6 +3,7 @@ import sys
 import argparse
 import re
 import time
+from script_defaults import get_default_ips, choose_scripts
 
 # 默认设置
 SOURCE_IP = "192.168.37.159"
@@ -23,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout","--redis-timeout", type=int, default=10000, help="Redis timeout in milliseconds for YCSB.")
     parser.add_argument("-rc","--recordcount", type=int, default=100000, help="Record count for YCSB (recordcount == operationcount).")
     parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument('--sec', action='store_true', help='use source-sec/destination-sec scripts')
     parsed_args = parser.parse_args()
 
     # 全局变量
@@ -34,6 +36,8 @@ if __name__ == "__main__":
     OPERATION_COUNT = RECORD_COUNT  # 两者相等
     REDIS_TIMEOUT = parsed_args.timeout
     runs = parsed_args.runs
+    # script selection: allow secure variants
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(parsed_args, 'sec', False))
 
 # 定义实验类型与参数
 experiments = {
@@ -104,6 +108,10 @@ def destination_prepare():
     ]
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+    # 停止 destination 后台进程并移除 pidfile（如果存在）
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
     recvtty_cmd = (
     f"PATH=$PATH:/root/go/bin "
@@ -111,6 +119,13 @@ def destination_prepare():
     f"> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_dest.pid"
 )
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
+    ts = int(time.time())
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 
 
@@ -425,7 +440,7 @@ def source_run_migration(exp_args):
 
     time.sleep(8)  # 等待YCSB启动稳定
     # 执行source.py进行迁移
-    migration_cmd = f"python3 source.py {exp_args} redis {DEST_IP}"
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} redis {DEST_IP}"
     run_cmd(migration_cmd)
 
     # clean

@@ -5,11 +5,14 @@ import re
 import time
 
 # 默认设置
-SOURCE_IP = "192.168.37.159"
-DEST_IP = "192.168.37.161"
-CLIENT_IP = "192.168.37.158"
+SOURCE_IP = "192.168.2.105"
+DEST_IP = "192.168.2.225"
+CLIENT_IP = "192.168.2.245"
+VIP = "192.168.2.100"
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
-VIP = "192.168.37.150"
+# default script selection
+from script_defaults import choose_scripts
+SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
 
@@ -21,18 +24,19 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--client-ip",default=CLIENT_IP, help="IP address of the YCSB client machine.")
     parser.add_argument("--vip", default=VIP, help="Virtual IP address (optional).")
 
-   
+
    # [memtier] changed: 替换/新增 memtier 参数（默认值按你给的命令）
-    parser.add_argument("--mt-n", type=int, default=200000, help="memtier: total requests per thread (-n).")
+    parser.add_argument("--mt-n", type=int, default=150000, help="memtier: total requests per thread (-n).")
     parser.add_argument("--mt-c", type=int, default=5, help="memtier: connections per thread (-c).")
     parser.add_argument("--mt-t", type=int, default=4, help="memtier: number of threads (-t).")
-    parser.add_argument("--mt-ratio", default="5:1", help="memtier: --ratio (reads:writes).")
+    parser.add_argument("--mt-ratio", default="9:1", help="memtier: --ratio (reads:writes).")
     # parser.add_argument("--mt-dsl", default="32:0.3,64:0.1,512:0.3,1024:0.2,4096:0.1",
     #                     help="memtier: --data-size-list.")
     parser.add_argument("--mt-dsl", default="32:3,64:1,512:4,1024:1,2048:1",
                     help="memtier: --data-size-list (权重必须是整数).")
     parser.add_argument("--mt-rand", action="store_true", default=True, help="memtier: use random keys (-R).")
     parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument('--sec', action='store_true', help='use source-sec/destination-sec scripts')
 
     parsed_args = parser.parse_args()
 
@@ -42,6 +46,10 @@ if __name__ == "__main__":
     CLIENT_IP = parsed_args.client_ip  # [memtier] changed
     VIP = parsed_args.vip
     runs = parsed_args.runs
+    # set source script selection
+    src, dst = choose_scripts(getattr(parsed_args, 'sec', False))
+    globals()['SOURCE_SCRIPT'] = src
+    globals()['DEST_SCRIPT'] = dst
 
         # memtier 相关参数  # [memtier] changed
     MT_N = parsed_args.mt_n
@@ -54,9 +62,9 @@ if __name__ == "__main__":
 # 定义实验类型与参数
 experiments = {
 
-    "post-copy": "-post -d --tcp-established --shell-job",
+    #"post-copy": "-post -d --tcp-established --shell-job",
 
-    # "pre-copy": "-pre -d --tcp-established --shell-job",
+     "pre-copy": "-pre -d --tcp-established --shell-job -z 0",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -117,6 +125,10 @@ def destination_prepare():
     ]
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+    # 停止 destination 后台进程并移除 pidfile（如果存在）
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
     # recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
     # run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
@@ -127,6 +139,13 @@ def destination_prepare():
     f"> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_dest.pid"
 )
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
+    ts = int(time.time())
+    dest_log = f"/tmp/{globals().get('DEST_SCRIPT','destination.py').replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {globals().get('DEST_SCRIPT','destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 def destination_clean():
     """在目标节点清理资源"""
@@ -364,8 +383,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     """清空网络配置"""
-    run_cmd("sudo tc qdisc del dev ens33 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True)
     if YCSB_IP:
         run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=YCSB_IP, ignore_error=True)
 
@@ -384,14 +403,14 @@ def configure_network():
 
     # 配置source的网络限制 (source->dest, source->ycsb)
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=source_rules,
         is_remote=False  # 本地执行
     )
 
     # 配置dest的网络限制 (dest->source, dest->ycsb)
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=dest_rules,
         is_remote=True,  # 远程执行
         target_ip=DEST_IP
@@ -418,8 +437,8 @@ def build_memtier_load_cmd():
         f"-n {MT_N}",          # 使用同样的请求数
         "-c 5",                # 你要求的 load 阶段：-c 1
         "-t 4",                # 你要求的 load 阶段：-t 1
-        "--ratio=4:1",         # 你要求的 load 阶段：写入-only
-        f"--data-size-list={MT_DSL}",
+        "--ratio=9:1",         # 你要求的 load 阶段：写入-only
+        f"--data-size-list=32:3,64:4,128:3,512:1,1024:1",
     ]
     if MT_RAND:
         parts.append("-R")     # 随机 key，保持你的默认设定
@@ -430,11 +449,11 @@ def build_memtier_cmd():
         "memtier_benchmark",
         f"-s {VIP}",
         "-p 6379",
-        f"-n {MT_N}",
+        f"-n 210000",
         f"-c {MT_C}",
         f"-t {MT_T}",
-        f"--ratio={MT_RATIO}",
-        f"--data-size-list={MT_DSL}",
+        f"--ratio=6:1",
+        f"--data-size-list=32:2,64:4,128:5,512:4,1024:1,2048:1",
     ]
     if MT_RAND:
         parts.append("-R")
@@ -466,7 +485,7 @@ def source_run_migration(exp_args):
     time.sleep(8)  # 等待 run 启动稳定
 
     # ===== 执行迁移 =====
-    migration_cmd = f"python3 source.py {exp_args} redis {DEST_IP}"
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} redis {DEST_IP}"
     run_cmd(migration_cmd)
 
     # ===== 清理源端 recvtty =====

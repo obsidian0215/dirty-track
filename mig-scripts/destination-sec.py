@@ -134,51 +134,10 @@ def handle_prepare(prepare_info):
     else:
         prepare(path, image_path, parent_paths)
 
-        # 根据端口和迭代列表，启动ncat进程监听
-        for parent, iter_num, port in zip(parent_paths, iteration_list, port_list):
-            # 定义解压路径
-            extract_path = parent
-            # 启动 ncat 监听并解压的管道命令
-            # 命令: nc -lp {port} -q 1 -w 10 | tar -xzf - -C {extract_path}
-            # 添加 -w 10 超时，-q 1 在输入结束后退出
-            if compress == 0:
-                # 无压缩
-                cmd = f"nc -lp {port} -q 1 -w 300 | tar -xf - -C {extract_path}"
-            elif compress >= 1 and compress <= 4:
-                # 使用lzo_gpu解压：先解压lzo，再解压tar
-                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
-                cmd = f"nc -lp {port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
-            else:
-                raise ValueError(f"不支持的压缩等级: {compress}")
-            # logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            #print("process id:",process)
-            # 将进程记录到字典中
-            with process_lock:
-                transfer_processes[port] = process
-
-        # 最后一个端口用于解压到 image_path
-        if port_list:
-            last_port = port_list[-1]
-            # os.makedirs(image_path, exist_ok=True)
-            extract_path = image_path
-            if compress == 0:
-                # 无压缩
-                #cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -zxf - -C {extract_path}"
-            elif compress >= 1 and compress <= 4:
-                # 使用lzo_gpu解压：先解压lzo，再解压tar
-                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
-            else:
-                raise ValueError(f"不支持的压缩等级: {compress}")
-                #cmd = f"nc -lp {last_port} "
-                #cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
-            # logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            with process_lock:
-                transfer_processes[last_port] = process
-        #print_transfer_processes()
+        # 不再通过 nc 启动监听；改为源端通过 scp/rsync 将归档文件直接传输到这些目录，
+        # 目标端将通过控制消息通知并在收到归档后执行解包。
+        # prepare() 已经创建了需要的目录结构。
+        # transfer_processes 保留以便兼容旧逻辑的清理；但此处不创建任何进程。
 
         prep_end = time.perf_counter()
         cpu_prep_end = psutil.cpu_percent(interval=None)
@@ -478,6 +437,80 @@ def _wait_all_transfers_done(timeout=30.0, interval=0.1):
             return True
         time.sleep(interval)
     return False
+
+def handle_archive_ready(info):
+    """
+    处理源端发送的 archive_ready 控制消息：立即返回 ACK（RECEIVED），
+    并在后台解包归档文件，完成后在目标目录写入处理标记文件 (.{archive}.processed)
+    以供源端通过轮询确认处理结果。
+    返回立即 ACK 字符串 'RECEIVED' 或错误信息。
+    """
+    try:
+        path = info.get('path')
+        archive = info.get('archive')
+        compress_level = info.get('compress', 0)
+
+        if not path or not archive:
+            return 'Error: invalid archive_ready payload'
+
+        full_archive = os.path.join(path, archive)
+
+        # 确保目标路径存在
+        os.makedirs(path, exist_ok=True)
+
+        def _background_extract():
+            try:
+                # 等待文件写入稳定（最长300秒）
+                if not _wait_file_stable(full_archive, timeout=300.0):
+                    # 写入失败则写入错误标记
+                    err_marker = os.path.join(path, f'.{archive}.processed.err')
+                    with open(err_marker, 'w') as f:
+                        f.write('timeout or not found')
+                    return
+
+                # 根据文件后缀选择解包命令
+                if archive.endswith('.tar.gz') or archive.endswith('.tgz'):
+                    cmd = f"tar -xzf {full_archive} -C {path}"
+                elif archive.endswith('.tar.lzo') or archive.endswith('.lzo'):
+                    lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+                    cmd = f"{lzo_gpu_path} -d {full_archive} - | tar -xf - -C {path}"
+                else:
+                    cmd = f"tar -xf {full_archive} -C {path}"
+
+                proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if proc.returncode != 0:
+                    err_marker = os.path.join(path, f'.{archive}.processed.err')
+                    with open(err_marker, 'w') as f:
+                        f.write(proc.stderr or 'extract failed')
+                    return
+
+                # 移除归档以节省空间（可选）
+                try:
+                    os.remove(full_archive)
+                except Exception:
+                    pass
+
+                # 写入成功标记
+                ok_marker = os.path.join(path, f'.{archive}.processed')
+                with open(ok_marker, 'w') as f:
+                    f.write('OK')
+
+            except Exception:
+                try:
+                    err_marker = os.path.join(path, f'.{archive}.processed.err')
+                    with open(err_marker, 'w') as f:
+                        f.write('exception during extract')
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_background_extract, daemon=True)
+        t.start()
+
+        # 立即 ACK，源端应该改为轮询目标上的 .{archive}.processed 文件以确认完成
+        return 'RECEIVED'
+
+    except Exception as e:
+        return f'Error: {e}'
 def handle_restore(msg):
     """
     处理 restore 命令，由于使用同步传输，传输在迁移过程中已完成，直接执行恢复操作。
@@ -559,8 +592,8 @@ def migrate_server():
     #Bind socket to local host and port
     try:
         s.bind((HOST, PORT))
-    except socket.error as msg:
-        print('Bind failed. Error Code : ' + str(msg[0]) + ' Message ' + msg[1])
+    except socket.error as exc:
+        print(f'Bind failed: {exc}')
         sys.exit()
 
     print('Socket bind complete')
@@ -616,6 +649,9 @@ def migrate_server():
 
                     case {'prepare': prepare_info}:
                         reply = handle_prepare(prepare_info)
+                    case {'archive_ready': info}:
+                        # 源端已通过 scp/rsync 上传了归档文件，处理并解包
+                        reply = handle_archive_ready(info)
                     case {'restore':_}:
                         # 如果所有传输已完成，立即执行恢复
                         # 所有传输指last_iter及之前的传输，和最大端口对应的传输

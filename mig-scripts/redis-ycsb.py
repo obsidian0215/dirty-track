@@ -5,15 +5,17 @@ import re
 import time
 
 # 默认设置
-SOURCE_IP = "192.168.15.199"
-DEST_IP = "192.168.15.239"
-CLIENT_IP = "192.168.15.181"  # 客户端IP
+from script_defaults import get_default_ips
+SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
-VIP = "192.168.15.100"
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
 
 # 使用argparse解析命令行参数以动态设置
+# default script selection
+from script_defaults import choose_scripts
+SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Redis container migration with YCSB testing.")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="IP address of the source machine.")
@@ -23,6 +25,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout","--redis-timeout", type=int, default=4000, help="Redis timeout in milliseconds for YCSB.")
     parser.add_argument("-rc","--recordcount", type=int, default=100000, help="Record count for YCSB (recordcount == operationcount).")
     parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument('--sec', action='store_true', help='use source-sec/destination-sec scripts')
     parsed_args = parser.parse_args()
 
     # 全局变量
@@ -34,14 +37,18 @@ if __name__ == "__main__":
     OPERATION_COUNT = RECORD_COUNT  # 两者相等
     REDIS_TIMEOUT = parsed_args.timeout
     runs = parsed_args.runs
+    # script selection
+    src, dst = choose_scripts(getattr(parsed_args, 'sec', False))
+    globals()['SOURCE_SCRIPT'] = src
+    globals()['DEST_SCRIPT'] = dst
 
 # 定义实验类型与参数
 experiments = {
     "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    "post-copy": "-post -d --tcp-established --shell-job",
-    "hybrid": "-pre -post -d --tcp-established --shell-job",
-    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+  #  "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+   # "post-copy": "-post -d --tcp-established --shell-job",
+   # "hybrid": "-pre -post -d --tcp-established --shell-job",
+   # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 def run_cmd(cmd, ignore_error=False):
@@ -107,6 +114,13 @@ def destination_prepare():
 
     recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
+    ts = int(time.time())
+    dest_log = f"/tmp/{globals().get('DEST_SCRIPT','destination.py').replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {globals().get('DEST_SCRIPT','destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 
 def destination_clean():
@@ -122,6 +136,10 @@ def destination_clean():
 
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+    # 停止 destination 后台进程并移除 pidfile（如果存在）
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
 
 def source_prepare():
@@ -345,8 +363,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     """清空网络配置"""
-    run_cmd("sudo tc qdisc del dev ens33 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True)
     if YCSB_IP:
         run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=YCSB_IP, ignore_error=True)
 
@@ -365,14 +383,14 @@ def configure_network():
 
     # 配置source的网络限制 (source->dest, source->ycsb)
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=source_rules,
         is_remote=False  # 本地执行
     )
 
     # 配置dest的网络限制 (dest->source, dest->ycsb)
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=dest_rules,
         is_remote=True,  # 远程执行
         target_ip=DEST_IP
@@ -419,8 +437,8 @@ def source_run_migration(exp_args):
     run_ycsb_cmd(ycsb_run_cmd, background=False)
 
     time.sleep(8)  # 等待YCSB启动稳定
-    # 执行source.py进行迁移
-    migration_cmd = f"python3 source.py {exp_args} redis {DEST_IP}"
+    # 执行 source 脚本进行迁移（可通过 --sec 切换）
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} redis {DEST_IP}"
     run_cmd(migration_cmd)
 
     # clean

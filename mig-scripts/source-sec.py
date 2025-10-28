@@ -88,7 +88,7 @@ def get_compressed_files_size(directory, compress_level):
     else:
         # 如果是负数或无效值（尽管 argparse 限制了），不计算
         return 0
-        
+
     try:
         with os.scandir(directory) as entries:
             for entry in entries:
@@ -98,7 +98,7 @@ def get_compressed_files_size(directory, compress_level):
                     total_size += entry.stat().st_size
     except Exception as e:
         print(f"Error calculating compressed file size in {directory}: {e}")
-            
+
     return total_size
 
 # 停止 sync_rootfs 进程的函数
@@ -221,7 +221,7 @@ def get_lzo_files_size(directory):
     if not os.path.isdir(directory):
         print(f"Warning: Directory not found, cannot calculate LZO size: {directory}")
         return 0
-        
+
     try:
         # 我们只扫描顶层目录，因为 .lzo 文件都存储在 mig_base 下
         with os.scandir(directory) as entries:
@@ -231,7 +231,7 @@ def get_lzo_files_size(directory):
                     total_size += entry.stat().st_size
     except Exception as e:
         print(f"Error calculating LZO file size in {directory}: {e}")
-            
+
     return total_size
 # [新函数结束]
 
@@ -966,7 +966,7 @@ def parse_size(size_str):
     return size
 
 #Transfer the previously created pre-dump using nc (同步版本)
-def xfer_pre_dump(parent_path, dest, i, port):
+def xfer_pre_dump(cs, parent_path, dest, i, port):
     global pre_dump_xfer_time_total
 
     # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
@@ -1036,20 +1036,95 @@ def xfer_pre_dump(parent_path, dest, i, port):
 
     print(f"Pre-dump {i} archive: {size} Bytes, {(end - start):.3f} ms")
 
-    # 传输到目标服务器
-    nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-    # print(nc_cmd)
+    # 传输到目标服务器：使用 scp/rsync（根据大小选择）
+    remote_dir = f"root@{dest}:{parent_path}"
 
-    start = time.perf_counter() * 1000
-    ret = os.system(nc_cmd)
-    end = time.perf_counter() * 1000
-    transfer_time = end - start
+    # 选择传输工具：大文件使用 rsync（可续传+效率），小文件使用 scp
+    transfer_cmd = None
+    RSYNC_THRESHOLD = 10 * 1024 * 1024  # 10MB
+    if size >= RSYNC_THRESHOLD:
+        # rsync via ssh
+        transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
+    else:
+        transfer_cmd = f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
 
-    print(f"Pre-dump {i} xfer: {transfer_time:.3f} ms")
+    # 传输时增加重试机制
+    max_retries = 3
+    attempt = 0
+    transfer_time = 0
+    success = False
+    while attempt < max_retries:
+        attempt += 1
+        print(f"Transferring pre-dump {i} to {dest} using: {transfer_cmd} (attempt {attempt})")
+        start = time.perf_counter() * 1000
+        ret = os.system(transfer_cmd)
+        end = time.perf_counter() * 1000
+        transfer_time = end - start
+        print(f"Pre-dump {i} xfer attempt {attempt}: {transfer_time:.3f} ms")
+        if ret == 0:
+            success = True
+            break
+        else:
+            print(f"Pre-dump {i} xfer failed (attempt {attempt}), ExitCode: {ret}")
+            if attempt < max_retries:
+                backoff = 2 ** attempt
+                print(f"Retrying after {backoff}s...")
+                time.sleep(backoff)
 
-    if ret != 0:
-        print(f"Pre-dump {i} xfer failed, ExitCode: {ret}")
+    if not success:
         error()
+
+    # 通知目标端已经收到归档并请求目标端解包/处理（两阶段：立即 ACK，再异步轮询目标处理完成标记）
+    try:
+        notify = json.dumps({
+            "archive_ready": {
+                "path": parent_path,
+                "archive": os.path.basename(archive_name),
+                "compress": compress,
+                "iter": i
+            }
+        })
+
+        # 发送通知并等待短时ACK
+        cs.send(bytes(notify, encoding='utf-8'))
+        inputready, _, _ = select.select([cs], [], [], 10)
+        if inputready:
+            resp = cs.recv(2048).decode('utf-8')
+            # 期待目标端快速返回 'RECEIVED'
+            if not resp or 'RECEIVED' not in resp:
+                print(f"Destination did not ACK archive upload: {resp}")
+                error()
+        else:
+            print("No immediate ACK from destination (timeout)")
+            error()
+
+    except Exception as e:
+        print(f"Error notifying destination about archive: {e}")
+        error()
+
+    # 异步轮询目标上是否写入了 .{archive}.processed 标记（不阻塞主流程）
+    def _poll_processed():
+        marker = os.path.join(parent_path, f'.{os.path.basename(archive_name)}.processed')
+        err_marker = os.path.join(parent_path, f'.{os.path.basename(archive_name)}.processed.err')
+        check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+        timeout = 600.0
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                proc = subprocess.run(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                out = proc.stdout.strip()
+                if out == 'OK':
+                    print(f"Pre-dump {i} processed on destination")
+                    return
+                if out == 'ERR':
+                    print(f"Pre-dump {i} extraction failed on destination")
+                    return
+            except Exception as e:
+                print(f"Error polling processed marker: {e}")
+            time.sleep(1.0)
+
+    poll_thread = threading.Thread(target=_poll_processed, daemon=True)
+    poll_thread.start()
 
     if time_constraint > 0:
         bandwidth_measurements.append(1000.0 * size / transfer_time)
@@ -1057,7 +1132,7 @@ def xfer_pre_dump(parent_path, dest, i, port):
     pre_dump_xfer_time_total += transfer_time
 
 #Transfer the previosuly created dump using rsync
-def xfer_final(image_path, dest, compress, port):
+def xfer_final(cs, image_path, dest, compress, port):
     global dump_xfer_time
 
     # print("xfer DUMP")
@@ -1101,14 +1176,106 @@ def xfer_final(image_path, dest, compress, port):
         cmd_tar = f"nc -q 0 {dest} {port} < {lzo_name}"
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
-    start = time.perf_counter() * 1000
-    ret = os.system(cmd_tar)
-    end = time.perf_counter() * 1000
-    # print(f"DUMP transfer time {(end - start):.3f} ms")
+    # 传输到目标服务器：使用 scp/rsync 选择
+    # 如果是已生成的文件(lzo或tar), 找到要传输的实际文件
+    if compress == 0:
+        # tar via stdout handled earlier as cmd_tar; but we now prefer to create a file and scp it
+        # 使用 tar -cf - | ssh dest "cat > /path/to/image_archive.tar"
+        archive_name = os.path.join(mig_base, "final_dump.tar.gz")
+        # 生成压缩tar.gz
+        cmd_make = f"tar -czf {archive_name} -C {image_path} ."
+        ret = os.system(cmd_make)
+        if ret != 0:
+            print("Create final tar.gz failed")
+            error()
+    elif compress >= 1 and compress <= 4:
+        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
+        archive_name = lzo_name
+    else:
+        raise ValueError(f"不支持的压缩等级: {compress}")
 
-    # 计算传输时间
-    dump_xfer_time = end - start
-    if ret != 0:
+    # 选择传输工具
+    RSYNC_THRESHOLD = 10 * 1024 * 1024
+    size = os.path.getsize(archive_name)
+    remote_dir = f"root@{dest}:{image_path}"
+    if size >= RSYNC_THRESHOLD:
+        transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
+    else:
+        transfer_cmd = f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+
+    print(f"Transferring final dump to {dest} using: {transfer_cmd}")
+    # final transfer with retries
+    max_retries = 3
+    attempt = 0
+    dump_xfer_time = 0
+    success = False
+    while attempt < max_retries:
+        attempt += 1
+        start = time.perf_counter() * 1000
+        ret = os.system(transfer_cmd)
+        end = time.perf_counter() * 1000
+        dump_xfer_time = end - start
+        print(f"Final dump xfer attempt {attempt}: {dump_xfer_time:.3f} ms")
+        if ret == 0:
+            success = True
+            break
+        else:
+            print(f"Final dump transfer failed (attempt {attempt}), ExitCode: {ret}")
+            if attempt < max_retries:
+                backoff = 2 ** attempt
+                print(f"Retrying after {backoff}s...")
+                time.sleep(backoff)
+
+    if not success:
+        error()
+
+    # 通知目标端解包并处理，等待短时ACK
+    try:
+        notify = json.dumps({
+            "archive_ready": {
+                "path": image_path,
+                "archive": os.path.basename(archive_name),
+                "compress": compress,
+                "final": True
+            }
+        })
+        cs.send(bytes(notify, encoding='utf-8'))
+        inputready, _, _ = select.select([cs], [], [], 10)
+        if inputready:
+            resp = cs.recv(4096).decode('utf-8')
+            if not resp or 'RECEIVED' not in resp:
+                print(f"Destination did not ACK final archive: {resp}")
+                error()
+        else:
+            print("Timed out waiting for destination ACK for final archive")
+            error()
+    except Exception as e:
+        print(f"Error notifying destination about final archive: {e}")
+        error()
+
+    # 对 final dump 在主流程中同步等待目标处理完成（最长等待600s）
+    marker = os.path.join(image_path, f'.{os.path.basename(archive_name)}.processed')
+    err_marker = os.path.join(image_path, f'.{os.path.basename(archive_name)}.processed.err')
+    check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+    timeout = 600.0
+    end_time = time.time() + timeout
+    processed_ok = False
+    while time.time() < end_time:
+        try:
+            proc = subprocess.run(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            out = proc.stdout.strip()
+            if out == 'OK':
+                processed_ok = True
+                break
+            if out == 'ERR':
+                print('Final dump extraction failed on destination')
+                error()
+        except Exception as e:
+            print(f"Error polling final processed marker: {e}")
+        time.sleep(1.0)
+
+    if not processed_ok:
+        print('Timed out waiting for destination to process final archive')
         error()
 
 # Run the pre-dump iteration and transfer it to the destination
@@ -1168,7 +1335,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
                 iter_terminate = True
 
         # 传输当前迭代的 pre-dump
-        xfer_pre_dump(last_path, dest, last_iter, port_list[last_iter-1])
+        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter-1])
         if iter_terminate:
             break
         last_iter += 1
@@ -1574,7 +1741,7 @@ def migrate(container, dest, pre, post, replay,
             print(f"创建转储后同步标记失败: {e}")
 
     # 传输容器剩余状态
-    xfer_final(image_path, dest, compress, port_list[-1])
+    xfer_final(cs, image_path, dest, compress, port_list[-1])
 
 
     # 等待强制同步完成 - 检查标记文件是否已被删除
@@ -1907,17 +2074,17 @@ if __name__ == '__main__':
         # 1. 计算 LZO 文件总大小 (分子)
         # mig_base 在 __main__ 块的开头 (约 1756 行) 已经定义
         #total_lzo_size = get_lzo_files_size(mig_base)
-        total_compressed_size = get_compressed_files_size(mig_base, compress) # <-- 修正后的调用 
+        total_compressed_size = get_compressed_files_size(mig_base, compress) # <-- 修正后的调用
         # 2. 计算未压缩数据总大小 (分母)
-        # pre_dump_size_total 和 dump_size 是全局变量, 
+        # pre_dump_size_total 和 dump_size 是全局变量,
         # 并在 migrate() 函数末尾通过 get_dump_size() 填充
         total_uncompressed_size = pre_dump_size_total + dump_size
-        
+
         compression_ratio = 0.0
         if total_uncompressed_size > 0:
             # 压缩率 = (压缩后大小 / 压缩前大小) * 100%
-            compression_ratio = (total_uncompressed_size / total_compressed_size) 
-        
+            compression_ratio = (total_uncompressed_size / total_compressed_size)
+
         print(f'Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB')
         # print(f'Total Original (uncompressed) size: {total_uncompressed_size / 1024:.3f} KB')
         print(f'Compression Ratio: {compression_ratio:.2f} %')

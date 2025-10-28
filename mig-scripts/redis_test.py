@@ -5,17 +5,15 @@ import re
 import time
 
 # 默认设置
-SOURCE_IP = "192.168.37.159"
-DEST_IP = "192.168.37.161"
-CLIENT_IP = "192.168.37.158"
-VIP = "192.168.37.150"
-
+from script_defaults import get_default_ips, choose_scripts
+SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
+SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 # 场景配置：Redis的video和sensor场景
 scene_configs = {
     'video': {
         'bench': 'experiment/migration/redis/bench_video_cache.py',
         'base_args': {
-            '--redis-host': '192.168.37.150',
+            '--redis-host': '192.168.2.100',
             '--redis-port': '6379',
             '--duration': '120', #
             '--payload-size-kb': '1'
@@ -33,7 +31,7 @@ scene_configs = {
             '--payload-size-kb': '2',
             '--sensors-per-device': '10',
             '--read-pct': '0',
-            '--duration': '90', # 90s 
+            '--duration': '90', # 90s
             '--target-db-size-mb':'120'
         }
     },
@@ -77,6 +75,13 @@ def destination_prepare():
 
     recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
+    ts = int(time.time())
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 def destination_clean():
     container_name = "redis"
@@ -88,6 +93,10 @@ def destination_clean():
     ]
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
+    # 停止destination后台进程并移除pid（如果存在）
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, DEST_IP, ignore_error=True)
 
 def source_prepare():
     container_name = "redis"
@@ -163,10 +172,11 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
         return False
 
 def clean_configure_network():
-    run_cmd("sudo tc qdisc del dev ens33 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev ens33 root", DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True)
     if CLIENT_IP:
         run_remote_cmd("sudo tc qdisc del dev ens33 root", CLIENT_IP, ignore_error=True)
+
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
     """配置网络规则，使用 tc 命令设置带宽和延迟"""
@@ -174,7 +184,7 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         raise ValueError("Target IP must be provided for remote execution.")
 
     base_cmds = [
-        "sudo tc qdisc add dev ens33 root handle 1: htb",
+        f"sudo tc qdisc add dev {interface} root handle 1: htb",
     ]
 
     for idx, rule in enumerate(rules, start=1):
@@ -185,40 +195,41 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         dst = rule["dst"]
 
         base_cmds.extend([
-            f"sudo tc class add dev ens33 parent 1: classid {classid} htb rate {rate}",
-            f"sudo tc filter add dev ens33 protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
-            f"sudo tc qdisc add dev ens33 parent {classid} handle {handle} netem delay {delay}",
+            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
+            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
         ])
 
     for cmd in base_cmds:
-        print(f"Executing: {cmd}")
+        print(f"Executing network config: {cmd}")
         if is_remote:
             run_remote_cmd(cmd, target_ip=target_ip, ignore_error=ignore_error)
         else:
             run_cmd(cmd, ignore_error=ignore_error)
 
+
 def configure_network():
     """配置网络限制"""
     source_rules = [
-        {"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}
+        {"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}
     ]
     dest_rules = [
-        {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}
+        {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}
     ]
     if CLIENT_IP:
-        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
 
     # 配置source的网络限制
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=source_rules,
         is_remote=False  # 本地执行
     )
 
     # 配置dest的网络限制
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=dest_rules,
         is_remote=True,  # 远程执行
         target_ip=DEST_IP
@@ -229,8 +240,8 @@ def configure_network():
         configure_network_do(
             interface="ens33",
             rules=[
-                {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP}
+                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP}
             ],
             is_remote=True,  # 远程执行
             target_ip=CLIENT_IP
@@ -255,8 +266,8 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
 experiments = {
 
     # "post-copy": "-post -d --tcp-established --shell-job",
-    # "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+    #"pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
@@ -300,10 +311,10 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
         # run_args['--rps'] = '100'
     if scene == 'vehicle':
         run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
-        run_args['--size-distribution'] = 'normal' # 
+        run_args['--size-distribution'] = 'normal' #
         run_args['--vehicle-pattern'] = 'highway'
 
-    # run 
+    # run
     run_bg_cmd = (
         f"cd {bench_dir} && "
         f"nohup python3 {bench_file} {args_to_str(run_args)} "
@@ -313,8 +324,8 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
     time.sleep(3)
 
 
-    # 执行source.py进行迁移
-    migration_cmd = f"python3 source.py {exp_args} {container_name} {DEST_IP}"
+    # 执行 source 脚本进行迁移（支持 secure 变体）
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} {container_name} {DEST_IP}"
     run_cmd(migration_cmd)
 
     # clean
@@ -339,11 +350,12 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
 
 def main():
     # 使用参数值更新全局变量
-    global SOURCE_IP, DEST_IP, CLIENT_IP
+    global SOURCE_IP, DEST_IP, CLIENT_IP, SOURCE_SCRIPT
     parser = argparse.ArgumentParser(description="Redis自动化负载测试脚本")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="迁移源IP")
     parser.add_argument("-d", "--dest-ip", default=DEST_IP, help="迁移目标IP")
     parser.add_argument("-c", "--client-ip", default=CLIENT_IP, help="客户端IP")
+    parser.add_argument("--sec", action='store_true', help="use secure source/destination scripts (source-sec.py / destination-sec.py)")
     parser.add_argument("--scene", choices=['video', 'sensor','vehicle'], required=True, help="场景: video或sensor")
     parser.add_argument("--redis-port", type=int, default=6379, help="Redis端口")
     parser.add_argument("--threads", type=int, help="线程数")
@@ -357,10 +369,11 @@ def main():
                        default=list(experiments.keys()), help="要运行的迁移实验类型，默认全部")
     args = parser.parse_args()
 
-    
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
+    # 根据 --sec 切换为 secure 变体
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(args, 'sec', False))
 
     experiment_types_to_run = args.experiment_types if args.experiment_types else list(experiments.keys())
 

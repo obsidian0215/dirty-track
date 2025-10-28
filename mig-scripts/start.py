@@ -6,10 +6,10 @@ import re
 
 
 # 默认设置
-SOURCE_IP = "192.168.37.159"
-DEST_IP = "192.168.37.161"
-CLIENT_IP = "192.168.37.158"
-VIP = "192.168.37.150"
+from script_defaults import get_default_ips, choose_scripts
+SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
+SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+
 
 def run_cmd(cmd, ignore_error=False):
     print("Executing on source:", cmd)
@@ -215,11 +215,11 @@ def source_prepare(args):
 def source_run_migration(args,exp_args):
     container_name = args.container
     # 开启工具测试
-    run_remote_cmd('wrk -t4 -c50 -d120s --timeout 10s http://192.168.37.150/', CLIENT_IP, ignore_error=True,background=True)
+    run_remote_cmd('wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/', CLIENT_IP, ignore_error=True,background=True)
 
     time.sleep(3)  # 等待bench启动稳定
-    # 执行source.py进行迁移
-    run_cmd(f"python3 source.py {container_name} {DEST_IP} {exp_args}")
+    # 执行 source 脚本进行迁移 (可切换为 secure 变体)
+    run_cmd(f"python3 {SOURCE_SCRIPT} {container_name} {DEST_IP} {exp_args}")
 
 
 def source_clean(args):
@@ -242,10 +242,17 @@ def destination_prepare(args):
     (f"rm -rf /runc/containers/{container_name}",False),
     (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}",False),
     # 启动console.sock并把进程号存储起来,后续清理时kill掉
-    (f"nohup recvtty -m single /runc/containers/{container_name}/console.sock  > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid", False)
+    (f"nohup  /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock  > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid", False)
     ]
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP,ignore_error=ign)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
+    ts = int(time.time())
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 def destination_clean(args):
     # 恢复过程结束时杀死recvtty进程
@@ -262,6 +269,10 @@ def destination_clean(args):
 
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+    # 停止 destination 后台进程（如果存在）并移除 pid 文件
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
 
 
@@ -312,42 +323,42 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     # 清空网络配置
-    run_cmd("sudo tc qdisc del dev ens33 root",ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=DEST_IP,ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root",ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root",target_ip=DEST_IP,ignore_error=True)
     if VIP_IP:
         run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP,ignore_error=True)
 
 def configure_network():
     source_rules = [
-    {"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}
+    {"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}
         ]
     dest_rules = [
-    {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}
+    {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}
     ]
     if VIP_IP:
-        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
 
   # 配置source的网络限制  source->dest  source->client
     configure_network_do(
-    interface="ens33",
+    interface="enp2s0",
     rules=source_rules,
     is_remote=False  # 本地执行
     )
  # 配置dest的网络限制  dest->source  dest->client
     configure_network_do(
-    interface="ens33",
+    interface="enp2s0",
     rules=dest_rules,
     is_remote=True,  # 远程执行
     target_ip=DEST_IP  # 远程执行命令机器 IP
-    )   
+    )
     # 配置client的网络限制  client->vip
     if VIP_IP:
         configure_network_do(
         interface="ens33",
         rules=[
-            {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-            {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP}
+            {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
+            {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP}
         ],
         is_remote=True,  # 远程执行
         target_ip=CLIENT_IP  # 远程执行命令机器 IP
@@ -355,10 +366,14 @@ def configure_network():
 
 # 定义实验类型与参数
 experiments = {
-    "post-copy": "-post -d --tcp-established --shell-job",
+    #"post-copy": "-post -d --tcp-established --shell-job",
 
 
-    # "pre-copy": "-pre -d --tcp-established --shell-job",
+     #"pre-copy": "-pre -d --tcp-established --shell-job",
+     #"pre-copy": "-pre -d --tcp-established --shell-job -z 1",
+     #"pre-copy": "-pre -d --tcp-established --shell-job -z 2",
+     "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+     #"pre-copy": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -377,6 +392,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dest-ip", required=True, help="IP address of the destination machine.")
     parser.add_argument("--client-ip", required=False, help="IP address of the machine running client such as ycsb.")
     parser.add_argument("--virtual-ip", required=False, help="virtual ip ")
+    parser.add_argument("--sec", action='store_true', help="use secure source/destination scripts (source-sec.py / destination-sec.py)")
     args = parser.parse_args()
 
 
@@ -384,6 +400,8 @@ if __name__ == "__main__":
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
     VIP_IP = args.virtual_ip
+    # 选择 source 脚本：使用 centralized helper
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
     #print(DEST_IP)
     #input()
     for exp_name, exp_args in experiments.items():
@@ -403,7 +421,7 @@ if __name__ == "__main__":
                 # 开启网络资源限制
                 configure_network()
 
-            
+
                 # 执行迁移
                 source_run_migration(args,exp_args)
                 #input()

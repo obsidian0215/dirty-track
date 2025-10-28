@@ -21,17 +21,18 @@ import time
 import re
 
 # 默认设置
-SOURCE_IP = "192.168.37.159"
-DEST_IP = "192.168.37.161"
-CLIENT_IP = "192.168.37.158"
-VIP = "192.168.37.150"
+from script_defaults import get_default_ips, choose_scripts
+SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
+
+# default script to call; can be switched to source-sec.py via --sec
+SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
 # 定义实验类型
 experiments = {
-    # "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy": "-pre -d --tcp-established --shell-job -z 1"
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "post-copy": "-post -d --tcp-established --shell-job"
-    "hybrid": "-pre -post -d --tcp-established --shell-job",
+    #"hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
@@ -40,7 +41,7 @@ scene_configs = {
     'sensor': {
         'bench': 'experiment/migration/influxdb/bench_sensoragg.py',
         'base_args': {
-            '--influx-url': 'http://192.168.37.150:8181',
+            '--influx-url': 'http://192.168.2.100:8181',
             # '--token': 'token',
             # '--org': 'org',
             # '--bucket': 'sensor-data',
@@ -55,7 +56,7 @@ scene_configs = {
     'vehicle': {
         'bench': 'experiment/migration/influxdb/bench_cartelem.py',
         'base_args': {
-            '--influx-url': 'http://192.168.37.150:8181',
+            '--influx-url': 'http://192.168.2.100:8181',
             # '--token': 'token',
             # '--org': 'org',
             # '--bucket': 'vehicle-data',
@@ -104,8 +105,15 @@ def destination_prepare():
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
 
-    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    recvtty_cmd = f"PATH=$PATH:/root/go/bin /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
+    # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
+    ts = int(time.time())
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
+    print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 def destination_clean():
     container_name = "influxdb"
@@ -117,6 +125,10 @@ def destination_clean():
     ]
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
+    # 停止 destination 后台进程并移除 pidfile（如果存在）
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    run_remote_cmd(stop_cmd, DEST_IP, ignore_error=True)
 
 def source_prepare():
     container_name = "influxdb"
@@ -192,8 +204,8 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
         return False
 
 def clean_configure_network():
-    run_cmd("sudo tc qdisc del dev ens33 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev ens33 root", DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True)
     if CLIENT_IP:
         run_remote_cmd("sudo tc qdisc del dev ens33 root", CLIENT_IP, ignore_error=True)
 
@@ -230,25 +242,25 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 def configure_network():
     """配置网络限制"""
     source_rules = [
-        {"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}
+       {"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}
     ]
     dest_rules = [
-        {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}
+        {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}
     ]
     if CLIENT_IP:
-        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
 
     # 配置source的网络限制
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=source_rules,
         is_remote=False  # 本地执行
     )
 
     # 配置dest的网络限制
     configure_network_do(
-        interface="ens33",
+        interface="enp2s0",
         rules=dest_rules,
         is_remote=True,  # 远程执行
         target_ip=DEST_IP
@@ -259,8 +271,8 @@ def configure_network():
         configure_network_do(
             interface="ens33",
             rules=[
-                {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP}
+                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP}
             ],
             is_remote=True,  # 远程执行
             target_ip=CLIENT_IP
@@ -300,10 +312,10 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
 
     if scene == 'vehicle':
         run_args['--payload-size-kb']  = '4'   # ★ 你要的新值
-        run_args['--size-distribution'] = 'normal' # 
+        run_args['--size-distribution'] = 'normal' #
         run_args['--vehicle-pattern'] = 'highway'
 
-    # run 
+    # run
     run_bg_cmd = (
         f"cd {bench_dir} && "
         f"nohup python3 {bench_file} {args_to_str(run_args)} "
@@ -313,8 +325,8 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
 
     time.sleep(3)  # 等待bench启动稳定
 
-    # 执行source.py进行迁移
-    migration_cmd = f"python3 source-cpu-mem-net.py {exp_args} {container_name} {DEST_IP}"
+    # 执行 source 脚本进行迁移（可通过 --sec 切换到 source-sec.py）
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} {container_name} {DEST_IP}"
     run_cmd(migration_cmd)
 
     # ---------- 5) 迁移后清理后台 bench ----------
@@ -337,7 +349,7 @@ def source_run_migration(exp_args, scene_config, extra_args,scene):
 
 def run_migration(experiment_args, container_name):
     """运行迁移命令"""
-    migration_cmd = f"python3 source-cpu-mem-net.py {experiment_args} {container_name} {DEST_IP}"
+    migration_cmd = f"python3 {SOURCE_SCRIPT} {experiment_args} {container_name} {DEST_IP}"
     print(f"Running migration: {migration_cmd}")
     result = subprocess.run(migration_cmd, shell=True)
     if result.returncode != 0:
@@ -370,13 +382,18 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="每个实验类型的运行次数")
     parser.add_argument("--experiment-types", nargs='*', choices=list(experiments.keys()),
                        default=list(experiments.keys()), help="要运行的实验类型，默认全部")
+    parser.add_argument('--sec', action='store_true', help='use source-sec/destination-sec scripts')
 
     args = parser.parse_args()
 
-    
+
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
+
+    # set script selection
+    global SOURCE_SCRIPT
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
 
     # 设置场景特有bucket
     if not args.bucket:
