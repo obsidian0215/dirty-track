@@ -1,12 +1,12 @@
+import argparse
+import re
 import subprocess
 import sys
 import time
-import argparse
-import re
-
 
 # 默认设置
-from script_defaults import get_default_ips, choose_scripts
+from script_defaults import choose_scripts, get_default_ips
+
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
@@ -19,6 +19,7 @@ def run_cmd(cmd, ignore_error=False):
         sys.exit(1)
     else:
         print(result.stdout)
+
 
 # def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
 #     # 如果background=True，则在目标机器上使用nohup和&将进程放入后台
@@ -35,6 +36,7 @@ def run_cmd(cmd, ignore_error=False):
 #         sys.exit(1)
 #     else:
 #         print(result.stdout)
+
 
 def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
     if not target_ip:
@@ -71,9 +73,9 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
     """
 
     # 配置文件路径 (固定值)
-    config_path = '/etc/keepalived/keepalived.conf'
+    config_path = "/etc/keepalived/keepalived.conf"
     # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
-    pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
+    pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
 
     # 定义修改文件的函数
     def modify_file(content):
@@ -99,7 +101,10 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
             print(f"在远程机器 {target_ip} 重启 keepalived 服务...")
             result = subprocess.run(
                 f"ssh {target_ip} '{restart_cmd}'",
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
             if result.returncode != 0:
                 print(f"远程重启 keepalived 失败: {result.stderr}")
@@ -107,38 +112,32 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
 
             # 检查服务状态
             status = subprocess.run(
-                f"ssh {target_ip} '{status_cmd}'",
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                f"ssh {target_ip} '{status_cmd}'", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
             if status.returncode == 0 and status.stdout.strip() == "active":
-                print(f"远程 keepalived 服务已成功重启并处于活动状态。")
+                print("远程 keepalived 服务已成功重启并处于活动状态。")
                 return True
             else:
-                print(f"远程 keepalived 服务未能成功重启或未处于活动状态。")
+                print("远程 keepalived 服务未能成功重启或未处于活动状态。")
                 return False
 
         else:
             # 重启本地服务
             print("在本地机器重启 keepalived 服务...")
-            result = subprocess.run(
-                restart_cmd,
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            result = subprocess.run(restart_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if result.returncode != 0:
                 print(f"本地重启 keepalived 失败: {result.stderr}")
                 return False
 
             # 检查服务状态
-            status = subprocess.run(
-                status_cmd,
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            status = subprocess.run(status_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if status.returncode == 0 and status.stdout.strip() == "active":
                 print("本地 keepalived 服务已成功重启并处于活动状态。")
                 return True
             else:
                 print("本地 keepalived 服务未能成功重启或未处于活动状态。")
                 return False
+
     try:
         if is_remote:
             if not target_ip:
@@ -148,7 +147,10 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
             print(f"从远程机器 {target_ip} 读取配置文件...")
             result = subprocess.run(
                 f"ssh {target_ip} 'cat {config_path}'",
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
             if result.returncode != 0:
                 print(f"远程读取配置文件失败: {result.stderr}")
@@ -163,7 +165,10 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
             print(f"将修改后的内容写回远程机器 {target_ip}...")
             write_result = subprocess.run(
                 f"ssh {target_ip} \"echo '{updated_content}' > {config_path}\"",
-                shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
             if write_result.returncode != 0:
                 print(f"远程写入配置文件失败: {write_result.stderr}")
@@ -175,7 +180,7 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
         else:
             # 本地读取配置文件内容
             print("从本地读取配置文件...")
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 content = f.read()
 
             updated_content = modify_file(content)
@@ -184,10 +189,10 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
 
             # 写回本地配置文件
             print("将修改后的内容写回本地配置文件...")
-            with open(config_path, 'w') as f:
+            with open(config_path, "w") as f:
                 f.write(updated_content)
 
-               # 重启本地服务
+            # 重启本地服务
             if not restart_keepalived(is_remote=False):
                 return False
 
@@ -198,24 +203,34 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
         print(f"修改配置文件时出错: {e}")
         return False
 
+
 def source_prepare(args):
     container_name = args.container
     cmds = [
         # 准备新的bundle
-        (f"rm -rf /runc/containers/{container_name}",False),
-        (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}",False),
+        (f"rm -rf /runc/containers/{container_name}", False),
+        (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
-        (f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",False),
+        (
+            f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            False,
+        ),
         # 启动容器
-        (f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",False)
+        (
+            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            False,
+        ),
     ]
     for c, ign in cmds:
         run_cmd(c, ignore_error=ign)
 
-def source_run_migration(args,exp_args):
+
+def source_run_migration(args, exp_args):
     container_name = args.container
     # 开启工具测试
-    run_remote_cmd('wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/', CLIENT_IP, ignore_error=True,background=True)
+    run_remote_cmd(
+        "wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/", CLIENT_IP, ignore_error=True, background=True
+    )
 
     time.sleep(3)  # 等待bench启动稳定
     # 执行 source 脚本进行迁移 (可切换为 secure 变体)
@@ -225,27 +240,31 @@ def source_run_migration(args,exp_args):
 def source_clean(args):
     container_name = args.container
     # 清理console.sock
-    run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null",ignore_error=True)
+    run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True)
     # 清理 dirtypages的挂载, 可忽略错误(有时候挂载都清理完毕了)
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*",ignore_error=True)
+    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
-    run_cmd(f"runc delete {container_name}", ignore_error=True) # 如果容器不存在可忽略错误
-    run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
-    run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9",ignore_error=True)
+    run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
+    run_cmd("ps aux | grep 'inotifywait' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", ignore_error=True)
+    run_cmd("ps aux | grep 'sync_rootfs' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", ignore_error=True)
+
 
 def destination_prepare(args):
     # 在目标节点执行准备操作
     # 有些命令可能出现非致命错误，用ignore_error=True
     container_name = args.container
     cmds = [
-     # 准备新的bundle,
-    (f"rm -rf /runc/containers/{container_name}",False),
-    (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}",False),
-    # 启动console.sock并把进程号存储起来,后续清理时kill掉
-    (f"nohup  /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock  > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid", False)
+        # 准备新的bundle,
+        (f"rm -rf /runc/containers/{container_name}", False),
+        (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
+        # 启动console.sock并把进程号存储起来,后续清理时kill掉
+        (
+            f"nohup  /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock  > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid",
+            False,
+        ),
     ]
     for c, ign in cmds:
-        run_remote_cmd(c, target_ip=DEST_IP,ignore_error=ign)
+        run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
@@ -254,26 +273,28 @@ def destination_prepare(args):
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
+
 def destination_clean(args):
     # 恢复过程结束时杀死recvtty进程
     container_name = args.container
 
     cmds = [
         (f"runc kill {container_name}", True),  # 如果容器不存在可忽略错误
-        (f"runc delete {container_name}", True), # 如果容器不存在可忽略错误
-        (f"kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null",True), # 杀死recvtty进程
-        (f"ps aux | grep 'recvtty' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9", True),
-        #(f"ps aux | grep '[n]c -lp' | awk '{{print $2}}' | xargs -r kill -9", False),
-        (f"ps aux | grep '[n]c -lp' | grep -v grep | awk '{{print \\$2}}' | xargs -r kill -9", True)
+        (f"runc delete {container_name}", True),  # 如果容器不存在可忽略错误
+        ("kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null", True),  # 杀死recvtty进程
+        ("ps aux | grep 'recvtty' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
+        # (f"ps aux | grep '[n]c -lp' | awk '{{print $2}}' | xargs -r kill -9", False),
+        ("ps aux | grep '[n]c -lp' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
     ]
 
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
     # 停止 destination 后台进程（如果存在）并移除 pid 文件
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    stop_cmd = f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    stop_cmd = (
+        f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
-
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
@@ -306,11 +327,13 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         delay = rule["delay"]
         dst = rule["dst"]
 
-        base_cmds.extend([
-            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
-            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
-        ])
+        base_cmds.extend(
+            [
+                f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
+            ]
+        )
 
     # 执行命令 (本地或远程)
     for cmd in base_cmds:
@@ -323,57 +346,46 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     # 清空网络配置
-    run_cmd("sudo tc qdisc del dev enp2s0 root",ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev enp2s0 root",target_ip=DEST_IP,ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True)
     if VIP_IP:
-        run_remote_cmd("sudo tc qdisc del dev ens33 root",target_ip=CLIENT_IP,ignore_error=True)
+        run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=CLIENT_IP, ignore_error=True)
+
 
 def configure_network():
-    source_rules = [
-    {"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}
-        ]
-    dest_rules = [
-    {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}
-    ]
+    source_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
     if VIP_IP:
         source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
         dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
 
-  # 配置source的网络限制  source->dest  source->client
+    # 配置source的网络限制  source->dest  source->client
+    configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
+    # 配置dest的网络限制  dest->source  dest->client
     configure_network_do(
-    interface="enp2s0",
-    rules=source_rules,
-    is_remote=False  # 本地执行
-    )
- # 配置dest的网络限制  dest->source  dest->client
-    configure_network_do(
-    interface="enp2s0",
-    rules=dest_rules,
-    is_remote=True,  # 远程执行
-    target_ip=DEST_IP  # 远程执行命令机器 IP
+        interface="enp2s0", rules=dest_rules, is_remote=True, target_ip=DEST_IP  # 远程执行  # 远程执行命令机器 IP
     )
     # 配置client的网络限制  client->vip
     if VIP_IP:
         configure_network_do(
-        interface="ens33",
-        rules=[
-            {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-            {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP}
-        ],
-        is_remote=True,  # 远程执行
-        target_ip=CLIENT_IP  # 远程执行命令机器 IP
-    )
+            interface="ens33",
+            rules=[
+                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP},
+            ],
+            is_remote=True,  # 远程执行
+            target_ip=CLIENT_IP,  # 远程执行命令机器 IP
+        )
+
 
 # 定义实验类型与参数
 experiments = {
-    #"post-copy": "-post -d --tcp-established --shell-job",
-
-
-     #"pre-copy": "-pre -d --tcp-established --shell-job",
-     #"pre-copy": "-pre -d --tcp-established --shell-job -z 1",
-     #"pre-copy": "-pre -d --tcp-established --shell-job -z 2",
-     "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
-     #"pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+    # "post-copy": "-post -d --tcp-established --shell-job",
+    # "pre-copy": "-pre -d --tcp-established --shell-job",
+    # "pre-copy": "-pre -d --tcp-established --shell-job -z 1",
+    # "pre-copy": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+    # "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -392,9 +404,10 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--dest-ip", required=True, help="IP address of the destination machine.")
     parser.add_argument("--client-ip", required=False, help="IP address of the machine running client such as ycsb.")
     parser.add_argument("--virtual-ip", required=False, help="virtual ip ")
-    parser.add_argument("--sec", action='store_true', help="use secure source/destination scripts (source-sec.py / destination-sec.py)")
+    parser.add_argument(
+        "--sec", action="store_true", help="use secure source/destination scripts (source-sec.py / destination-sec.py)"
+    )
     args = parser.parse_args()
-
 
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
@@ -402,10 +415,10 @@ if __name__ == "__main__":
     VIP_IP = args.virtual_ip
     # 选择 source 脚本：使用 centralized helper
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
-    #print(DEST_IP)
-    #input()
+    # print(DEST_IP)
+    # input()
     for exp_name, exp_args in experiments.items():
-        for i in range(1, runs+1):
+        for i in range(1, runs + 1):
             print(f"======== Running {exp_name} experiment run {i} ========")
 
             try:
@@ -416,15 +429,14 @@ if __name__ == "__main__":
                 source_prepare(args)
 
                 # 还原keepalived配置
-                #update_keepalived_priority(100)
-                #update_keepalived_priority(50,True,DEST_IP)
+                # update_keepalived_priority(100)
+                # update_keepalived_priority(50,True,DEST_IP)
                 # 开启网络资源限制
                 configure_network()
 
-
                 # 执行迁移
-                source_run_migration(args,exp_args)
-                #input()
+                source_run_migration(args, exp_args)
+                # input()
                 print(f"======== Finished {exp_name} experiment run {i} ========")
             except Exception as e:
                 # 捕获异常并打印错误信息
@@ -432,13 +444,11 @@ if __name__ == "__main__":
             finally:
                 # 无论前面是否出错，清理源和目标节点资源
                 print("Cleaning up source and destination resources...")
-                #input()
+                # input()
                 source_clean(args)
                 destination_clean(args)
                 clean_configure_network()
 
-            print(f"======== sleep ========")
+            print("======== sleep ========")
             # time.sleep(30000) #
             # input()
-
-
