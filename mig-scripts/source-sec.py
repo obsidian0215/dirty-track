@@ -158,7 +158,7 @@ def stop_sync_rootfs():
 
                 # 再次尝试清理子进程
                 if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
-                    kill_proc = subprocess.run(
+                    subprocess.run(
                         f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
                     )
 
@@ -241,8 +241,6 @@ def get_lzo_files_size(directory):
 
 
 # [新函数结束]
-
-
 def final_sync_es_data(dest_ip, rootfs_path):
     """
     在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
@@ -428,8 +426,6 @@ def read_unsigned_long(file_path):
         return []
 
 
-
-
 def read_dirtymap(file_path):
     """
     读取dirtymap文件，返回文件头（时间）和记录的脏页地址。
@@ -463,7 +459,7 @@ def read_dirtymap(file_path):
             count = len(data) // entry_size
             addresses = []
             for i in range(count):
-                entry = data[i * entry_size : (i + 1) * entry_size]
+                entry = data[i * entry_size: (i + 1) * entry_size]
                 address, write_count = struct.unpack("<QI", entry)
                 addresses.append(address)
 
@@ -573,7 +569,7 @@ def read_warmlist(file_path):
 
             for i in range(count):
                 # 解析单个条目
-                entry = data[i * entry_size : (i + 1) * entry_size]
+                entry = data[i * entry_size: (i + 1) * entry_size]
                 address, s_count = struct.unpack("<QB", entry)  # Q: unsigned long, B: unsigned char
 
                 # 更新最大值
@@ -1538,25 +1534,6 @@ def update_image_parent(mig_base: str, latest_parent: str):
         error()
 
 
-def final_sync_es_data(dest_ip, rootfs_path):
-    """
-    在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
-    """
-    import os
-    import subprocess
-
-    src_data = os.path.join(rootfs_path, "usr/share/elasticsearch/data") + "/"
-    dst_data = f"root@{dest_ip}:{src_data}"
-
-    # 确保目标端父目录存在
-    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'", shell=True, check=False, text=True)
-
-    # 做一次强同步（参数更稳健：权限/属性/uidgid 就位；inplace 避免重写；delete-delay 降低瞬时空窗）
-    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_data, dst_data]
-    print("[final_sync_es_data] running:", " ".join(cmd))
-    subprocess.check_call(cmd)
-
-
 def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args):
     global rst_time, dirtymap_path, device_fd, sync_rootfs_process, sync_rootfs_log_file
 
@@ -2202,5 +2179,3 @@ if __name__ == "__main__":
 
     if diskless:
         post_process(max_iter)
-
-

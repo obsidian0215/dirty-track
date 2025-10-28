@@ -4,17 +4,16 @@ import subprocess
 import sys
 import time
 
-# 默认设置
+# 使用argparse解析命令行参数以动态设置
+# default script selection
 from script_defaults import get_default_ips
+from script_defaults import choose_scripts
 
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
 
-# 使用argparse解析命令行参数以动态设置
-# default script selection
-from script_defaults import choose_scripts
 
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
@@ -127,10 +126,10 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    dest_log = f"/tmp/{globals().get('DEST_SCRIPT','destination.py').replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{globals().get('DEST_SCRIPT', 'destination.py').replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = (
-        f"nohup python3 {globals().get('DEST_SCRIPT','destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+        f"nohup python3 {globals().get('DEST_SCRIPT', 'destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")

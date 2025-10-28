@@ -12,9 +12,7 @@ import sys
 import threading
 import time
 from _thread import start_new_thread
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
-
+from typing import Dict
 import psutil
 
 compress = False
@@ -24,12 +22,7 @@ restore_info = None
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global variable to track port list
-INIT_PORT = 12345
-iteration_list: List[int] = []
-port_list: List[int] = [INIT_PORT]
 transfer_processes: Dict[int, subprocess.Popen] = {}
-last_iter = 0
 
 # 确保线程安全
 process_lock = threading.Lock()
@@ -108,7 +101,7 @@ def prepare(base_path, image_path, parent_path):
 
 
 def handle_prepare(prepare_info):
-    global compress, iteration_list, port_list
+    global compress
     logger.info("开始处理prepare请求")
     prep_start = time.perf_counter()
     cpu_prep_start = psutil.cpu_percent(interval=None)
@@ -119,19 +112,6 @@ def handle_prepare(prepare_info):
     parent_paths = prepare_info.get("parent_path", [])
     compress = prepare_info.get("compress", 0)
 
-    # 初始化监听端口列表和迭代列表
-    for parent in parent_paths:
-        iter_suffix = parent.split("_")[-1]
-        try:
-            iter_num = int(iter_suffix)
-        except ValueError:
-            logger.error(f"无法解析迭代号，从 parent_path 中提取的迭代号为 {iter_suffix}")
-            continue
-        iteration_list.append(iter_num)
-        port = INIT_PORT + iter_num
-        port_list.append(port)
-    print("port_list:", port_list)
-    # input()
     path_exist = os.path.exists(path)
     if not path_exist and not os.path.exists(os.path.dirname(path)):
         reply = "Cannot find corresponding container bundle"
@@ -419,16 +399,6 @@ def perform_restore(msg):
     return reply
 
 
-def print_transfer_processes():
-    if not transfer_processes:
-        print("transfer_processes 字典为空。")
-    else:
-        print("当前 transfer_processes 内容:")
-        for port, process in transfer_processes.items():
-            status = "运行中" if process.poll() is None else f"已结束 (退出码: {process.returncode})"
-            print(f"  端口: {port}, PID: {process.pid}, 状态: {status}, 命令: {process.args}")
-
-
 def _wait_file_stable(path, timeout=10.0, interval=0.1):
     import os
     import time
@@ -560,45 +530,6 @@ def handle_restore(msg):
     # logger.info("开始执行恢复操作")
     reply = perform_restore(msg)
 
-    # 异步启动进程清理任务，让主线程快速响应
-    def _cleanup_worker():
-        global transfer_processes, process_lock
-        terminated_count = 0
-        with process_lock:
-            for port, process in list(transfer_processes.items()):
-                if process and process.poll() is None:  # 进程仍在运行
-                    try:
-                        logger.debug(f"终止仍在运行的nc进程 (端口 {port}, PID {process.pid})")
-                        process.terminate()
-
-                        # 等待进程优雅退出，最多等待3秒
-                        try:
-                            process.wait(timeout=3.0)
-                            logger.debug(f"进程 {process.pid} 已退出")
-                        except subprocess.TimeoutExpired:
-                            logger.warning(f"进程 {process.pid} 未退出，强制杀死")
-                            process.kill()
-                            process.wait()
-                            logger.info(f"进程 {process.pid} 已被强制杀死")
-
-                        terminated_count += 1
-                    except Exception as e:
-                        logger.error(f"清理进程 {process.pid} 时出错: {e}")
-
-        # 清空进程字典
-        transfer_processes.clear()
-
-        if terminated_count > 0:
-            logger.debug(f"共清理了 {terminated_count} 个nc进程")
-        else:
-            logger.debug("没有需要清理的nc进程")
-
-    # 使用线程池异步执行清理
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cleanup")
-    executor.submit(_cleanup_worker)
-    executor.shutdown(wait=False)
-    logger.debug("已启动异步进程清理任务")
-
     threading.Thread(target=_restore_target_priority_later, daemon=True).start()
     return reply
 
@@ -625,7 +556,6 @@ def migrate_server():
 
     # Function for handling connections. This will be used to create threads
     def clientthread(conn, addr):
-        global compress, iteration_list, last_iter
         # Sending message to connected client
         # infinite loop so that function does not terminate and thread does not end.
         while True:
@@ -674,7 +604,6 @@ def migrate_server():
                         reply = handle_archive_ready(info)
                     case {"restore": _}:
                         # 如果所有传输已完成，立即执行恢复
-                        # 所有传输指last_iter及之前的传输，和最大端口对应的传输
                         # time.sleep(1)
                         reply = handle_restore(msg)
                     case _:
@@ -697,7 +626,8 @@ def migrate_server():
         global source_ip
         source_ip = addr[0]
 
-        # start new thread takes 1st argument as a function name to be run, second is the tuple of arguments to the function.
+        # start new thread takes 1st argument as a function name to be run,
+        # second is the tuple of arguments to the function.
         start_new_thread(
             clientthread,
             (
@@ -711,4 +641,3 @@ def migrate_server():
 
 if __name__ == "__main__":
     migrate_server()
-

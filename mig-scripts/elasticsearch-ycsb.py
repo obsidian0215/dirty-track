@@ -117,7 +117,7 @@ def destination_prepare():
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
@@ -488,4 +488,3 @@ if __name__ == "__main__":
                 update_keepalived_priority(30, True, DEST_IP)
             time.sleep(17)  #
             # input()
-

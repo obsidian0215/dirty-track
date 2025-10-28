@@ -660,7 +660,8 @@ def migrate_server():
         global source_ip
         source_ip = addr[0]
 
-        # start new thread takes 1st argument as a function name to be run, second is the tuple of arguments to the function.
+        # start new thread takes 1st argument as a function name to be run,
+        # second is the tuple of arguments to the function.
         start_new_thread(
             clientthread,
             (
@@ -674,4 +675,3 @@ def migrate_server():
 
 if __name__ == "__main__":
     migrate_server()
-

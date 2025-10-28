@@ -4,14 +4,15 @@ import subprocess
 import sys
 import time
 
+# default script selection
+from script_defaults import choose_scripts
+
 # 默认设置
 SOURCE_IP = "192.168.2.105"
 DEST_IP = "192.168.2.225"
 CLIENT_IP = "192.168.2.245"
 VIP = "192.168.2.100"
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
-# default script selection
-from script_defaults import choose_scripts
 
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 # RECORD_COUNT = 100000
@@ -147,10 +148,10 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
-    dest_log = f"/tmp/{globals().get('DEST_SCRIPT','destination.py').replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{globals().get('DEST_SCRIPT', 'destination.py').replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = (
-        f"nohup python3 {globals().get('DEST_SCRIPT','destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+        f"nohup python3 {globals().get('DEST_SCRIPT', 'destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
@@ -544,4 +545,3 @@ if __name__ == "__main__":
                 update_keepalived_priority(70)
                 update_keepalived_priority(30, True, DEST_IP)
             time.sleep(7)  #
-

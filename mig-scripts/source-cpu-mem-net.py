@@ -566,7 +566,7 @@ def stop_sync_rootfs():
 
                 # 再次尝试清理子进程
                 if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
-                    kill_proc = subprocess.run(
+                    subprocess.run(
                         f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
                     )
 
@@ -788,8 +788,6 @@ def read_unsigned_long(file_path):
         return []
 
 
-
-
 def read_dirtymap(file_path):
     """
     读取dirtymap文件，返回文件头（时间）和记录的脏页地址。
@@ -823,7 +821,7 @@ def read_dirtymap(file_path):
             count = len(data) // entry_size
             addresses = []
             for i in range(count):
-                entry = data[i * entry_size : (i + 1) * entry_size]
+                entry = data[i * entry_size: (i + 1) * entry_size]
                 address, write_count = struct.unpack("<QI", entry)
                 addresses.append(address)
 
@@ -933,7 +931,7 @@ def read_warmlist(file_path):
 
             for i in range(count):
                 # 解析单个条目
-                entry = data[i * entry_size : (i + 1) * entry_size]
+                entry = data[i * entry_size: (i + 1) * entry_size]
                 address, s_count = struct.unpack("<QB", entry)  # Q: unsigned long, B: unsigned char
 
                 # 更新最大值
@@ -2315,5 +2313,3 @@ if __name__ == "__main__":
 
     if diskless:
         post_process(max_iter)
-
-

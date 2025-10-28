@@ -80,7 +80,7 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
@@ -486,4 +486,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
