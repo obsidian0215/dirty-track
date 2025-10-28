@@ -1,27 +1,28 @@
 #!/usr/bin/env python
-#code retrieved from https://www.redhat.com/en/blog/container-migration-around-world and partially modified
-import socket
-import sys
-import select
-import time
-import os
-import shutil
-import subprocess
-#import distutils.util
+# code retrieved from https://www.redhat.com/en/blog/container-migration-around-world and partially modified
+# import distutils.util
 import argparse
-import json
-from fcntl import ioctl
-import psutil
-import struct
-import fcntl
-import statistics
-import re
-import threading
-import signal
 import atexit
+import fcntl
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import socket
+import statistics
+import struct
+import subprocess
+import sys
+import threading
+import time
+from fcntl import ioctl
+
+import psutil
 
 # 定义字符设备路径
-DEVICE_PATH = '/dev/dirty-track'
+DEVICE_PATH = "/dev/dirty-track"
 
 # 定义ioctl命令相关参数
 IOC_NRBITS = 8
@@ -30,9 +31,9 @@ IOC_SIZEBITS = 14
 IOC_DIRBITS = 2
 
 IOC_NRSHIFT = 0
-IOC_TYPESHIFT = IOC_NRSHIFT + IOC_NRBITS        # 8
-IOC_SIZESHIFT = IOC_TYPESHIFT + IOC_TYPEBITS    # 16
-IOC_DIRSHIFT = IOC_SIZESHIFT + IOC_SIZEBITS     # 30
+IOC_TYPESHIFT = IOC_NRSHIFT + IOC_NRBITS  # 8
+IOC_SIZESHIFT = IOC_TYPESHIFT + IOC_TYPEBITS  # 16
+IOC_DIRSHIFT = IOC_SIZESHIFT + IOC_SIZEBITS  # 30
 
 IOC_NONE = 0
 IOC_WRITE = 1
@@ -42,20 +43,25 @@ IOC_IN = IOC_WRITE << IOC_DIRSHIFT
 IOC_OUT = IOC_READ << IOC_DIRSHIFT
 IOC_IO = (IOC_WRITE | IOC_READ) << IOC_DIRSHIFT
 
+
 def _IO(type, nr):
-    return (IOC_NONE | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
+    return IOC_NONE | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT)
+
 
 def _IOR(type, nr, size):
-    return (IOC_OUT | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
+    return IOC_OUT | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT)
+
 
 def _IOW(type, nr, size):
-    return (IOC_IN | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
+    return IOC_IN | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT)
+
 
 def _IOWR(type, nr, size):
-    return (IOC_IO | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT))
+    return IOC_IO | (size << IOC_SIZESHIFT) | (type << IOC_TYPESHIFT) | (nr << IOC_NRSHIFT)
+
 
 # 定义 ioctl 命令
-DIRTY_TRACK_MAGIC = ord('d')
+DIRTY_TRACK_MAGIC = ord("d")
 IOCTL_SET_DIRTY_MAP_PATH = _IOW(DIRTY_TRACK_MAGIC, 1, 256)
 IOCTL_START_PID = _IOW(DIRTY_TRACK_MAGIC, 2, 4)
 IOCTL_STOP_PID = _IOW(DIRTY_TRACK_MAGIC, 3, 4)
@@ -69,6 +75,8 @@ container_pids = []
 sync_rootfs_process = None
 sync_rootfs_log_file = None
 pre_dump_iters = 0
+
+
 # [修改] 重命名并修正函数
 def get_compressed_files_size(directory, compress_level):
     """
@@ -82,9 +90,9 @@ def get_compressed_files_size(directory, compress_level):
 
     # 根据压缩级别确定要查找的文件后缀
     if compress_level == 0:
-        suffix_to_find = '.tar.gz'
+        suffix_to_find = ".tar.gz"
     elif compress_level >= 1:
-        suffix_to_find = '.lzo'
+        suffix_to_find = ".lzo"
     else:
         # 如果是负数或无效值（尽管 argparse 限制了），不计算
         return 0
@@ -93,13 +101,13 @@ def get_compressed_files_size(directory, compress_level):
         with os.scandir(directory) as entries:
             for entry in entries:
                 # [修改] 只查找当前运行所对应的压缩文件类型
-                if entry.is_file() and not entry.is_symlink() and \
-                   entry.name.endswith(suffix_to_find):
+                if entry.is_file() and not entry.is_symlink() and entry.name.endswith(suffix_to_find):
                     total_size += entry.stat().st_size
     except Exception as e:
         print(f"Error calculating compressed file size in {directory}: {e}")
 
     return total_size
+
 
 # 停止 sync_rootfs 进程的函数
 def stop_sync_rootfs():
@@ -120,24 +128,21 @@ def stop_sync_rootfs():
             # 使用系统命令清理残留的子进程
             try:
                 # 获取父进程PID并查找所有子进程
-                if hasattr(sync_rootfs_process, 'pid') and sync_rootfs_process.pid:
+                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
                     pid = sync_rootfs_process.pid
                     # 查找并终止所有相关进程（ps -列出进程，grep -筛选，awk -提取PID，xargs -传递PID给kill）
-                    kill_proc = subprocess.run(f'pkill -P {pid} || true', shell=True,
-                                              capture_output=True, text=True)
+                    kill_proc = subprocess.run(f"pkill -P {pid} || true", shell=True, capture_output=True, text=True)
                     print("已清理 sync_rootfs.sh 的所有子进程")
 
                     # 使用进程组ID来确保清理所有后台进程和子进程
                     try:
                         # 获取进程组ID
-                        proc = subprocess.run(['ps', '-p', str(pid), '-o', 'pgid='],
-                                            capture_output=True, text=True)
+                        proc = subprocess.run(["ps", "-p", str(pid), "-o", "pgid="], capture_output=True, text=True)
                         if proc.returncode == 0 and proc.stdout.strip():
                             pgid = proc.stdout.strip()
                             print(f"清理进程组 {pgid}")
                             # 发送SIGKILL到整个进程组
-                            subprocess.run(['kill', '-KILL', '-' + pgid],
-                                         capture_output=True, text=True)
+                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
                     except Exception as e:
                         print(f"清理进程组时出现警告: {e}")
 
@@ -152,19 +157,20 @@ def stop_sync_rootfs():
                 print("sync_rootfs 主进程已被强制杀死")
 
                 # 再次尝试清理子进程
-                if hasattr(sync_rootfs_process, 'pid') and sync_rootfs_process.pid:
-                    kill_proc = subprocess.run(f'pkill -P {sync_rootfs_process.pid} || true',
-                                              shell=True, capture_output=True, text=True)
+                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
+                    kill_proc = subprocess.run(
+                        f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
+                    )
 
                     # 使用进程组ID强制清理所有相关进程
                     try:
-                        proc = subprocess.run(['ps', '-p', str(sync_rootfs_process.pid), '-o', 'pgid='],
-                                            capture_output=True, text=True)
+                        proc = subprocess.run(
+                            ["ps", "-p", str(sync_rootfs_process.pid), "-o", "pgid="], capture_output=True, text=True
+                        )
                         if proc.returncode == 0 and proc.stdout.strip():
                             pgid = proc.stdout.strip()
                             print(f"强制清理进程组 {pgid}")
-                            subprocess.run(['kill', '-KILL', '-' + pgid],
-                                         capture_output=True, text=True)
+                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
                     except Exception as e:
                         print(f"强制清理进程组时出现警告: {e}")
 
@@ -180,16 +186,12 @@ def stop_sync_rootfs():
     # 确保清理所有残留的sync进程
     try:
         # 查找所有剩余的sync_rootfs.sh进程并强制杀死
-        remaining_proc = subprocess.run(
-            "pgrep -f sync_rootfs.sh || true",
-            shell=True, capture_output=True, text=True
-        )
+        remaining_proc = subprocess.run("pgrep -f sync_rootfs.sh || true", shell=True, capture_output=True, text=True)
         if remaining_proc.returncode == 0 and remaining_proc.stdout.strip():
-            remaining_pids = remaining_proc.stdout.strip().split('\n')
+            remaining_pids = remaining_proc.stdout.strip().split("\n")
             for pid in remaining_pids:
                 try:
-                    subprocess.run(['kill', '-KILL', pid.strip()],
-                                 capture_output=True, text=True)
+                    subprocess.run(["kill", "-KILL", pid.strip()], capture_output=True, text=True)
                     print(f"清理残留 sync_rootfs.sh 进程 {pid.strip()}")
                 except Exception as e:
                     print(f"清理残留进程 {pid.strip()} 时错误: {e}")
@@ -205,12 +207,15 @@ def stop_sync_rootfs():
         finally:
             sync_rootfs_log_file = None
 
+
 # 信号处理器函数
 def signal_handler(signum, frame):
     """处理 сигнал终止"""
     print(f"\n接收到信号 {signum}，正在清理并退出...")
     stop_sync_rootfs()
     sys.exit(0)
+
+
 # [新] 添加这个函数
 def get_lzo_files_size(directory):
     """
@@ -227,32 +232,32 @@ def get_lzo_files_size(directory):
         with os.scandir(directory) as entries:
             for entry in entries:
                 # 确保是文件、非链接且以 .lzo 结尾
-                if entry.is_file() and not entry.is_symlink() and entry.name.endswith('.lzo'):
+                if entry.is_file() and not entry.is_symlink() and entry.name.endswith(".lzo"):
                     total_size += entry.stat().st_size
     except Exception as e:
         print(f"Error calculating LZO file size in {directory}: {e}")
 
     return total_size
+
+
 # [新函数结束]
+
 
 def final_sync_es_data(dest_ip, rootfs_path):
     """
     在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
     """
-    import os, subprocess
+    import os
+    import subprocess
 
     src_data = os.path.join(rootfs_path, "usr/share/elasticsearch/data") + "/"
     dst_data = f"root@{dest_ip}:{src_data}"
 
     # 确保目标端父目录存在
-    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'",
-                   shell=True, check=False, text=True)
+    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'", shell=True, check=False, text=True)
 
     # 做一次强同步（参数更稳健：权限/属性/uidgid 就位；inplace 避免重写；delete-delay 降低瞬时空窗）
-    cmd = [
-        "rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay",
-        "-P", "--timeout=0", src_data, dst_data
-    ]
+    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_data, dst_data]
     print("[final_sync_es_data] running:", " ".join(cmd))
     subprocess.check_call(cmd)
 
@@ -265,10 +270,10 @@ pre_dump_xfer_time_total = 0.0  # 毫秒
 # [新] 定义全局变量用于累计压缩时间
 total_compression_time = 0.0  # 毫秒
 # 定义全局变量用于记录最后一次dump的时间和大小
-dump_time = 0.0                # 毫秒
-dump_size = 0.0                # 字节
-dump_xfer_time = 0.0        # 毫秒
-rst_time =0.0
+dump_time = 0.0  # 毫秒
+dump_size = 0.0  # 字节
+dump_xfer_time = 0.0  # 毫秒
+rst_time = 0.0
 # post
 total_uffd_copy = 0.0
 rpf_handle_time = 0.0
@@ -286,47 +291,52 @@ iter_dirtymaps = []
 processed_files = set()
 
 bandwidth_measurements = []  # List to store individual bandwidth measurements (Bytes/s)
-average_bandwidth = 0.0      # Average bandwidth (Bytes/s)
-bandwidth_stddev = 0.0       # Standard deviation of bandwidth (Bytes/s)
+average_bandwidth = 0.0  # Average bandwidth (Bytes/s)
+bandwidth_stddev = 0.0  # Standard deviation of bandwidth (Bytes/s)
+
 
 # 通过ioctl设置脏页跟踪的目录路径
 def ioctl_set_dirty_map_path(device_fd, path):
     # 路径字符串打包为定长字节数组
-    buf = struct.pack(f'{len(path)}s', path.encode('utf-8'))
+    buf = struct.pack(f"{len(path)}s", path.encode("utf-8"))
     # 调用 ioctl 传递路径给内核模块
     ioctl(device_fd, IOCTL_SET_DIRTY_MAP_PATH, buf)
+
 
 # 通过ioctl启动指定进程的脏页跟踪
 def ioctl_start_pid(device_fd, pid):
     # pid_t在Python中可以用struct.pack来打包
-    buf = bytearray(struct.pack('I', pid))
+    buf = bytearray(struct.pack("I", pid))
     ioctl(device_fd, IOCTL_START_PID, buf)
     # ret = struct.unpack_from('I', buf)[0]
 
+
 # 通过ioctl停止指定进程的脏页跟踪
 def ioctl_stop_pid(device_fd, pid):
-    buf = bytearray(struct.pack('I', pid))
+    buf = bytearray(struct.pack("I", pid))
     ioctl(device_fd, IOCTL_STOP_PID, buf)
     # ret = struct.unpack_from('I', buf)[0]
 
+
 # 通过ioctl获取脏页跟踪的目录路径
 def ioctl_get_dirty_map_path(device_fd):
-    buf = bytearray(struct.pack('256s', b'\0' * 256))
+    buf = bytearray(struct.pack("256s", b"\0" * 256))
     ioctl(device_fd, IOCTL_GET_DIRTY_MAP_PATH, buf)
     # 解包路径字符串
-    path = struct.unpack_from(f'{len(buf)}s', buf)[0]
-    return path.decode('utf-8').rstrip('\0')
+    path = struct.unpack_from(f"{len(buf)}s", buf)[0]
+    return path.decode("utf-8").rstrip("\0")
+
 
 # 获取runc容器进程树的PID
 def get_runc_container_pidtree(container_name):
-    container_pids.clear()      # 先清空pid列表
-    container_pid_path = f'/run/runc/{container_name}/state.json'
+    container_pids.clear()  # 先清空pid列表
+    container_pid_path = f"/run/runc/{container_name}/state.json"
     if not os.path.exists(container_pid_path):
         raise FileNotFoundError(f"runc容器 {container_name} 的状态文件不存在：{container_pid_path}")
 
-    with open(container_pid_path, 'r') as f:
+    with open(container_pid_path, "r") as f:
         state = json.load(f)
-        init_pid = state['init_process_pid']
+        init_pid = state["init_process_pid"]
 
     try:
         init_process = psutil.Process(init_pid)
@@ -347,6 +357,7 @@ def get_runc_container_pidtree(container_name):
             except psutil.NoSuchProcess:
                 continue
 
+
 def error():
     print("Something did not work. Exiting!")
     # 确保在程序终止时停止 sync_rootfs 进程
@@ -356,24 +367,27 @@ def error():
         post_process(max_iter)
     sys.exit(-1)
 
+
 # 迁移开始前，指定dirty-map的目录路径
 def set_dirty_map_path(device_fd, path):
     """设置脏页跟踪的目录路径"""
     if not os.path.exists(path):
         os.mkdir(path)
     # 挂载到tmpfs
-    mount_cmd = f'mount -t tmpfs none {path}'
+    mount_cmd = f"mount -t tmpfs none {path}"
     ret = os.system(mount_cmd)
     if ret != 0:
         raise SystemError(f"无法将{path}装载到tmpfs")
     print(f"设置脏页跟踪的目录路径为: {os.path.abspath(path)}")
     ioctl_set_dirty_map_path(device_fd, path)
 
+
 # 启动所有容器进程的脏页跟踪
 def start_dirty_track(device_fd):
     for pid in container_pids:
         ioctl_start_pid(device_fd, pid)
         print(f"启动对PID {pid}的脏页跟踪")
+
 
 # 在pre-dump之间执行dirty-track并获取dirty-map
 def execute_dirty_track(device_fd, first):
@@ -399,27 +413,29 @@ def execute_dirty_track(device_fd, first):
 
     # return dirty_map_path
 
+
 def read_unsigned_long(file_path):
     """
     读取包含ulong64数字的二进制文件，返回一个列表
     """
     try:
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             data = f.read()
             count = len(data) // 8  # sizeof(unsigned long)
-            return list(struct.unpack('<' + 'Q' * count, data))
+            return list(struct.unpack("<" + "Q" * count, data))
     except Exception as e:
         print(f"Error reading {file_path}: {e}")
         return []
 
-import struct
+
+
 
 def read_dirtymap(file_path):
     """
     读取dirtymap文件，返回文件头（时间）和记录的脏页地址。
     """
     try:
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             data = f.read()
 
             # 文件头大小（unsigned long）
@@ -431,7 +447,7 @@ def read_dirtymap(file_path):
                 return None, []
 
             # 读取文件头（时间）
-            time_header = struct.unpack('<Q', data[:header_size])[0]
+            time_header = struct.unpack("<Q", data[:header_size])[0]
 
             # 每个条目的大小
             entry_size = 12  # sizeof(unsigned long) + sizeof(unsigned int)
@@ -447,14 +463,15 @@ def read_dirtymap(file_path):
             count = len(data) // entry_size
             addresses = []
             for i in range(count):
-                entry = data[i*entry_size:(i+1)*entry_size]
-                address, write_count = struct.unpack('<QI', entry)
+                entry = data[i * entry_size : (i + 1) * entry_size]
+                address, write_count = struct.unpack("<QI", entry)
                 addresses.append(address)
 
             return time_header, addresses
     except Exception as e:
         print(f"Error reading dirtymap file {file_path}: {e}")
         return None, []
+
 
 def merge_addresses(dirty_addresses, candidate_addresses):
     """
@@ -487,11 +504,13 @@ def merge_addresses(dirty_addresses, candidate_addresses):
 
     return merged
 
+
 def pid_may_dump_size(addresses):
     """
     计算单个进程的内存大小（单位：字节）。
     """
     return len(addresses) * PAGE_SIZE
+
 
 def container_may_dump_size(container_pids, dirtymap_path):
     """
@@ -531,12 +550,13 @@ def container_may_dump_size(container_pids, dirtymap_path):
 
     return total_transfer_size
 
+
 def read_warmlist(file_path):
     """
     读取warmlist文件，返回其中选择次数(uchar)最大的脏页地址(ulong)和选择次数
     """
     try:
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             data = f.read()
 
             # 每个条目的大小
@@ -553,8 +573,8 @@ def read_warmlist(file_path):
 
             for i in range(count):
                 # 解析单个条目
-                entry = data[i*entry_size:(i+1)*entry_size]
-                address, s_count = struct.unpack('<QB', entry)  # Q: unsigned long, B: unsigned char
+                entry = data[i * entry_size : (i + 1) * entry_size]
+                address, s_count = struct.unpack("<QB", entry)  # Q: unsigned long, B: unsigned char
 
                 # 更新最大值
                 if s_count > max_s_count:
@@ -565,6 +585,7 @@ def read_warmlist(file_path):
     except Exception as e:
         print(f"Error reading warmlist file {file_path}: {e}")
         return None, None
+
 
 def read_max_scount(container_pids, dirtymap_path):
     """
@@ -596,15 +617,16 @@ def read_max_scount(container_pids, dirtymap_path):
 
     return max_scount
 
+
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
 def prepare(base_path, image_path, parent_path, work_path):
     if os.path.exists(base_path):
         try:
-            umount_cmd = 'umount ' + image_path
+            umount_cmd = "umount " + image_path
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
             shutil.rmtree(image_path)
-            shutil.rmtree(base_path + '/d_log')
+            shutil.rmtree(base_path + "/d_log")
         except:
             pass
 
@@ -614,11 +636,11 @@ def prepare(base_path, image_path, parent_path, work_path):
                 entry_path = os.path.join(base_path, entry)
                 # print(entry)
                 # print(entry_path)
-                if os.path.isdir(entry_path) and entry.startswith('parent'):
-                    umount_cmd = 'umount ' + entry_path
+                if os.path.isdir(entry_path) and entry.startswith("parent"):
+                    umount_cmd = "umount " + entry_path
                     subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
                     shutil.rmtree(entry_path)
-                elif os.path.isdir(entry_path) and entry.startswith('pd_log'):
+                elif os.path.isdir(entry_path) and entry.startswith("pd_log"):
                     shutil.rmtree(entry_path)
         except:
             pass
@@ -631,7 +653,8 @@ def prepare(base_path, image_path, parent_path, work_path):
         for i in work_path:
             os.mkdir(i)
     os.mkdir(image_path)
-    os.mkdir(base_path + '/d_log')
+    os.mkdir(base_path + "/d_log")
+
 
 # 功能函数：获取目录下特定模式文件的总大小
 # pattern: 文件名模式, e.g. "pages*.img"
@@ -640,13 +663,13 @@ def getdirsize(path, pattern=None):
     if not os.path.exists(path):
         return tsize
 
-    #skip soft link file
+    # skip soft link file
     if os.path.islink(path):
         return tsize
 
-    #avoid stat certain filename pattern
+    # avoid stat certain filename pattern
     if os.path.isfile(path):
-        tsize = os.path.getsize(path) # 5041481
+        tsize = os.path.getsize(path)  # 5041481
         if pattern:
             if pattern not in path:
                 return 0
@@ -662,7 +685,7 @@ def getdirsize(path, pattern=None):
                     continue
                 if sub_entry.is_dir():
                     # print("current dir is {}".format(sub_entry.name))
-                    subdir_size = getdirsize(sub_entry_path, pattern) # 5800007
+                    subdir_size = getdirsize(sub_entry_path, pattern)  # 5800007
                     tsize += subdir_size
                 elif sub_entry.is_file():
                     # file_size = os.path.getsize(sub_entry_path) # 1891
@@ -677,41 +700,47 @@ def getdirsize(path, pattern=None):
         #     print('the total size of {} is {}'.format(path, tsize))
         return tsize
 
+
 # 带宽测量（使用异步或多线程）
 def measure_bandwidth(dest_ip):
     print(f"开始测量到{dest_ip}的带宽")
     try:
         # 使用 iperf3 进行短时间带宽测量
-        result = subprocess.run(['iperf3', '-c', dest_ip, '-t', '3', '-f', 'm', '-J'],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(
+            ["iperf3", "-c", dest_ip, "-t", "3", "-f", "m", "-J"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         if result.returncode != 0:
             print("带宽测量失败:", result.stderr)
             return 0
         iperf_output = json.loads(result.stdout)
-        bandwidth = iperf_output['end']['sum_sent']['bits_per_second'] / 8  # 转换为Bytes/s
+        bandwidth = iperf_output["end"]["sum_sent"]["bits_per_second"] / 8  # 转换为Bytes/s
         print(f"测得带宽: {bandwidth:.2f} Bytes/s")
         return bandwidth
     except Exception as e:
         print("带宽测量异常:", e)
         return 0
 
+
 # 降低source的优先级以触发VIP迁移到dest
 def transfer_vip(new_prior):
     try:
         # 定义 Keepalived 配置文件路径和备份路径
-        config_path = '/etc/keepalived/keepalived.conf'
-        backup_path = '/etc/keepalived/keepalived.conf.bak'
+        config_path = "/etc/keepalived/keepalived.conf"
+        backup_path = "/etc/keepalived/keepalived.conf.bak"
 
         # 备份原始配置文件
         shutil.copy(config_path, backup_path)
         # print(f"已备份原始 Keepalived 配置文件到 {backup_path}")
 
         # 读取原始配置文件内容
-        with open(config_path, 'r') as f:
+        with open(config_path, "r") as f:
             config = f.read()
 
         # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
-        pattern = r'(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})'
+        pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
 
         # 定义替换函数，将 priority设置为比目标节点较低的值
         def repl(match):
@@ -728,21 +757,20 @@ def transfer_vip(new_prior):
             return 1
 
         # 将修改后的配置写回配置文件
-        with open(config_path, 'w') as f:
+        with open(config_path, "w") as f:
             f.write(new_config)
         # print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
 
         # 重新加载 Keepalived 服务以应用更改
-        result = subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True)
+        result = subprocess.run(
+            ["sudo", "systemctl", "reload", "keepalived"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
 
         if result.returncode != 0:
             print(f"重新加载 Keepalived 服务失败：{result.stderr}")
             # 如果重新加载失败，可以选择恢复备份配置
             shutil.copy(backup_path, config_path)
-            subprocess.run(['sudo', 'systemctl', 'reload', 'keepalived'])
+            subprocess.run(["sudo", "systemctl", "reload", "keepalived"])
             print("已恢复原始 Keepalived 配置文件并重新加载服务。")
             return 1
         else:
@@ -759,17 +787,18 @@ def transfer_vip(new_prior):
         print(f"发生错误：{e}")
         return 1
 
+
 # 通知dest提升优先级
 def notify_transfer_vip(cs, inputs):
     vip_cmd = json.dumps({"transfer_vip": True})
-    cs.send(bytes(vip_cmd, encoding='utf-8'))
+    cs.send(bytes(vip_cmd, encoding="utf-8"))
     # print("send notify_transfer_vip")
     inputready, outputready, exceptready = select.select(inputs, [], [], 5)
 
     if inputready:
         for s in inputready:
             answer_bytes = s.recv(1024)
-            answer = answer_bytes.decode('utf-8').strip()
+            answer = answer_bytes.decode("utf-8").strip()
             # print(answer)
             pattern = r"OK"
             match = re.search(pattern, answer)
@@ -782,6 +811,7 @@ def notify_transfer_vip(cs, inputs):
         print("can't confirm the VIP has been transfered")
         return 1
 
+
 # 异步VIP迁移
 def async_vip_migration(cs, inputs):
     """
@@ -792,7 +822,7 @@ def async_vip_migration(cs, inputs):
     migration_start = time.time()
 
     try:
-        ret = transfer_vip('30')
+        ret = transfer_vip("30")
 
         if ret == 0:
             ret = notify_transfer_vip(cs, inputs)
@@ -803,7 +833,7 @@ def async_vip_migration(cs, inputs):
                 return
             else:
                 print("VIP notification confirmation failed, restoring priority")
-                transfer_vip('70')  # 恢复到原优先级
+                transfer_vip("70")  # 恢复到原优先级
                 return
         else:
             print("VIP priority setting failed, migration aborted")
@@ -811,7 +841,8 @@ def async_vip_migration(cs, inputs):
 
     except Exception as e:
         print(f"VIP migration failed: {e}, restoring priority")
-        transfer_vip('70')  # 恢复到原优先级
+        transfer_vip("70")  # 恢复到原优先级
+
 
 # 计算image目录下除pages-x.img外的文件总大小
 def calculate_image(directory, exclude_pages=False):
@@ -826,20 +857,21 @@ def calculate_image(directory, exclude_pages=False):
                 total_size += os.path.getsize(file_path)
     return total_size
 
-#create the pre-dump, which is done in case of pre-copy and hybrid migrations.
-#pre-dump contains the entire content of the container virtual memory
-#pre-dump is stored in the parent directory
+
+# create the pre-dump, which is done in case of pre-copy and hybrid migrations.
+# pre-dump contains the entire content of the container virtual memory
+# pre-dump is stored in the parent directory
 def pre_dump(mig_base, container, i, dirtymap):
     global pre_dump_time_total, pre_dump_size_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    cmd = 'runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}'.format(i, i)
-    cmd += ' ' + container
+    cmd = "runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}".format(i, i)
+    cmd += " " + container
     if dirtymap:
-        cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
+        cmd += " --use-dirty-map --dirty-map-dir " + dirtymap_path
     # 只有 i>1 时才加上上一次的 parent_(i-1)
     if i > 1:
-        cmd += f' --parent-path ../parent_{i-1}'
+        cmd += f" --parent-path ../parent_{i-1}"
     # cmd += ' --parent-path ../parent_{}'.format(i)
     # print(cmd)
     # start = time.perf_counter() * 1000
@@ -851,18 +883,19 @@ def pre_dump(mig_base, container, i, dirtymap):
     if ret != 0:
         error()
 
+
 def real_dump_0(mig_base, runc_args=None):
     global esti_dump_time, esti_dump_size_pre, esti_dump_size_post
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
-    cmd = 'runc checkpoint --image-path parent_0 --work-path pd_log_0'
+    cmd = "runc checkpoint --image-path parent_0 --work-path pd_log_0"
 
     if runc_args:
-        cmd += ' ' + ' '.join(runc_args)
+        cmd += " " + " ".join(runc_args)
 
-    cmd += ' --leave-running'
-    cmd += ' ' + container
+    cmd += " --leave-running"
+    cmd += " " + container
 
     p = subprocess.Popen(cmd, shell=True)
     ret = p.wait()
@@ -870,36 +903,36 @@ def real_dump_0(mig_base, runc_args=None):
     os.chdir(old_cwd)
     if ret != 0:
         error()
-    directory_path = f'{mig_base}/parent_0'
+    directory_path = f"{mig_base}/parent_0"
     esti_dump_size_post = calculate_image(directory_path, False)
     # esti_dump_size_pre = calculate_image(directory_path, True)
     print(f"The total size of all files excluding 'pages-x.img' in {directory_path} is {esti_dump_size_post} bytes.")
     # print(f"The total size of all files including 'pages-x.img' in {directory_path} is {esti_dump_size_pre} bytes.")
-    stats_dump_file = os.path.join(mig_base, 'pd_log_0/stats-dump')
+    stats_dump_file = os.path.join(mig_base, "pd_log_0/stats-dump")
     parse_stats_dump(stats_dump_file, "dump", False)
 
 
-#create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
-#dump is stored in the image directory.
-#in case of pre-dump present, specify it is in the parent directory.
-#When post-copy phase is not present, wait until dump command ends (with p.wait())
-#If instead post-copy phase is present, the dump procedure does not write memory pages in image and starts the page server for later transfer of faulted pages.
-#the page server will then read local memory dump and send memory pages upon request of the lazy-pages daemon running on the destination.
-#The page server listens on port 27.
-#Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
-#Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
+# create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
+# dump is stored in the image directory.
+# in case of pre-dump present, specify it is in the parent directory.
+# When post-copy phase is not present, wait until dump command ends (with p.wait())
+# If instead post-copy phase is present, the dump procedure does not write memory pages in image and starts the page server for later transfer of faulted pages.
+# the page server will then read local memory dump and send memory pages upon request of the lazy-pages daemon running on the destination.
+# The page server listens on port 27.
+# Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
+# Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
 def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inputs, runc_args=None):
     global dump_time, dump_size, dump_xfer_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
-    #cmd = 'runc checkpoint --image-path image --leave-running'
-    cmd = 'runc checkpoint --image-path image --work-path d_log'
+    # cmd = 'runc checkpoint --image-path image --leave-running'
+    cmd = "runc checkpoint --image-path image --work-path d_log"
 
     if runc_args:
-        cmd += ' ' + ' '.join(runc_args)
+        cmd += " " + " ".join(runc_args)
     if precopy:
-        cmd += ' --parent-path ../parent_{}'.format(last_iter)
+        cmd += " --parent-path ../parent_{}".format(last_iter)
     # if diskless:
     #     #send the page server command,
     #     #after the server's response, CRIU can directly transfer memory dump with network
@@ -914,26 +947,26 @@ def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inpu
     #             error()
     #     cmd += ' --page-server {}:27'.format(dest)
     if postcopy:
-        cmd += ' --lazy-pages'
-        cmd += ' --page-server localhost:27'
+        cmd += " --lazy-pages"
+        cmd += " --page-server localhost:27"
         read_fd, write_fd = os.pipe()
         fdflags = fcntl.fcntl(write_fd, fcntl.F_GETFD)
         fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
-        cmd += ' --status-fd ' + str(write_fd)
+        cmd += " --status-fd " + str(write_fd)
     if dirtymap:
-        cmd += ' --use-dirty-map --dirty-map-dir ' + dirtymap_path
+        cmd += " --use-dirty-map --dirty-map-dir " + dirtymap_path
     if replay:
-        cmd += ' --leave-running'
+        cmd += " --leave-running"
 
-    cmd += ' ' + container
+    cmd += " " + container
 
     # postcopy时stat-dump无法准确度量检查点时间，因此需要单独计算
     if postcopy:
         start = time.perf_counter() * 1000
         p = subprocess.Popen(cmd, pass_fds=(write_fd,), shell=True)
         ret = os.read(read_fd, 1)
-        if ret == b'\0':
-            print('Ready for lazy page transfer')
+        if ret == b"\0":
+            print("Ready for lazy page transfer")
             os.close(read_fd)
             os.close(write_fd)
         ret = 0
@@ -948,16 +981,17 @@ def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inpu
         error()
 
     # '--tcp-established'迁移TCP连接
-    if runc_args and '--tcp-established' in ' '.join(runc_args):
+    if runc_args and "--tcp-established" in " ".join(runc_args):
         # VIP线程独立处理，不要共享inputs列表
         vip_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         vip_socket.connect((dest, 18863))
         vip_thread = threading.Thread(target=async_vip_migration, args=(vip_socket, [vip_socket]))
         vip_thread.start()
 
+
 # 解析大小字符串，转换为以Byte为单位
 def parse_size(size_str):
-    size_multiplier = {'K': 1024, 'M': 1024 * 1024, 'G': 1024 * 1024 * 1024}
+    size_multiplier = {"K": 1024, "M": 1024 * 1024, "G": 1024 * 1024 * 1024}
     unit = size_str[-1].upper()
     if unit in size_multiplier:
         size = float(size_str[:-1]) * size_multiplier[unit]
@@ -965,7 +999,8 @@ def parse_size(size_str):
         size = float(size_str)  # 默认单位为字节，保持为原始值
     return size
 
-#Transfer the previously created pre-dump using nc (同步版本)
+
+# Transfer the previously created pre-dump using nc (同步版本)
 def xfer_pre_dump(cs, parent_path, dest, i, port):
     global pre_dump_xfer_time_total
 
@@ -973,7 +1008,7 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
     # 创建压缩包
     if compress == 0:
         # 无压缩
-        #archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        # archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
         archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
         cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
     elif compress >= 1 and compress <= 4:
@@ -1026,7 +1061,7 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
     end = time.perf_counter() * 1000
 
     global total_compression_time
-    total_compression_time += (end - start)
+    total_compression_time += end - start
     if not os.path.exists(archive_name):
         raise FileNotFoundError(f"Archive file {archive_name} not found")
 
@@ -1046,7 +1081,9 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
         # rsync via ssh
         transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
     else:
-        transfer_cmd = f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+        transfer_cmd = (
+            f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+        )
 
     # 传输时增加重试机制
     max_retries = 3
@@ -1067,7 +1104,7 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
         else:
             print(f"Pre-dump {i} xfer failed (attempt {attempt}), ExitCode: {ret}")
             if attempt < max_retries:
-                backoff = 2 ** attempt
+                backoff = 2**attempt
                 print(f"Retrying after {backoff}s...")
                 time.sleep(backoff)
 
@@ -1076,22 +1113,24 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
 
     # 通知目标端已经收到归档并请求目标端解包/处理（两阶段：立即 ACK，再异步轮询目标处理完成标记）
     try:
-        notify = json.dumps({
-            "archive_ready": {
-                "path": parent_path,
-                "archive": os.path.basename(archive_name),
-                "compress": compress,
-                "iter": i
+        notify = json.dumps(
+            {
+                "archive_ready": {
+                    "path": parent_path,
+                    "archive": os.path.basename(archive_name),
+                    "compress": compress,
+                    "iter": i,
+                }
             }
-        })
+        )
 
         # 发送通知并等待短时ACK
-        cs.send(bytes(notify, encoding='utf-8'))
+        cs.send(bytes(notify, encoding="utf-8"))
         inputready, _, _ = select.select([cs], [], [], 10)
         if inputready:
-            resp = cs.recv(2048).decode('utf-8')
+            resp = cs.recv(2048).decode("utf-8")
             # 期待目标端快速返回 'RECEIVED'
-            if not resp or 'RECEIVED' not in resp:
+            if not resp or "RECEIVED" not in resp:
                 print(f"Destination did not ACK archive upload: {resp}")
                 error()
         else:
@@ -1104,8 +1143,8 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
 
     # 异步轮询目标上是否写入了 .{archive}.processed 标记（不阻塞主流程）
     def _poll_processed():
-        marker = os.path.join(parent_path, f'.{os.path.basename(archive_name)}.processed')
-        err_marker = os.path.join(parent_path, f'.{os.path.basename(archive_name)}.processed.err')
+        marker = os.path.join(parent_path, f".{os.path.basename(archive_name)}.processed")
+        err_marker = os.path.join(parent_path, f".{os.path.basename(archive_name)}.processed.err")
         check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
         timeout = 600.0
         end = time.time() + timeout
@@ -1113,10 +1152,10 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
             try:
                 proc = subprocess.run(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 out = proc.stdout.strip()
-                if out == 'OK':
+                if out == "OK":
                     print(f"Pre-dump {i} processed on destination")
                     return
-                if out == 'ERR':
+                if out == "ERR":
                     print(f"Pre-dump {i} extraction failed on destination")
                     return
             except Exception as e:
@@ -1131,7 +1170,8 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
 
     pre_dump_xfer_time_total += transfer_time
 
-#Transfer the previosuly created dump using rsync
+
+# Transfer the previosuly created dump using rsync
 def xfer_final(cs, image_path, dest, compress, port):
     global dump_xfer_time
 
@@ -1165,7 +1205,7 @@ def xfer_final(cs, image_path, dest, compress, port):
             raise RuntimeError("lzo_gpu compress final dump failed")
         end = time.perf_counter() * 1000
         global total_compression_time
-        total_compression_time += (end - start) # 累加压缩时间
+        total_compression_time += end - start  # 累加压缩时间
         # 删除临时tar文件
         try:
             os.remove(tar_name)
@@ -1201,7 +1241,9 @@ def xfer_final(cs, image_path, dest, compress, port):
     if size >= RSYNC_THRESHOLD:
         transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
     else:
-        transfer_cmd = f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+        transfer_cmd = (
+            f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+        )
 
     print(f"Transferring final dump to {dest} using: {transfer_cmd}")
     # final transfer with retries
@@ -1222,7 +1264,7 @@ def xfer_final(cs, image_path, dest, compress, port):
         else:
             print(f"Final dump transfer failed (attempt {attempt}), ExitCode: {ret}")
             if attempt < max_retries:
-                backoff = 2 ** attempt
+                backoff = 2**attempt
                 print(f"Retrying after {backoff}s...")
                 time.sleep(backoff)
 
@@ -1231,19 +1273,21 @@ def xfer_final(cs, image_path, dest, compress, port):
 
     # 通知目标端解包并处理，等待短时ACK
     try:
-        notify = json.dumps({
-            "archive_ready": {
-                "path": image_path,
-                "archive": os.path.basename(archive_name),
-                "compress": compress,
-                "final": True
+        notify = json.dumps(
+            {
+                "archive_ready": {
+                    "path": image_path,
+                    "archive": os.path.basename(archive_name),
+                    "compress": compress,
+                    "final": True,
+                }
             }
-        })
-        cs.send(bytes(notify, encoding='utf-8'))
+        )
+        cs.send(bytes(notify, encoding="utf-8"))
         inputready, _, _ = select.select([cs], [], [], 10)
         if inputready:
-            resp = cs.recv(4096).decode('utf-8')
-            if not resp or 'RECEIVED' not in resp:
+            resp = cs.recv(4096).decode("utf-8")
+            if not resp or "RECEIVED" not in resp:
                 print(f"Destination did not ACK final archive: {resp}")
                 error()
         else:
@@ -1254,8 +1298,8 @@ def xfer_final(cs, image_path, dest, compress, port):
         error()
 
     # 对 final dump 在主流程中同步等待目标处理完成（最长等待600s）
-    marker = os.path.join(image_path, f'.{os.path.basename(archive_name)}.processed')
-    err_marker = os.path.join(image_path, f'.{os.path.basename(archive_name)}.processed.err')
+    marker = os.path.join(image_path, f".{os.path.basename(archive_name)}.processed")
+    err_marker = os.path.join(image_path, f".{os.path.basename(archive_name)}.processed.err")
     check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
     timeout = 600.0
     end_time = time.time() + timeout
@@ -1264,19 +1308,20 @@ def xfer_final(cs, image_path, dest, compress, port):
         try:
             proc = subprocess.run(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             out = proc.stdout.strip()
-            if out == 'OK':
+            if out == "OK":
                 processed_ok = True
                 break
-            if out == 'ERR':
-                print('Final dump extraction failed on destination')
+            if out == "ERR":
+                print("Final dump extraction failed on destination")
                 error()
         except Exception as e:
             print(f"Error polling final processed marker: {e}")
         time.sleep(1.0)
 
     if not processed_ok:
-        print('Timed out waiting for destination to process final archive')
+        print("Timed out waiting for destination to process final archive")
         error()
+
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
@@ -1288,27 +1333,27 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
     while last_iter <= max_iter:
-        last_path = parent_path[last_iter-1]
+        last_path = parent_path[last_iter - 1]
         # if diskless:
-            # #send the page server command,
-            # #after the server's response, CRIU can directly transfer memory dump with network
-            # pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
-            # cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-            # inputready, outputready, exceptready = select.select(input, [], [], 4)
-            # #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-            # if inputready:
-            #     for s in inputready:
-            #         answer = s.recv(1024)
-            #         print(answer)
-            #         error()
-            # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
+        # #send the page server command,
+        # #after the server's response, CRIU can directly transfer memory dump with network
+        # pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
+        # cs.send(bytes(pageserver_cmd, encoding='utf-8'))
+        # inputready, outputready, exceptready = select.select(input, [], [], 4)
+        # #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+        # if inputready:
+        #     for s in inputready:
+        #         answer = s.recv(1024)
+        #         print(answer)
+        #         error()
+        # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
 
-        dir_size = getdirsize(last_path, 'pages')
+        dir_size = getdirsize(last_path, "pages")
         # print("parent_path:",parent_path)
         # print("last_iter:",last_iter)
-        less_last_path = parent_path[last_iter - 2]  if last_iter > 1 else None
+        less_last_path = parent_path[last_iter - 2] if last_iter > 1 else None
         # print("less_last_path:",less_last_path)
 
         # 更新最大predump大小
@@ -1326,8 +1371,11 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         else:
             # 否则比较两次 pre-dump 目录大小
             less_last_path = parent_path[last_iter - 2]
-            if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
-                    or dir_size < 1024 * 64 or last_iter == max_iter:
+            if (
+                abs(dir_size - getdirsize(less_last_path, "pages")) < 1024 * 64
+                or dir_size < 1024 * 64
+                or last_iter == max_iter
+            ):
                 iter_terminate = True
 
         if dirtymap:
@@ -1335,13 +1383,14 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
                 iter_terminate = True
 
         # 传输当前迭代的 pre-dump
-        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter-1])
+        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter - 1])
         if iter_terminate:
             break
         last_iter += 1
-    print("last_iter:",last_iter)
-    print("less_last_path:",less_last_path)
+    print("last_iter:", last_iter)
+    print("less_last_path:", less_last_path)
     return last_iter
+
 
 def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
     """
@@ -1356,37 +1405,32 @@ def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
     try:
         # 执行 'crit decode' 命令并获取输出
         result = subprocess.run(
-            ['crit', 'show', stats_dump_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
+            ["crit", "show", stats_dump_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
         )
 
         # 解析 JSON 输出
         stat_data = json.loads(result.stdout)
-        entries = stat_data.get('entries', [])
+        entries = stat_data.get("entries", [])
 
         for entry in entries:
-            dump_info = entry.get('dump', {})
+            dump_info = entry.get("dump", {})
             # 提取特定时间字段并累加(us)
-            time_keys = ['freezing_time', 'frozen_time']
-            if log_type == 'pre_dump':
-                time_keys.extend(['memdump_time', 'memwrite_time'])
+            time_keys = ["freezing_time", "frozen_time"]
+            if log_type == "pre_dump":
+                time_keys.extend(["memdump_time", "memwrite_time"])
 
             total_time = sum(float(dump_info.get(key, 0)) for key in time_keys if key in dump_info)
 
             if accumulate:  # 只有当accumulate为True时，才执行累加
-                if log_type == 'pre_dump':
+                if log_type == "pre_dump":
                     pre_dump_time_total += total_time / 1000
                     print(f"stats-dump total_time for pre-dump: {total_time/1000}ms")
-                elif log_type == 'dump':
+                elif log_type == "dump":
                     dump_time += total_time / 1000
                     print(f"stats-dump total_time for dump: {total_time/1000}ms")
             else:
                 esti_dump_time = total_time / 1000
                 print(f"stats-dump total_time for first-dump: {total_time/1000}ms")
-
 
     except subprocess.CalledProcessError as e:
         print(f"执行 crit decode 时出错: {e.stderr}")
@@ -1394,6 +1438,7 @@ def parse_stats_dump(stats_dump_path, log_type, accumulate=True):
         print(f"解析 JSON 时出错: {e}")
     except Exception as e:
         print(f"处理 stats-dump 文件时发生未知错误: {e}")
+
 
 def determine_log_type(path):
     """
@@ -1403,15 +1448,16 @@ def determine_log_type(path):
     :return: 'pre_dump' 或 'dump'，若无法确定则返回 None
     """
     # 使用正则表达式匹配路径模式
-    pre_dump_pattern = re.compile(r'.*/pd_log_\d+$')
-    dump_pattern = re.compile(r'.*/d_log$')
+    pre_dump_pattern = re.compile(r".*/pd_log_\d+$")
+    dump_pattern = re.compile(r".*/d_log$")
 
     if pre_dump_pattern.match(path):
-        return 'pre_dump'
+        return "pre_dump"
     elif dump_pattern.match(path):
-        return 'dump'
+        return "dump"
     else:
         return None
+
 
 def get_dump_time(work_path_list):
     """
@@ -1421,7 +1467,7 @@ def get_dump_time(work_path_list):
     :param work_path_list: 包含工作路径的列表
     """
     for path in work_path_list:
-        stats_dump_file = os.path.join(path, 'stats-dump')
+        stats_dump_file = os.path.join(path, "stats-dump")
         if os.path.isfile(stats_dump_file):
             log_type = determine_log_type(path)
             if log_type:
@@ -1431,6 +1477,7 @@ def get_dump_time(work_path_list):
         else:
             print(f"未找到stats-dump文件: {stats_dump_file}")
 
+
 def get_dump_size(image_path, pre_dump):
     """
     遍历image_path
@@ -1439,26 +1486,28 @@ def get_dump_size(image_path, pre_dump):
     :param pre_dump: 是否为预拷贝
     """
     global dump_size, pre_dump_size_total
-    cmd_du = ['du', '-bs', image_path]
+    cmd_du = ["du", "-bs", image_path]
     try:
         result = subprocess.run(cmd_du, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         # 提取大小部分
 
-        xfer_size_str = result.stdout.strip().split('\t')[0]  # 例如 "124K"
+        xfer_size_str = result.stdout.strip().split("\t")[0]  # 例如 "124K"
         xfer_size = parse_size(xfer_size_str)
-        if (pre_dump):
+        if pre_dump:
             pre_dump_size_total += xfer_size  # 累计预拷贝大小
         else:
             dump_size = xfer_size  # 累计拷贝大小
     except subprocess.CalledProcessError as e:
         print(f"Error executing du command: {e.stderr}")
-        if (pre_dump):
+        if pre_dump:
             pre_dump_size_total += 0.0  # 累计预拷贝大小
         else:
             dump_size = 0.0  # 累计拷贝大小
             error()
 
+
 INIT_PORT = 12345
+
 
 def update_image_parent(mig_base: str, latest_parent: str):
     """
@@ -1488,30 +1537,27 @@ def update_image_parent(mig_base: str, latest_parent: str):
         print(f"无法创建新的 image parent 符号链接 {image_parent_link} -> {relative_target}: {e}")
         error()
 
+
 def final_sync_es_data(dest_ip, rootfs_path):
     """
     在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
     """
-    import os, subprocess
+    import os
+    import subprocess
 
     src_data = os.path.join(rootfs_path, "usr/share/elasticsearch/data") + "/"
     dst_data = f"root@{dest_ip}:{src_data}"
 
     # 确保目标端父目录存在
-    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'",
-                   shell=True, check=False, text=True)
+    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'", shell=True, check=False, text=True)
 
     # 做一次强同步（参数更稳健：权限/属性/uidgid 就位；inplace 避免重写；delete-delay 降低瞬时空窗）
-    cmd = [
-        "rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay",
-        "-P", "--timeout=0", src_data, dst_data
-    ]
+    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_data, dst_data]
     print("[final_sync_es_data] running:", " ".join(cmd))
     subprocess.check_call(cmd)
 
 
-def migrate(container, dest, pre, post, replay,
-            rootfs, max_iter, dirtymap, time_constraint, runc_args):
+def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args):
     global rst_time, dirtymap_path, device_fd, sync_rootfs_process, sync_rootfs_log_file
 
     # 注册退出处理器和信号处理器
@@ -1534,13 +1580,12 @@ def migrate(container, dest, pre, post, replay,
     port_list = [INIT_PORT]
 
     if pre:
-        for i in range(1, max_iter +1):
+        for i in range(1, max_iter + 1):
             pathname = mig_base + "/parent_{}".format(i)
             parent_path.append(pathname)
             pathname = mig_base + "/pd_log_{}".format(i)
             work_path.append(pathname)
             port_list.append(INIT_PORT + i)  # del +1
-
 
     print("post_list: {0}", port_list)
     print("parent_path: {0}", parent_path)
@@ -1548,7 +1593,7 @@ def migrate(container, dest, pre, post, replay,
 
     real_dump_0(mig_base, runc_args=runc_args)
 
-    #time.sleep(100000)
+    # time.sleep(100000)
     # 测量初始带宽和状态传输最大值(Bytes)
     if time_constraint > 0:
         global max_xfer_size
@@ -1563,7 +1608,7 @@ def migrate(container, dest, pre, post, replay,
         try:
             global device_fd
             global device_file
-            device_file = open(DEVICE_PATH, 'wb')
+            device_file = open(DEVICE_PATH, "wb")
             device_fd = device_file.fileno()
         except FileNotFoundError:
             print(f"Light-DT not found in {DEVICE_PATH}, please load the dirty-track kernel module first.")
@@ -1572,37 +1617,39 @@ def migrate(container, dest, pre, post, replay,
         # 迁移开始前配置dirty-map目录
         set_dirty_map_path(device_fd, dirtymap_path)
 
-
     socket.setdefaulttimeout(6)
     cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #Connect to the migration server running on the destination to send the commands
+    # Connect to the migration server running on the destination to send the commands
     cs.connect((dest, 18863))
 
-    inputs = [cs,sys.stdin]
+    inputs = [cs, sys.stdin]
 
     if pre:
-        prepare_cmd = json.dumps({
-            "prepare": {
-                "path": mig_base,
-                "image_path": image_path,
-                "parent_path": parent_path,  # parent_path为列表
-                "compress": compress
-
+        prepare_cmd = json.dumps(
+            {
+                "prepare": {
+                    "path": mig_base,
+                    "image_path": image_path,
+                    "parent_path": parent_path,  # parent_path为列表
+                    "compress": compress,
+                }
             }
-        })
+        )
     else:
-        prepare_cmd = json.dumps({
-            "prepare": {
-                "path": mig_base,
-                "image_path": image_path,
-                "compress": compress
-                # 不包含 parent_path
+        prepare_cmd = json.dumps(
+            {
+                "prepare": {
+                    "path": mig_base,
+                    "image_path": image_path,
+                    "compress": compress,
+                    # 不包含 parent_path
+                }
             }
-        })
+        )
 
-    cs.send(bytes(prepare_cmd, encoding='utf-8'))
+    cs.send(bytes(prepare_cmd, encoding="utf-8"))
     inputready, outputready, exceptready = select.select(inputs, [], [], 4)
-    #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
+    # If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
     if inputready:
         for s in inputready:
             answer = s.recv(1024).decode("utf-8")
@@ -1614,12 +1661,12 @@ def migrate(container, dest, pre, post, replay,
                 error()
 
     if rootfs:
-        search_cmd = 'runc list | grep ' + container
+        search_cmd = "runc list | grep " + container
         container_exist = subprocess.getstatusoutput(search_cmd)
-        #(0, 'redis-test   7289        running     /runc/containers/redis-test   2024-04-21T07:13:10.98300754Z   root')
+        # (0, 'redis-test   7289        running     /runc/containers/redis-test   2024-04-21T07:13:10.98300754Z   root')
 
-        #if the container is already running on the source, then we can transfer the rootfs
-        #if the container is not running, then the script will exit
+        # if the container is already running on the source, then we can transfer the rootfs
+        # if the container is not running, then the script will exit
         if container_exist[0]:
             error()
 
@@ -1631,23 +1678,25 @@ def migrate(container, dest, pre, post, replay,
         # if ret != 0:
         #     error()
 
-        #infinite rootfs sync
+        # infinite rootfs sync
         # 确保脚本有执行权限
-        if not os.access('./sync_rootfs.sh', os.X_OK):  # 检查是否有执行权限
-            os.chmod('./sync_rootfs.sh', 0o755)        # 添加执行权限
+        if not os.access("./sync_rootfs.sh", os.X_OK):  # 检查是否有执行权限
+            os.chmod("./sync_rootfs.sh", 0o755)  # 添加执行权限
 
         # 保存日志文件句柄到全局变量
-        sync_rootfs_log_file = open(mig_base + "/d_log/sync_rootfs.log", 'w')
-        sync_cmd = './sync_rootfs.sh ' + dest + ' ' + rootfs_path
+        sync_rootfs_log_file = open(mig_base + "/d_log/sync_rootfs.log", "w")
+        sync_cmd = "./sync_rootfs.sh " + dest + " " + rootfs_path
 
         # 保存进程对象到全局变量
-        sync_rootfs_process = subprocess.Popen(sync_cmd, shell=True, stdout=sync_rootfs_log_file, stderr=sync_rootfs_log_file)
+        sync_rootfs_process = subprocess.Popen(
+            sync_cmd, shell=True, stdout=sync_rootfs_log_file, stderr=sync_rootfs_log_file
+        )
         print(f"sync_rootfs started: (PID = {sync_rootfs_process.pid})")
 
     if pre:
         if diskless:
             for i in range(0, max_iter):
-                mount_cmd = 'mount -t tmpfs none '+ parent_path[i]
+                mount_cmd = "mount -t tmpfs none " + parent_path[i]
                 ret = os.system(mount_cmd)
                 if ret != 0:
                     error()
@@ -1657,16 +1706,16 @@ def migrate(container, dest, pre, post, replay,
         global pre_dump_iters
         pre_dump_iters = last_iter
         # 使用同步传输，所有传输已在iterate_predump中完成，无需发送确认消息
-        #if diskless:
+        # if diskless:
         #   diskless_pre_dump(base_path, container, dest)
-        #else:
+        # else:
         #   pre_dump(base_path, container)
         #   xfer_pre_dump(parent_path, dest, base_path)
     else:
         last_iter = 0
 
     if diskless:
-        mount_cmd = 'mount -t tmpfs none '+ image_path
+        mount_cmd = "mount -t tmpfs none " + image_path
         ret = os.system(mount_cmd)
         if ret != 0:
             error()
@@ -1691,7 +1740,9 @@ def migrate(container, dest, pre, post, replay,
         print(f"Bandwidth standard deviation: {bandwidth_stddev:.2f} Bytes/s")
 
         # 可用于传输的时间=时间约束-2*C/R时间
-        max_xfer_size = abs(average_bandwidth - bandwidth_stddev) * ((time_constraint - 2 * esti_dump_time) / 1000.0)  # Convert ms to seconds
+        max_xfer_size = abs(average_bandwidth - bandwidth_stddev) * (
+            (time_constraint - 2 * esti_dump_time) / 1000.0
+        )  # Convert ms to seconds
         print(f"Max_transfer_size: {max_xfer_size:.2f} Bytes based on average bandwidth and time constraint")
 
         # 获取容器尚未传输的内存状态大小，判断是否post-copy
@@ -1721,7 +1772,7 @@ def migrate(container, dest, pre, post, replay,
                     # print("[Warning]post-copy is not enabled, pre-copy may failed")
                     post = True
             else:
-                print(f"We can transfer within one-shot stop-and-copy")
+                print("We can transfer within one-shot stop-and-copy")
                 if post:
                     post = False
 
@@ -1734,7 +1785,7 @@ def migrate(container, dest, pre, post, replay,
         try:
             # 创建标记文件触发rsync同步
             force_sync_marker = os.path.join(base_path, "force_sync.marker")
-            with open(force_sync_marker, 'w'):
+            with open(force_sync_marker, "w"):
                 pass  # 创建空文件
             print("标记文件已创建：触发实转储后同步")
         except Exception as e:
@@ -1742,7 +1793,6 @@ def migrate(container, dest, pre, post, replay,
 
     # 传输容器剩余状态
     xfer_final(cs, image_path, dest, compress, port_list[-1])
-
 
     # 等待强制同步完成 - 检查标记文件是否已被删除
     if rootfs and sync_rootfs_process and sync_rootfs_process.poll() is None:
@@ -1775,18 +1825,19 @@ def migrate(container, dest, pre, post, replay,
     # print('the total size of {} is {}{}'.format(image_path, dir_size[0], dir_size[1]))
 
     # if replay:
-        # todo: 创建转发路由
+    # todo: 创建转发路由
     # 只有elastisearch才需要
     # final_sync_es_data(dest, rootfs_path)
     # one-shot restore with post-copy
     # Build runc_args string for restore command
-    runc_args_str = ' '.join(runc_args) if runc_args else ""
-    #final_sync_es_data(dest, rootfs_path)
+    runc_args_str = " ".join(runc_args) if runc_args else ""
+    # final_sync_es_data(dest, rootfs_path)
 
-
-    restore_cmd = '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
+    restore_cmd = (
+        '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
+    )
     restore_cmd += '" , "lazy" : "' + str(post) + '" , "runc_args" : "' + runc_args_str.replace('"', '\\"') + '" } }'
-    cs.send(bytes(restore_cmd, encoding='utf-8'))
+    cs.send(bytes(restore_cmd, encoding="utf-8"))
 
     # 等待恢复完成
     print("Wait for destination...")
@@ -1805,12 +1856,14 @@ def migrate(container, dest, pre, post, replay,
         print(f"  Remaining {time_left} seconds...")
 
         if time_left <= 0:
-            print(f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues")
-    #If there is something in input to read (e.g., from the socket), then print it
+            print(
+                f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues"
+            )
+    # If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     for s in inputready:
         answer = s.recv(1024).decode("utf-8")
-        print("answer:",answer)
+        print("answer:", answer)
         if "runc restored" in answer:
             # 使用正则表达式提取数据
             pattern = r"runc restored .* successfully with (\d+\.\d+) ms(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
@@ -1833,7 +1886,7 @@ def migrate(container, dest, pre, post, replay,
         else:
             print("Received reply:", answer)
 
-    #after migration, rootfs sync process and opened files will be closed
+    # after migration, rootfs sync process and opened files will be closed
     if rootfs:
         stop_sync_rootfs()
 
@@ -1843,7 +1896,7 @@ def migrate(container, dest, pre, post, replay,
     # 读取stat-dump计算迁移时间
     # 注意后拷贝时dump_time不通过读取stat-dump获取
     if not post:
-        work_path.append(mig_base + '/d_log')
+        work_path.append(mig_base + "/d_log")
     get_dump_time(work_path_list=work_path)
 
     # 计算迁移大小
@@ -1853,49 +1906,71 @@ def migrate(container, dest, pre, post, replay,
 
     return True
 
+
 def post_process(max_iter):
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     for i in range(0, max_iter):
-        umount_cmd = 'umount ' + mig_base + '/parent_{}'.format(i)
+        umount_cmd = "umount " + mig_base + "/parent_{}".format(i)
         try:
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
         except:
             pass
 
     try:
-        umount_cmd = 'umount ' + mig_base + '/image'
+        umount_cmd = "umount " + mig_base + "/image"
         subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
     except:
         pass
     os.chdir(old_cwd)
 
-def touch(fname):
-    open(fname, 'a').close()
 
-parser = argparse.ArgumentParser(description='manual to migration script for source node')
-parser.add_argument('container', help="container's name(identical to bundle name)")
-parser.add_argument('dest', help="IP address of destination")
-parser.add_argument('-pre', '--pre-copy', dest='pre', action='store_true', help="enable per-copy migration")
-parser.add_argument('-post', '--post-copy', dest='post', action='store_true', help="enable post-copy migration")
-parser.add_argument('-d', '--disk-less', dest='diskless', action='store_true', help="enable disk-less migration(page-server, only effect pre-copy)")
-parser.add_argument('--no-rootfs', dest='norootfs', action='store_true', help="avoid the synchronization of rootfs")
-parser.add_argument('-i','--iter', type=int, help='Max iterations of pre-dump')
-parser.add_argument('-dm', '--use-dirty-map', dest='dirtymap', action='store_true', help="use dirty-map to reduce the size of memory dump")
-parser.add_argument('-tc', '--time-constraint', type=float, default=1000.0, help="max tranfer time constraint(ms)")
-parser.add_argument('--replay', dest='replay', action='store_true', help="enable post packets replay")
-parser.add_argument('-z', '--compress', type=int, choices=[0, 1, 2, 3, 4], default=0,
-                    help="compression level: 0=off, 1=fastest(2K), 2=fast(4K), 3=standard(16K), 4=best(32K)")
+def touch(fname):
+    open(fname, "a").close()
+
+
+parser = argparse.ArgumentParser(description="manual to migration script for source node")
+parser.add_argument("container", help="container's name(identical to bundle name)")
+parser.add_argument("dest", help="IP address of destination")
+parser.add_argument("-pre", "--pre-copy", dest="pre", action="store_true", help="enable per-copy migration")
+parser.add_argument("-post", "--post-copy", dest="post", action="store_true", help="enable post-copy migration")
+parser.add_argument(
+    "-d",
+    "--disk-less",
+    dest="diskless",
+    action="store_true",
+    help="enable disk-less migration(page-server, only effect pre-copy)",
+)
+parser.add_argument("--no-rootfs", dest="norootfs", action="store_true", help="avoid the synchronization of rootfs")
+parser.add_argument("-i", "--iter", type=int, help="Max iterations of pre-dump")
+parser.add_argument(
+    "-dm",
+    "--use-dirty-map",
+    dest="dirtymap",
+    action="store_true",
+    help="use dirty-map to reduce the size of memory dump",
+)
+parser.add_argument("-tc", "--time-constraint", type=float, default=1000.0, help="max tranfer time constraint(ms)")
+parser.add_argument("--replay", dest="replay", action="store_true", help="enable post packets replay")
+parser.add_argument(
+    "-z",
+    "--compress",
+    type=int,
+    choices=[0, 1, 2, 3, 4],
+    default=0,
+    help="compression level: 0=off, 1=fastest(2K), 2=fast(4K), 3=standard(16K), 4=best(32K)",
+)
 
 # 处理 --tcp-established 和 --shell-job 等criu参数
 # 将这些参数排除在脚本参数解析之外
 args, remaining = parser.parse_known_args()
 
+
 def extract_positional_args():
     """从原始命令行中智能提取位置参数(container名和目标IP)"""
 
     # 定义所有已知的可带数值参数
-    value_params = {'-tc', '--time-constraint', '-i', '--iter','-z','--compress'}
+    value_params = {"-tc", "--time-constraint", "-i", "--iter", "-z", "--compress"}
 
     i = 1  # 跳过脚本名称
     positional_args = []
@@ -1903,12 +1978,12 @@ def extract_positional_args():
     while i < len(sys.argv):
         arg = sys.argv[i]
 
-        if arg.startswith('-'):
+        if arg.startswith("-"):
             if arg in value_params:
                 # 跳过参数名和它的值
                 i += 2
                 continue
-            elif arg.startswith('--'):
+            elif arg.startswith("--"):
                 # 长选项，如果占用参数则跳过
                 i += 1
                 continue
@@ -1918,6 +1993,7 @@ def extract_positional_args():
 
     return positional_args
 
+
 # 获取位置参数
 positional = extract_positional_args()
 container_name = None
@@ -1925,7 +2001,7 @@ runc_args = []
 
 # 第一步：从remaining中提取criu参数
 for arg in remaining:
-    if arg.startswith('--') or arg.startswith('-'):
+    if arg.startswith("--") or arg.startswith("-"):
         # criu/runc 参数
         runc_args.append(arg)
     else:
@@ -1944,7 +2020,7 @@ if len(positional) > 0:
 # 如果仍然没找到，使用备用方法
 if not container_name:
     for arg in sys.argv[1:]:
-        if not arg.startswith('-') and arg != args.dest:
+        if not arg.startswith("-") and arg != args.dest:
             container_name = arg
             break
 
@@ -1954,7 +2030,7 @@ if not container_name:
 # print(f"Debug: container_name = '{container_name}'")
 # print(f"Debug: criu_args = {runc_args}")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
 
     runc_base = "/runc/containers/"
 
@@ -1967,7 +2043,7 @@ if __name__ == '__main__':
     compress = args.compress
 
     # 检查用户是否确实提供了时间约束参数
-    if '--time-constraint' in sys.argv or '-tc' in sys.argv:
+    if "--time-constraint" in sys.argv or "-tc" in sys.argv:
         time_constraint = args.time_constraint
     else:
         time_constraint = -1  # 用户没有提供时间约束，禁用时间约束检查
@@ -1986,69 +2062,67 @@ if __name__ == '__main__':
     else:
         max_iter = 0  # 当未启用预拷贝时，将 max_iter 设为 0
 
-    #The name of the container is the first argument
-    #NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
+    # The name of the container is the first argument
+    # NOTE: for the way the code is currently written, it must be the same as the name of the OCI bundle
     container = container_name
-    #destination IP is the second argument
+    # destination IP is the second argument
     dest = args.dest
-    #the Pre and Lazy flags, which are used to determine the migration techniques as follows:
-    #Cold = False False
-    #Pre-copy = True False
-    #Post-copy = False True
-    #Hybrid = True True
+    # the Pre and Lazy flags, which are used to determine the migration techniques as follows:
+    # Cold = False False
+    # Pre-copy = True False
+    # Post-copy = False True
+    # Hybrid = True True
     pre = args.pre
     post = args.post
     replay = args.replay
     dirtymap = args.dirtymap
 
-    #use CRIU's page server to directly transfer memory dump
+    # use CRIU's page server to directly transfer memory dump
     diskless = args.diskless
     if diskless and not (pre or post):
         parser.error("Diskless only supported to used in pre/post-copy")
 
-    #rootfs_sync flag, which is used to enable synchronization of container's rootfs
+    # rootfs_sync flag, which is used to enable synchronization of container's rootfs
     if args.norootfs:
         rootfs = False
 
     base_path = runc_base + container
     mig_base = base_path + "/migrate"
 
-    #-h outputs numbers in human readable format
-    #-a enables archive mode, which preserves permissions, ownership, and modification times, among other things
-    #-z enables compression during transfer
-    #-P reserves files which are not completely transferred to speed-up the following re-transferring
+    # -h outputs numbers in human readable format
+    # -a enables archive mode, which preserves permissions, ownership, and modification times, among other things
+    # -z enables compression during transfer
+    # -P reserves files which are not completely transferred to speed-up the following re-transferring
     # rsync_opts = "-haz --whole-file"
     rsync_opts = "-az --whole-file"
     ssh_opts = "-o TCPWindowSize=65536 -o SSHBufferSize=65536 -c aes128-ctr"
 
     # 开始热迁移
-    migrate(container, dest, pre, post, replay, rootfs,
-                    max_iter, dirtymap, time_constraint, runc_args)
-
+    migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time_constraint, runc_args)
 
     print("-----------------------statistics---------------")
-    transfer_vip('100')   # 把源端优先级恢复到 100s
-# 输出累计的预拷贝时间和大小
+    transfer_vip("100")  # 把源端优先级恢复到 100s
+    # 输出累计的预拷贝时间和大小
     if pre:
-        print('Total pre-dump time: {:.0f} ms'.format(pre_dump_time_total))
-        print('Total pre-dump transfer time: {:.0f} ms'.format(pre_dump_xfer_time_total))
-
+        print("Total pre-dump time: {:.0f} ms".format(pre_dump_time_total))
+        print("Total pre-dump transfer time: {:.0f} ms".format(pre_dump_xfer_time_total))
 
     # 输出 dump 的时间和大小
-    print('Total dump time: {:.0f} ms'.format(dump_time))
-    print('Total dump transfer time: {:.0f} ms'.format(dump_xfer_time))
-    print('resume time (pre dump can use):{:.0f} ms '.format(rst_time))
+    print("Total dump time: {:.0f} ms".format(dump_time))
+    print("Total dump transfer time: {:.0f} ms".format(dump_xfer_time))
+    print("resume time (pre dump can use):{:.0f} ms ".format(rst_time))
     if pre:
-        print('Total pre-dump size: {:.3f} KB'.format(pre_dump_size_total / 1024))  # 转换为 KB
-    print('Total dump size:{:.3f} KB'.format(dump_size / 1024))  # 转换为 KB
+        print("Total pre-dump size: {:.3f} KB".format(pre_dump_size_total / 1024))  # 转换为 KB
+    print("Total dump size:{:.3f} KB".format(dump_size / 1024))  # 转换为 KB
 
     if pre and not post:
-        total_time = pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time+rst_time
+        total_time = pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time
     elif not pre and post:
-        total_time = dump_time + dump_xfer_time+rst_time + rpf_handle_time
+        total_time = dump_time + dump_xfer_time + rst_time + rpf_handle_time
     elif pre and post:
-        total_time = pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time+rst_time+rpf_handle_time
-
+        total_time = (
+            pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time + rpf_handle_time
+        )
 
     stop_time = dump_time + dump_xfer_time + rst_time
 
@@ -2059,22 +2133,22 @@ if __name__ == '__main__':
         total_size = dump_size / 1024 + pre_dump_size_total / 1024 + total_uffd_copy
     else:
         total_size = dump_size / 1024 + pre_dump_size_total / 1024
-    print('total migrate size: {:.3f} KB'.format(total_size))
+    print("total migrate size: {:.3f} KB".format(total_size))
     if post:
-        print('Faulted pages transfer time（ms）: {:.0f} ms'.format(rpf_handle_time))
-        print('Faulted pages size(KB): {:.2f} KB'.format(total_uffd_copy))
-    #input()
+        print("Faulted pages transfer time（ms）: {:.0f} ms".format(rpf_handle_time))
+        print("Faulted pages size(KB): {:.2f} KB".format(total_uffd_copy))
+    # input()
     # 迁移完成后，执行后处理
     # for excel
 
     # [修改] 计算压缩率并为 output_values 准备变量
     compression_ratio = 0.0  # 默认初始化
-# [新] 计算并打印压缩率
+    # [新] 计算并打印压缩率
     if compress >= 0:
         # 1. 计算 LZO 文件总大小 (分子)
         # mig_base 在 __main__ 块的开头 (约 1756 行) 已经定义
-        #total_lzo_size = get_lzo_files_size(mig_base)
-        total_compressed_size = get_compressed_files_size(mig_base, compress) # <-- 修正后的调用
+        # total_lzo_size = get_lzo_files_size(mig_base)
+        total_compressed_size = get_compressed_files_size(mig_base, compress)  # <-- 修正后的调用
         # 2. 计算未压缩数据总大小 (分母)
         # pre_dump_size_total 和 dump_size 是全局变量,
         # 并在 migrate() 函数末尾通过 get_dump_size() 填充
@@ -2083,59 +2157,45 @@ if __name__ == '__main__':
         compression_ratio = 0.0
         if total_uncompressed_size > 0:
             # 压缩率 = (压缩后大小 / 压缩前大小) * 100%
-            compression_ratio = (total_uncompressed_size / total_compressed_size)
+            compression_ratio = total_uncompressed_size / total_compressed_size
 
-        print(f'Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB')
+        print(f"Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB")
         # print(f'Total Original (uncompressed) size: {total_uncompressed_size / 1024:.3f} KB')
-        print(f'Compression Ratio: {compression_ratio:.2f} %')
+        print(f"Compression Ratio: {compression_ratio:.2f} %")
     # [新功能结束]
 
-   # 输出数据行
+    # 输出数据行
     output_values = []
 
     if pre:
-        output_values.extend([
-            int(round(pre_dump_time_total)),
-            int(round(pre_dump_xfer_time_total))
-        ])
+        output_values.extend([int(round(pre_dump_time_total)), int(round(pre_dump_xfer_time_total))])
 
-    output_values.extend([
-        int(round(dump_time)),
-        int(round(dump_xfer_time)),
-        int(round(rst_time))
-    ])
+    output_values.extend([int(round(dump_time)), int(round(dump_xfer_time)), int(round(rst_time))])
 
     if pre:
-        output_values.append('{:.2f}'.format(pre_dump_size_total / 1024))  # 预拷贝大小以KB为单位
+        output_values.append("{:.2f}".format(pre_dump_size_total / 1024))  # 预拷贝大小以KB为单位
     else:
-        output_values.append('')
+        output_values.append("")
 
-    output_values.append('{:.2f}'.format(dump_size / 1024))  # dump_size以KB为单位
+    output_values.append("{:.2f}".format(dump_size / 1024))  # dump_size以KB为单位
 
-    output_values.extend([
-        int(round(total_time)),
-        int(round(stop_time))
-    ])
+    output_values.extend([int(round(total_time)), int(round(stop_time))])
     output_values.append(int(round(total_size)))
     if post:
-        output_values.extend([
-            int(round(rpf_handle_time)),
-            '{:.2f}'.format(total_uffd_copy)
-
-        ])
+        output_values.extend([int(round(rpf_handle_time)), "{:.2f}".format(total_uffd_copy)])
     if pre:
         output_values.append(int(round(pre_dump_iters)))
     print("aaaaaaaaaaaaaaaa")
-    if compress>0:
+    if compress > 0:
         print("bbbbbbbbbbbb")
         output_values.append(int(round(total_compression_time)))
-        #output_values.append(int(round(compression_ratio)))
-        output_values.append('{:.2f}'.format(compression_ratio))
-    print('\t'.join(map(str, output_values)))
+        # output_values.append(int(round(compression_ratio)))
+        output_values.append("{:.2f}".format(compression_ratio))
+    print("\t".join(map(str, output_values)))
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")
 
-    output_line = '\t'.join(map(str, output_values))
+    output_line = "\t".join(map(str, output_values))
     # 将结果追加写入 results.txt 文件
     with open("results.txt", "a") as f:
         f.write(output_line + "\n")
