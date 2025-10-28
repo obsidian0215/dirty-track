@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # code retrieved from https://www.redhat.com/en/blog/container-migration-around-world and partially modified
 import distutils.util
 import json
@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from _thread import *
+from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
@@ -82,7 +82,7 @@ def prepare(base_path, image_path, parent_path):
             shutil.rmtree(image_path)
             shutil.rmtree(base_path + "/r_log")
             # shutil.rmtree(base_path + '/lp_log')
-        except:
+        except Exception:
             pass
 
         try:
@@ -95,7 +95,7 @@ def prepare(base_path, image_path, parent_path):
                     umount_cmd = "umount " + entry_path
                     subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
                     shutil.rmtree(entry_path)
-        except:
+        except Exception:
             pass
     else:
         os.mkdir(base_path)
@@ -177,7 +177,7 @@ def transfer_vip():
 
         # 定义替换函数，将 priority 设置为较低的值（例如：50）
         def repl(match):
-            original_priority = match.group(2)
+            match.group(2)
             new_priority = "100"  # 设置新的优先级
             # print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
@@ -382,8 +382,8 @@ def perform_restore(msg):
     ret = p.wait()
     end_time = time.perf_counter()
     cpu_end = psutil.cpu_percent(interval=None)
-    cpu_usage = cpu_end - cpu_start
-    elapsed_ms = (end_time - start_time) * 1000
+    cpu_end - cpu_start
+    (end_time - start_time) * 1000
     logger.info(".3f")
 
     if lazy:
@@ -466,7 +466,7 @@ def handle_archive_ready(info):
     try:
         path = info.get("path")
         archive = info.get("archive")
-        compress_level = info.get("compress", 0)
+        info.get("compress", 0)
 
         if not path or not archive:
             return "Error: invalid archive_ready payload"
@@ -680,7 +680,7 @@ def migrate_server():
                     case _:
                         print("Unknown request: " + msg)
                         reply = "unknown request"
-            except:
+            except Exception:
                 continue
 
             print(reply)
@@ -711,3 +711,4 @@ def migrate_server():
 
 if __name__ == "__main__":
     migrate_server()
+

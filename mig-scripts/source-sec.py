@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # code retrieved from https://www.redhat.com/en/blog/container-migration-around-world and partially modified
 # import distutils.util
 import argparse
@@ -627,7 +627,7 @@ def prepare(base_path, image_path, parent_path, work_path):
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
             shutil.rmtree(image_path)
             shutil.rmtree(base_path + "/d_log")
-        except:
+        except Exception:
             pass
 
         try:
@@ -642,7 +642,7 @@ def prepare(base_path, image_path, parent_path, work_path):
                     shutil.rmtree(entry_path)
                 elif os.path.isdir(entry_path) and entry.startswith("pd_log"):
                     shutil.rmtree(entry_path)
-        except:
+        except Exception:
             pass
     else:
         os.mkdir(base_path)
@@ -744,7 +744,7 @@ def transfer_vip(new_prior):
 
         # 定义替换函数，将 priority设置为比目标节点较低的值
         def repl(match):
-            original_priority = match.group(2)
+            match.group(2)
             new_priority = new_prior  # 设置新的优先级
             # print(f"将 VIP 的优先级从 {original_priority} 更新为 {new_priority}")
             return f"{match.group(1)}{new_priority}{match.group(3)}"
@@ -1179,7 +1179,7 @@ def xfer_final(cs, image_path, dest, compress, port):
     # 创建压缩包并通过 SSH 传输
     if compress == 0:
         # 无压缩
-        cmd_tar = f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
+        f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
         # 创建压缩包并通过 SSH 传输
     elif compress >= 1 and compress <= 4:
         # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
@@ -1213,7 +1213,7 @@ def xfer_final(cs, image_path, dest, compress, port):
             print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
 
         # 通过nc传输lzo文件
-        cmd_tar = f"nc -q 0 {dest} {port} < {lzo_name}"
+        f"nc -q 0 {dest} {port} < {lzo_name}"
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
     # 传输到目标服务器：使用 scp/rsync 选择
@@ -1914,13 +1914,13 @@ def post_process(max_iter):
         umount_cmd = "umount " + mig_base + "/parent_{}".format(i)
         try:
             subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
-        except:
+        except Exception:
             pass
 
     try:
         umount_cmd = "umount " + mig_base + "/image"
         subprocess.run(umount_cmd, shell=True, stderr=subprocess.DEVNULL)
-    except:
+    except Exception:
         pass
     os.chdir(old_cwd)
 
@@ -2202,3 +2202,4 @@ if __name__ == "__main__":
 
     if diskless:
         post_process(max_iter)
+
