@@ -1003,9 +1003,8 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
     # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
     # 创建压缩包
     if compress == 0:
-        # 无压缩
-        # archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
-        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
+        # 无压缩 — 使用 .tar 后缀（不要误标记为 .tar.gz，以免目标端用 -z 解压失败）
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
         cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
     elif compress >= 1 and compress <= 4:
         # 使用lzo_gpu压缩
