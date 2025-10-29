@@ -1,6 +1,7 @@
 ﻿import argparse
 import re
 import subprocess
+import shlex
 import sys
 import time
 from result_writer import extract_stats_from_output, append_result
@@ -29,7 +30,7 @@ if __name__ == "__main__":
         "--recordcount", type=int, default=10000, help="Record count for YCSB (recordcount == operationcount)."
     )
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
-    parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     parsed_args = parser.parse_args()
 
     # 全局变量
@@ -98,12 +99,12 @@ def run_ycsb_cmd(cmd, ignore_error=False, background=False):
     # 如果background=True，则在目标机器上使用nohup和&将进程放入后台
     if background:
         remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
-        full_cmd = f"ssh {YCSB_IP} \"{remote_cmd}\""
     else:
-        full_cmd = f"ssh {YCSB_IP} '{cmd}'"
+        remote_cmd = cmd
 
-    print("Executing on YCSB machine:", full_cmd)
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ssh_args = ["ssh", YCSB_IP, remote_cmd]
+    print("Executing on YCSB machine:", " ".join(ssh_args))
+    result = subprocess.run(ssh_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 and not ignore_error:
         print("YCSB command failed with error:", result.stderr)
         sys.exit(1)
@@ -122,7 +123,11 @@ def destination_prepare():
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid",
+            (
+                "nohup /root/go/bin/recvtty -m single "
+                f"/runc/containers/{container_name}/console.sock > /dev/null 2>&1 "
+                "& echo $! > /tmp/recvtty.pid"
+            ),
             False,
         ),
     ]
@@ -132,7 +137,11 @@ def destination_prepare():
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = (
+        f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 "
+        "& echo $! > "
+        f"{dest_pidfile}"
+    )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
     wait = 0.5
@@ -165,7 +174,13 @@ def destination_clean():
     # 停止 destination 后台进程并移除 pidfile（如果存在）
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     stop_cmd = (
-        f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+        "if [ -f "
+        f"{dest_pidfile}"
+        "]; then kill -TERM $(cat "
+        f"{dest_pidfile}"
+        ") 2>/dev/null || true; rm -f "
+        f"{dest_pidfile}"
+        "; fi"
     )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
@@ -179,12 +194,20 @@ def source_prepare():
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                "nohup recvtty -m single "
+                f"/runc/containers/{container_name}/console.sock > /dev/null 2>&1 "
+                "& echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         # 启动容器
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock "
+                f"-d -b /runc/containers/{container_name} {container_name}"
+            ),
             False,
         ),
     ]
@@ -201,7 +224,8 @@ def source_clean():
     run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
-    # run_cmd("rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True) # 如果容器不存在可忽略错误
+    # run_cmd("rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True)
+    # 如果容器不存在可忽略错误
     # run_cmd(f"ps aux | grep 'inotifywait' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
     # run_cmd(f"ps aux | grep 'sync_rootfs' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9", ignore_error=True)
 
@@ -387,8 +411,10 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
-                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
+                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem "
+                f"delay {delay}",
             ]
         )
 
@@ -439,7 +465,10 @@ def configure_network():
 
 def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     # 启动容器
-    # container_cmd = "runc run --console-socket /runc/containers/elasticsearch/console.sock -d -b /runc/containers/elasticsearch elasticsearch"
+    # container_cmd = (
+    #     "runc run --console-socket /runc/containers/elasticsearch/console.sock "
+    #     "-d -b /runc/containers/elasticsearch elasticsearch"
+    # )
     # run_cmd(container_cmd)
 
     time.sleep(8)  # 等待容器启动稳定
@@ -451,7 +480,14 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     env_setup = "export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/bin/maven/bin/; "
 
     # YCSB load with Maven path
-    load_cmd = f'{env_setup}cd /root/YCSB && ./bin/ycsb load elasticsearch5-rest -s -P /root/YCSB/workloads/workloada -p "es.hosts.list={VIP}:9200" -p recordcount={RECORD_COUNT} > /root/YCSB/logs/outputLoad.txt'
+    load_cmd = (
+        f"{env_setup}"
+        "cd /root/YCSB && ./bin/ycsb load elasticsearch5-rest -s -P "
+        "/root/YCSB/workloads/workloada "
+        f"-p \"es.hosts.list={VIP}:9200\" "
+        f"-p recordcount={RECORD_COUNT} "
+        "> /root/YCSB/logs/outputLoad.txt"
+    )
     run_ycsb_cmd(load_cmd)
 
     # 在load和run之间设置网络带宽和延迟控制
@@ -459,13 +495,30 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     print("Network configuration applied between YCSB load and run.")
 
     # YCSB run (两者recordcount和operationcount相等) with Maven path
-    ycsb_run_cmd = f'{env_setup}cd /root/YCSB && nohup ./bin/ycsb run elasticsearch5-rest -s -P /root/YCSB/workloads/workloada -p operationcount={OPERATION_COUNT} -p "es.hosts.list={VIP}:9200" > /root/YCSB/logs/outputRun.txt 2>&1 &'
+    ycsb_run_cmd = (
+        f"{env_setup}"
+        "cd /root/YCSB && nohup ./bin/ycsb run elasticsearch5-rest -s -P "
+        "/root/YCSB/workloads/workloada "
+        f"-p operationcount={OPERATION_COUNT} "
+        f"-p \"es.hosts.list={VIP}:9200\" "
+        "> /root/YCSB/logs/outputRun.txt "
+        "2>&1 &"
+    )
     run_ycsb_cmd(ycsb_run_cmd, background=False)
 
     time.sleep(6)  # 等待YCSB启动稳定
     # 执行 source 脚本进行迁移（支持 secure 变体）
-    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} --file-locks elasticsearch {DEST_IP}"
-    result = run_cmd(migration_cmd)
+    # Execute migration command as an argument list to avoid local shell quoting issues.
+    migration_args = ["python3", SOURCE_SCRIPT]
+    migration_args += shlex.split(exp_args)
+    migration_args += ["--file-locks", "elasticsearch", DEST_IP]
+    print("Executing migration:", " ".join(migration_args))
+    result = subprocess.run(migration_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print("Migration command failed with error:", result.stderr)
+        sys.exit(1)
+    else:
+        print(result.stdout)
 
     # 尝试从 stdout 中提取统计行并写入 results
     try:

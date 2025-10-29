@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 from result_writer import extract_stats_from_output, append_result
+import shlex
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -79,13 +80,20 @@ def destination_prepare():
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
 
-    recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    recvtty_cmd = (
+        f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock "
+        "> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    )
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = (
+        f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} "
+        "2>&1 & echo $! > "
+        f"{dest_pidfile}"
+    )
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
     # 等待目标端写入 pidfile
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
@@ -127,11 +135,18 @@ def source_prepare():
         (f"rm -rf /runc/containers/{container_name}", False),
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         (
-            f"nohup recvtty -m null /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                f"nohup recvtty -m null /runc/containers/{container_name}/console.sock "
+                "> /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} "
+                f"{container_name}"
+            ),
             False,
         ),
     ]
@@ -249,7 +264,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
                 f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
             ]
         )
@@ -372,8 +388,10 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
     time.sleep(3)
 
     # 执行 source 脚本进行迁移（支持 secure 变体）
-    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} {container_name} {DEST_IP}"
-    result = run_cmd(migration_cmd)
+    # 使用参数列表调用本地 python 以避免不必要的 shell=True
+    cmd_list = ["python3", SOURCE_SCRIPT] + shlex.split(exp_args) + [container_name, DEST_IP]
+    print("Running migration:", " ".join(cmd_list))
+    result = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     # 尝试从 stdout 中提取统计行并写入 results
     try:
@@ -427,7 +445,7 @@ def main():
     parser.add_argument("--payload-size-kb", type=int, help="负载大小(KB)")
     parser.add_argument("--sensors-per-device", type=int, help="每设备传感器数")
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
-    parser.add_argument("--runs", type=int, default=1, help="每个实验类型的运行次数")
+    parser.add_argument("--runs", type=int, default=5, help="每个实验类型的运行次数")
     parser.add_argument(
         "--experiment-types",
         nargs="*",

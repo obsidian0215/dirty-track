@@ -1,6 +1,7 @@
 ﻿import argparse
 import re
 import subprocess
+import shlex
 import sys
 import time
 from result_writer import extract_stats_from_output, append_result
@@ -31,7 +32,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-rc", "--recordcount", type=int, default=100000, help="Record count for YCSB (recordcount == operationcount)."
     )
-    parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
     parsed_args = parser.parse_args()
@@ -102,13 +103,13 @@ def run_ycsb_cmd(cmd, ignore_error=False, background=False):
     # 在第三台机器上执行YCSB命令
     # 如果background=True，则在目标机器上使用nohup和&将进程放入后台
     if background:
-        # 使用nohup和&后台运行，让ssh立即返回
-        # 同时将输出重定向到文件，防止阻塞
-        cmd = f"nohup {cmd}  &"
+        remote_cmd = f"nohup {cmd}  &"
+    else:
+        remote_cmd = cmd
 
-    full_cmd = f"ssh {YCSB_IP} '{cmd}'"
-    print("Executing on YCSB machine:", full_cmd)
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    ssh_args = ["ssh", YCSB_IP, remote_cmd]
+    print("Executing on YCSB machine:", " ".join(ssh_args))
+    result = subprocess.run(ssh_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 and not ignore_error:
         print("YCSB command failed with error:", result.stderr)
         sys.exit(1)
@@ -130,7 +131,13 @@ def destination_prepare():
     # 停止 destination 后台进程并移除 pidfile（如果存在）
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     stop_cmd = (
-        f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+        "if [ -f "
+        f"{dest_pidfile}"
+        "]; then kill -TERM $(cat "
+        f"{dest_pidfile}"
+        ") 2>/dev/null || true; rm -f "
+        f"{dest_pidfile}"
+        "; fi"
     )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
@@ -142,9 +149,14 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
+    script_name = DEST_SCRIPT.replace('.', '_')
+    dest_log = f"/tmp/{script_name}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = (
+        f"nohup python3 /runc/dirty-track/mig-scripts/{script_name}.py > {dest_log} 2>&1 "
+        "& echo $! > "
+        f"{dest_pidfile}"
+    )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
     wait = 0.5
@@ -185,12 +197,20 @@ def source_prepare():
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup recvtty -m null /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                "nohup recvtty -m null "
+                f"/runc/containers/{container_name}/console.sock > /dev/null 2>&1 "
+                "& echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         # 启动容器
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} "
+                f"{container_name}"
+            ),
             False,
         ),
     ]
@@ -392,7 +412,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
                 f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
             ]
         )
@@ -456,7 +477,12 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     env_setup = "export PATH=$PATH:/usr/bin:/usr/local/bin:/usr/bin/maven/bin/; "
 
     # YCSB load with Maven path
-    load_cmd = f"{env_setup}cd /root/YCSB && ./bin/ycsb load redis -s -P /root/YCSB/workloads/workloada -p redis.host={VIP} -p redis.port=6379 -p recordcount={RECORD_COUNT} > /root/YCSB/logs/outputLoad.txt"
+    load_cmd = (
+        f"{env_setup}"
+        "cd /root/YCSB && ./bin/ycsb load redis -s -P /root/YCSB/workloads/workloada "
+        f"-p redis.host={VIP} -p redis.port=6379 -p recordcount={RECORD_COUNT} "
+        "> /root/YCSB/logs/outputLoad.txt"
+    )
     run_ycsb_cmd(load_cmd)
 
     # 在load和run之间设置网络带宽和延迟控制
@@ -465,13 +491,24 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
 
     timestamp = time.time()
     # YCSB run (两者recordcount和operationcount相等) with Maven path
-    ycsb_run_cmd = f"{env_setup}cd /root/YCSB && nohup ./bin/ycsb run redis -s -P /root/YCSB/workloads/workloada -p operationcount={OPERATION_COUNT} -p redis.host={VIP} -p redis.port=6379 -p redis.timeout={REDIS_TIMEOUT} > /root/YCSB/logs/outputRun_{timestamp}.txt 2>&1 &"
+    ycsb_run_cmd = (
+        f"{env_setup}"
+        "cd /root/YCSB && nohup ./bin/ycsb run redis -s -P /root/YCSB/workloads/workloada "
+        f"-p operationcount={OPERATION_COUNT} -p redis.host={VIP} -p redis.port=6379 "
+        "> /root/YCSB/logs/outputRun_" + str(timestamp) + "_tmp.txt 2>&1 &"
+    )
     run_ycsb_cmd(ycsb_run_cmd, background=False)
 
     time.sleep(8)  # 等待YCSB启动稳定
     # 执行source.py进行迁移
-    migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} redis {DEST_IP}"
-    result = run_cmd(migration_cmd)
+    migration_args = ["python3", SOURCE_SCRIPT] + shlex.split(exp_args) + ["redis", DEST_IP]
+    print("Executing migration:", " ".join(migration_args))
+    result = subprocess.run(migration_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print("Migration command failed with error:", result.stderr)
+        sys.exit(1)
+    else:
+        print(result.stdout)
 
     # 尝试从 stdout 中提取统计行并写入 results
     try:

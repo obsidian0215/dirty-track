@@ -364,16 +364,16 @@ def perform_restore(msg):
     ret = p.wait()
     end_time = time.perf_counter()
     cpu_end = psutil.cpu_percent(interval=None)
-    cpu_end - cpu_start
-    (end_time - start_time) * 1000
-    logger.info(".3f")
+    # 计算 CPU 变化和恢复耗时（ms），并记录日志。原先代码仅计算表达式但未保存或打印，属于无效死代码。
+    cpu_delta = cpu_end - cpu_start
+    elapsed_ms = (end_time - start_time) * 1000
+    logger.info(f"restore elapsed {elapsed_ms:.3f} ms, CPU change {cpu_delta:.2f}%")
 
     if lazy:
         # 等待 lazy-pages 守护进程结束
         lp.wait()
 
     if ret == 0:
-        global rst_time
         restore_log_path = msg["restore"]["path"] + "/migrate/r_log"
         get_restore_time(restore_log_path)
         # print(123)

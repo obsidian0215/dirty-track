@@ -409,6 +409,17 @@ sync_rootfs_process = None
 sync_rootfs_log_file = None
 pre_dump_iters = 0
 
+# Module-level defaults to satisfy functions that declare these names as `global`.
+pre_dump_time_total = 0.0
+pre_dump_size_total = 0
+esti_dump_time = 0.0
+esti_dump_size_pre = 0
+esti_dump_size_post = 0
+dump_size = 0.0
+dump_xfer_time = 0.0
+port_list = []
+max_predump_size = 0
+
 
 # 停止 sync_rootfs 进程的函数
 def stop_sync_rootfs():
@@ -459,7 +470,7 @@ def stop_sync_rootfs():
 
                 # 再次尝试清理子进程
                 if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
-                    kill_proc = subprocess.run(
+                    _ = subprocess.run(
                         f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
                     )
 
@@ -1125,7 +1136,6 @@ def calculate_image(directory, exclude_pages=False):
 # pre-dump contains the entire content of the container virtual memory
 # pre-dump is stored in the parent directory
 def pre_dump(mig_base, container, i, dirtymap):
-    global pre_dump_time_total, pre_dump_size_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     cmd = "runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}".format(i, i)
@@ -1148,7 +1158,6 @@ def pre_dump(mig_base, container, i, dirtymap):
 
 
 def real_dump_0(mig_base, runc_args=None):
-    global esti_dump_time, esti_dump_size_pre, esti_dump_size_post
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -1175,17 +1184,19 @@ def real_dump_0(mig_base, runc_args=None):
     parse_stats_dump(stats_dump_file, "dump", False)
 
 
-# create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
-# dump is stored in the image directory.
-# in case of pre-dump present, specify it is in the parent directory.
-# When post-copy phase is not present, wait until dump command ends (with p.wait())
-# If instead post-copy phase is present, the dump procedure does not write memory pages in image and starts the page server for later transfer of faulted pages.
-# the page server will then read local memory dump and send memory pages upon request of the lazy-pages daemon running on the destination.
-# The page server listens on port 27.
-# Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
-# Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
+# create the dump. This is done for any migration technique.
+# The dump is stored in the image directory.
+# If a pre-dump is present, it will be in the parent directory.
+# When post-copy is not used, wait until the dump command ends (p.wait()).
+# When post-copy is enabled, the dump procedure does not write memory pages into
+# the image; instead it starts a page server to transfer faulted pages later.
+# The page server will read the local memory dump and serve pages to the lazy-
+# pages daemon running on the destination. The page server listens on a port.
+# When using --status-fd, CRIU writes '\0' to the given pipe after finishing the
+# checkpoint and starting the page server. See CRIU docs for --lazy-pages and
+# --status-fd for details: https://criu.org/CLI/opt/--lazy-pages
 def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inputs, runc_args=None):
-    global dump_time, dump_size, dump_xfer_time
+    global dump_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -1339,7 +1350,6 @@ def xfer_final(image_path, dest, compress, port):
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
-    global port_list
     iter_terminate = False
     last_iter = 1
     if dirtymap:
@@ -1772,7 +1782,6 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
             print(f"Container may dump {esti_dump_page} bytes of memory pages")
         else:
             # 没有启用dirty-map时，使用最大predump大小进行估算
-            global max_predump_size
             esti_dump_size_pre = max_predump_size + esti_dump_size_post
             print(f"Estimated dump size from max predump: {esti_dump_size_pre} bytes")
 
@@ -1871,9 +1880,11 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
         print(f"  Remaining {time_left} seconds...")
 
         if time_left <= 0:
-            print(
-                f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues"
+            msg = (
+                f"Warning: exceed {max_wait_time} seconds without receiving "
+                "restore confirmation, live-migration may encountered issues"
             )
+            print(msg)
     # If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     set_phase("restored")
@@ -1882,7 +1893,10 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
         print("answer:", answer)
         if "runc restored" in answer:
             # 使用正则表达式提取数据
-            pattern = r"runc restored .* successfully with (\d+\.\d+) ms(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
+            pattern = (
+                r"runc restored .* successfully with (\d+\.\d+) ms"
+                r"(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
+            )
             match = re.search(pattern, answer)
             if match:
                 rst_time = float(match.group(1))

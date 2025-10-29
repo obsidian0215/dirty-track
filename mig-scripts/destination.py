@@ -110,7 +110,6 @@ def prepare(base_path, image_path, parent_path):
 
 
 def handle_prepare(prepare_info):
-    global compress, iteration_list, port_list
     logger.info("开始处理prepare请求")
     prep_start = time.perf_counter()
     cpu_prep_start = psutil.cpu_percent(interval=None)
@@ -425,16 +424,16 @@ def perform_restore(msg):
     ret = p.wait()
     end_time = time.perf_counter()
     cpu_end = psutil.cpu_percent(interval=None)
-    cpu_end - cpu_start
-    (end_time - start_time) * 1000
-    logger.info(".3f")
+    # 计算并记录恢复期间的 wall-clock 耗时（毫秒）和 CPU 使用变化。
+    cpu_delta = cpu_end - cpu_start
+    elapsed_ms = (end_time - start_time) * 1000
+    logger.info(f"restore elapsed {elapsed_ms:.3f} ms, CPU change {cpu_delta:.2f}%")
 
     if lazy:
         # 等待 lazy-pages 守护进程结束
         lp.wait()
 
     if ret == 0:
-        global rst_time
         restore_log_path = msg["restore"]["path"] + "/migrate/r_log"
         get_restore_time(restore_log_path)
         # print(123)
@@ -530,7 +529,6 @@ def handle_restore(msg):
 
     # 异步启动进程清理任务，让主线程快速响应
     def _cleanup_worker():
-        global transfer_processes, process_lock
         terminated_count = 0
         with process_lock:
             for port, process in list(transfer_processes.items()):
@@ -581,8 +579,9 @@ def migrate_server():
     # Bind socket to local host and port
     try:
         s.bind((HOST, PORT))
-    except socket.error as msg:
-        print("Bind failed. Error Code : " + str(msg[0]) + " Message " + msg[1])
+    except socket.error as exc:
+        # 使用异常对象的字符串表示而不是按索引访问（旧代码假定 msg 可索引，导致类型错误）
+        print(f"Bind failed: {exc}")
         sys.exit()
 
     print("Socket bind complete")
@@ -593,7 +592,6 @@ def migrate_server():
 
     # Function for handling connections. This will be used to create threads
     def clientthread(conn, addr):
-        global compress, iteration_list, last_iter
         # Sending message to connected client
         # infinite loop so that function does not terminate and thread does not end.
         while True:

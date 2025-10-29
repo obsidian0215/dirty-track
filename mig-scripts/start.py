@@ -219,12 +219,19 @@ def source_prepare(args):
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                f"nohup recvtty -m single /runc/containers/{container_name}/console.sock "
+                "> /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         # 启动容器
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} "
+                f"{container_name}"
+            ),
             False,
         ),
     ]
@@ -305,7 +312,10 @@ def destination_prepare(args):
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup  /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock  > /dev/null 2>&1 & echo $! > /tmp/recvtty.pid",
+            (
+                f"nohup  /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock  "
+                "> /dev/null 2>&1 & echo $! > /tmp/recvtty.pid"
+            ),
             False,
         ),
     ]
@@ -316,7 +326,11 @@ def destination_prepare(args):
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     # 使用仓库中的脚本完整路径，避免远程默认工作目录导致找不到脚本
-    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = (
+        f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} "
+        "2>&1 & echo $! > "
+        f"{dest_pidfile}"
+    )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
     wait = 0.5
@@ -389,7 +403,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
                 f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
             ]
         )
@@ -451,8 +466,8 @@ experiments = {
 }
 
 
-# 每种实验进行5次
-runs = 1
+# 每种实验进行5次（可通过命令行 --runs 覆盖）
+
 
 # 主流程
 if __name__ == "__main__":
@@ -467,6 +482,7 @@ if __name__ == "__main__":
         "--sec", action="store_true", help="use secure source/destination scripts (source-sec.py / destination-sec.py)"
     )
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
+    parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
@@ -475,6 +491,8 @@ if __name__ == "__main__":
     VIP_IP = args.virtual_ip
     # set bandwidth global
     globals()["BANDWIDTH"] = args.bandwidth
+    # runs from CLI
+    runs = args.runs
     # 选择 source 脚本：使用 centralized helper
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
     # print(DEST_IP)

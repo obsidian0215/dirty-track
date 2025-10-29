@@ -88,7 +88,6 @@ def run_cmd(cmd, ignore_error=False):
         sys.exit(1)
     print(result.stdout)
     return result
-    return result
 
 
 def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
@@ -105,7 +104,6 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
         sys.exit(1)
     print(result.stdout)
     return result
-    return result
 
 
 def destination_prepare():
@@ -117,13 +115,21 @@ def destination_prepare():
     for c, ign in cmds:
         run_remote_cmd(c, DEST_IP, ignore_error=ign)
 
-    recvtty_cmd = f"PATH=$PATH:/root/go/bin /root/go/bin/recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    recvtty_cmd = (
+        f"PATH=$PATH:/root/go/bin /root/go/bin/recvtty -m single "
+        f"/runc/containers/{container_name}/console.sock "
+        "> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
+    )
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = (
+        f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} "
+        "2>&1 & echo $! > "
+        f"{dest_pidfile}"
+    )
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
     # 等待目标端写入 pidfile
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
@@ -165,11 +171,18 @@ def source_prepare():
         (f"rm -rf /runc/containers/{container_name}", False),
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         (
-            f"nohup recvtty -m single /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                f"nohup recvtty -m single /runc/containers/{container_name}/console.sock "
+                "> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock "
+                f"-d -b /runc/containers/{container_name} {container_name}"
+            ),
             False,
         ),
     ]
@@ -287,7 +300,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
                 f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
             ]
         )
@@ -411,7 +425,7 @@ def run_migration(experiment_args, container_name):
     """运行迁移命令"""
     migration_cmd = f"python3 {SOURCE_SCRIPT} {experiment_args} {container_name} {DEST_IP}"
     print(f"Running migration: {migration_cmd}")
-    result = subprocess.run(migration_cmd, shell=True)
+    result = subprocess.run(migration_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         print(f"Migration failed: {result.stderr}")
         return False
@@ -442,7 +456,7 @@ def main():
     parser.add_argument(
         "--vehicle-pattern", choices=["normal_city", "highway", "stop_go"], help="车辆模式 (vehicle场景)"
     )
-    parser.add_argument("--runs", type=int, default=1, help="每个实验类型的运行次数")
+    parser.add_argument("--runs", type=int, default=5, help="每个实验类型的运行次数")
     parser.add_argument(
         "--experiment-types",
         nargs="*",

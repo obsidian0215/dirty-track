@@ -3,7 +3,6 @@
 # import distutils.util
 import argparse
 import atexit
-import fcntl
 import json
 import os
 import re
@@ -17,9 +16,18 @@ import subprocess
 import sys
 import threading
 import time
-from fcntl import ioctl
+try:
+    # fcntl is POSIX-only (Linux/Unix). Wrap import to allow static analysis on other platforms.
+    import fcntl
+    from fcntl import ioctl
+except Exception:
+    fcntl = None
+    ioctl = None
 
-import psutil
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 # 定义字符设备路径
 DEVICE_PATH = "/dev/dirty-track"
@@ -76,6 +84,19 @@ sync_rootfs_process = None
 sync_rootfs_log_file = None
 pre_dump_iters = 0
 
+# Module-level defaults used by functions that declare these names as `global`.
+# These avoid F824 (unused global) from static analyzers when functions reference
+# these names expecting module-level state.
+pre_dump_time_total = 0.0
+pre_dump_size_total = 0
+esti_dump_time = 0.0
+esti_dump_size_pre = 0
+esti_dump_size_post = 0
+dump_size = 0.0
+dump_xfer_time = 0.0
+# port_list is unused in secure transfer mode (scp/rsync); remove to avoid confusion
+max_predump_size = 0
+
 
 # [修改] 重命名并修正函数
 def get_compressed_files_size(directory, compress_level):
@@ -104,169 +125,13 @@ def get_compressed_files_size(directory, compress_level):
                 if entry.is_file() and not entry.is_symlink() and entry.name.endswith(suffix_to_find):
                     total_size += entry.stat().st_size
     except Exception as e:
-        print(f"Error calculating compressed file size in {directory}: {e}")
-
-    return total_size
-
-
-# 停止 sync_rootfs 进程的函数
-def stop_sync_rootfs():
-    """停止 sync_rootfs 进程及其所有子进程（包括rsync进程和后台定时器）"""
-    global sync_rootfs_process, sync_rootfs_log_file
-
-    if sync_rootfs_process:
-        try:
-            print("正在停止 sync_rootfs 进程及其所有子进程...")
-
-            # 终止主进程
-            sync_rootfs_process.terminate()
-
-            # 等待进程终止，最多等待5秒
-            sync_rootfs_process.wait(timeout=5.0)
-            print("sync_rootfs 主进程已终止")
-
-            # 使用系统命令清理残留的子进程
-            try:
-                # 获取父进程PID并查找所有子进程
-                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
-                    pid = sync_rootfs_process.pid
-                    # 查找并终止所有相关进程（ps -列出进程，grep -筛选，awk -提取PID，xargs -传递PID给kill）
-                    kill_proc = subprocess.run(f"pkill -P {pid} || true", shell=True, capture_output=True, text=True)
-                    print("已清理 sync_rootfs.sh 的所有子进程")
-
-                    # 使用进程组ID来确保清理所有后台进程和子进程
-                    try:
-                        # 获取进程组ID
-                        proc = subprocess.run(["ps", "-p", str(pid), "-o", "pgid="], capture_output=True, text=True)
-                        if proc.returncode == 0 and proc.stdout.strip():
-                            pgid = proc.stdout.strip()
-                            print(f"清理进程组 {pgid}")
-                            # 发送SIGKILL到整个进程组
-                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
-                    except Exception as e:
-                        print(f"清理进程组时出现警告: {e}")
-
-            except Exception as e:
-                print(f"清理子进程时出现警告（这通常没有问题）: {e}")
-
-        except subprocess.TimeoutExpired:
-            print("警告：sync_rootfs 进程无法正常终止，强制杀死")
-            try:
-                sync_rootfs_process.kill()
-                sync_rootfs_process.wait(timeout=2.0)
-                print("sync_rootfs 主进程已被强制杀死")
-
-                # 再次尝试清理子进程
-                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
-                    subprocess.run(
-                        f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
-                    )
-
-                    # 使用进程组ID强制清理所有相关进程
-                    try:
-                        proc = subprocess.run(
-                            ["ps", "-p", str(sync_rootfs_process.pid), "-o", "pgid="], capture_output=True, text=True
-                        )
-                        if proc.returncode == 0 and proc.stdout.strip():
-                            pgid = proc.stdout.strip()
-                            print(f"强制清理进程组 {pgid}")
-                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
-                    except Exception as e:
-                        print(f"强制清理进程组时出现警告: {e}")
-
-            except subprocess.TimeoutExpired:
-                print("错误：无法杀死 sync_rootfs 进程的所有子进程")
-
-        except Exception as e:
-            print(f"停止 sync_rootfs 进程时发生错误: {e}")
-
-        finally:
-            sync_rootfs_process = None
-
-    # 确保清理所有残留的sync进程
-    try:
-        # 查找所有剩余的sync_rootfs.sh进程并强制杀死
-        remaining_proc = subprocess.run("pgrep -f sync_rootfs.sh || true", shell=True, capture_output=True, text=True)
-        if remaining_proc.returncode == 0 and remaining_proc.stdout.strip():
-            remaining_pids = remaining_proc.stdout.strip().split("\n")
-            for pid in remaining_pids:
-                try:
-                    subprocess.run(["kill", "-KILL", pid.strip()], capture_output=True, text=True)
-                    print(f"清理残留 sync_rootfs.sh 进程 {pid.strip()}")
-                except Exception as e:
-                    print(f"清理残留进程 {pid.strip()} 时错误: {e}")
-    except Exception as e:
-        print(f"查找残留进程时出现错误: {e}")
-
-    if sync_rootfs_log_file:
-        try:
-            sync_rootfs_log_file.close()
-            print("sync_rootfs 日志文件已关闭")
-        except Exception as e:
-            print(f"关闭 sync_rootfs 日志文件时发生错误: {e}")
-        finally:
-            sync_rootfs_log_file = None
+        print(f"Error scanning directory {directory}: {e}")
+        return total_size
 
 
-# 信号处理器函数
-def signal_handler(signum, frame):
-    """处理 сигнал终止"""
-    print(f"\n接收到信号 {signum}，正在清理并退出...")
-    stop_sync_rootfs()
-    sys.exit(0)
-
-
-# [新] 添加这个函数
-def get_lzo_files_size(directory):
-    """
-    计算目录下 (仅限顶层) 所有 .lzo 文件的总大小。
-    这些文件是 xfer_pre_dump 和 xfer_final 创建的压缩包。
-    """
-    total_size = 0
-    if not os.path.isdir(directory):
-        print(f"Warning: Directory not found, cannot calculate LZO size: {directory}")
-        return 0
-
-    try:
-        # 我们只扫描顶层目录，因为 .lzo 文件都存储在 mig_base 下
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                # 确保是文件、非链接且以 .lzo 结尾
-                if entry.is_file() and not entry.is_symlink() and entry.name.endswith(".lzo"):
-                    total_size += entry.stat().st_size
-    except Exception as e:
-        print(f"Error calculating LZO file size in {directory}: {e}")
-
-    return total_size
-
-
-# [新函数结束]
-def final_sync_es_data(dest_ip, rootfs_path):
-    """
-    在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
-    """
-    import os
-    import subprocess
-
-    src_data = os.path.join(rootfs_path, "usr/share/elasticsearch/data") + "/"
-    dst_data = f"root@{dest_ip}:{src_data}"
-
-    # 确保目标端父目录存在
-    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'", shell=True, check=False, text=True)
-
-    # 做一次强同步（参数更稳健：权限/属性/uidgid 就位；inplace 避免重写；delete-delay 降低瞬时空窗）
-    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_data, dst_data]
-    print("[final_sync_es_data] running:", " ".join(cmd))
-    subprocess.check_call(cmd)
-
-
-# [tang change]定义全局变量用于累计预拷贝时间和大小
-pre_dump_time_total = 0.0  # 毫秒
-pre_dump_size_total = 0.0  # 字节
-pre_dump_xfer_time_total = 0.0  # 毫秒
-
-# [新] 定义全局变量用于累计压缩时间
 total_compression_time = 0.0  # 毫秒
+# 累计预拷贝传输时间（用于打印/统计）
+pre_dump_xfer_time_total = 0.0  # 毫秒
 # 定义全局变量用于记录最后一次dump的时间和大小
 dump_time = 0.0  # 毫秒
 dump_size = 0.0  # 字节
@@ -378,6 +243,107 @@ def set_dirty_map_path(device_fd, path):
         raise SystemError(f"无法将{path}装载到tmpfs")
     print(f"设置脏页跟踪的目录路径为: {os.path.abspath(path)}")
     ioctl_set_dirty_map_path(device_fd, path)
+
+
+def stop_sync_rootfs():
+    """停止 sync_rootfs 进程及其所有子进程（包括rsync进程和后台定时器）。
+    优先尝试优雅终止，超时后尝试强制终止，并清理可能残留的 sync_rootfs 进程。
+    """
+    global sync_rootfs_process
+
+    if sync_rootfs_process:
+        try:
+            print("正在停止 sync_rootfs 进程及其所有子进程...")
+
+            # 终止主进程
+            sync_rootfs_process.terminate()
+
+            # 等待进程终止，最多等待5秒
+            sync_rootfs_process.wait(timeout=5.0)
+            print("sync_rootfs 主进程已终止")
+
+            # 使用系统命令清理残留的子进程
+            try:
+                # 获取父进程PID并查找所有子进程
+                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
+                    pid = sync_rootfs_process.pid
+                    # 查找并终止所有相关进程（ps -列出进程，grep -筛选，awk -提取PID，xargs -传递PID给kill）
+                    _ = subprocess.run(f"pkill -P {pid} || true", shell=True, capture_output=True, text=True)
+                    print("已清理 sync_rootfs.sh 的所有子进程")
+
+                    # 使用进程组ID来确保清理所有后台进程和子进程
+                    try:
+                        # 获取进程组ID
+                        proc = subprocess.run(["ps", "-p", str(pid), "-o", "pgid="], capture_output=True, text=True)
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            pgid = proc.stdout.strip()
+                            print(f"清理进程组 {pgid}")
+                            # 发送SIGKILL到整个进程组
+                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"清理进程组时出现警告: {e}")
+
+            except Exception as e:
+                print(f"清理子进程时出现警告（这通常没有问题）: {e}")
+
+        except subprocess.TimeoutExpired:
+            print("警告：sync_rootfs 进程无法正常终止，强制杀死")
+            try:
+                sync_rootfs_process.kill()
+                sync_rootfs_process.wait(timeout=2.0)
+                print("sync_rootfs 主进程已被强制杀死")
+
+                # 再次尝试清理子進程
+                if hasattr(sync_rootfs_process, "pid") and sync_rootfs_process.pid:
+                    _ = subprocess.run(
+                        f"pkill -P {sync_rootfs_process.pid} || true", shell=True, capture_output=True, text=True
+                    )
+
+                    # 使用进程组ID强制清理所有相关进程
+                    try:
+                        proc = subprocess.run(
+                            ["ps", "-p", str(sync_rootfs_process.pid), "-o", "pgid="], capture_output=True, text=True
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            pgid = proc.stdout.strip()
+                            print(f"强制清理进程组 {pgid}")
+                            subprocess.run(["kill", "-KILL", "-" + pgid], capture_output=True, text=True)
+                    except Exception as e:
+                        print(f"强制清理進程組時出現警告: {e}")
+
+            except subprocess.TimeoutExpired:
+                print("错误：无法杀死 sync_rootfs 进程的所有子进程")
+
+        except Exception as e:
+            print(f"停止 sync_rootfs 进程时发生错误: {e}")
+
+        finally:
+            sync_rootfs_process = None
+
+    # 确保清理所有残留的sync进程
+    try:
+        # 查找所有剩余的sync_rootfs.sh进程并强制杀死
+        remaining_proc = subprocess.run("pgrep -f sync_rootfs.sh || true", shell=True, capture_output=True, text=True)
+        if remaining_proc.returncode == 0 and remaining_proc.stdout.strip():
+            remaining_pids = remaining_proc.stdout.strip().split("\n")
+            for pid in remaining_pids:
+                try:
+                    subprocess.run(["kill", "-KILL", pid.strip()], capture_output=True, text=True)
+                    print(f"清理残留 sync_rootfs.sh 进程 {pid.strip()}")
+                except Exception as e:
+                    print(f"清理残留進程 {pid.strip()} 時錯誤: {e}")
+    except Exception as e:
+        print(f"查找残留进程时出现错误: {e}")
+
+
+# 简单的信号处理器，确保收到终止信号时清理资源
+def signal_handler(signum, frame):
+    print(f"\n接收到信号 {signum}，正在清理并退出...")
+    try:
+        stop_sync_rootfs()
+    except Exception:
+        pass
+    sys.exit(0)
 
 
 # 启动所有容器进程的脏页跟踪
@@ -858,7 +824,6 @@ def calculate_image(directory, exclude_pages=False):
 # pre-dump contains the entire content of the container virtual memory
 # pre-dump is stored in the parent directory
 def pre_dump(mig_base, container, i, dirtymap):
-    global pre_dump_time_total, pre_dump_size_total
     old_cwd = os.getcwd()
     os.chdir(mig_base)
     cmd = "runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}".format(i, i)
@@ -881,7 +846,6 @@ def pre_dump(mig_base, container, i, dirtymap):
 
 
 def real_dump_0(mig_base, runc_args=None):
-    global esti_dump_time, esti_dump_size_pre, esti_dump_size_post
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -908,17 +872,19 @@ def real_dump_0(mig_base, runc_args=None):
     parse_stats_dump(stats_dump_file, "dump", False)
 
 
-# create the dump. This is done for any migration technique. Content of the dump varies depending on the technique.
-# dump is stored in the image directory.
-# in case of pre-dump present, specify it is in the parent directory.
-# When post-copy phase is not present, wait until dump command ends (with p.wait())
-# If instead post-copy phase is present, the dump procedure does not write memory pages in image and starts the page server for later transfer of faulted pages.
-# the page server will then read local memory dump and send memory pages upon request of the lazy-pages daemon running on the destination.
-# The page server listens on port 27.
-# Still in case of the post-copy phase, with the --status-fd option, CRIU writes '\0' to the specified pipe when it has finished with the checkpoint and start of the page server
-# Read https://criu.org/CLI/opt/--lazy-pages and https://criu.org/CLI/opt/--status-fd for more information.
+# create the dump. This is done for any migration technique.
+# The dump is stored in the image directory.
+# If a pre-dump is present, it will be in the parent directory.
+# When post-copy is not used, wait until the dump command ends (p.wait()).
+# When post-copy is enabled, the dump procedure does not write memory pages into
+# the image; instead it starts a page server to transfer faulted pages later.
+# The page server will read the local memory dump and serve pages to the lazy-
+# pages daemon running on the destination. The page server listens on a port.
+# When using --status-fd, CRIU writes '\0' to the given pipe after finishing the
+# checkpoint and starting the page server. See CRIU docs for --lazy-pages and
+# --status-fd for details: https://criu.org/CLI/opt/--lazy-pages
 def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inputs, runc_args=None):
-    global dump_time, dump_size, dump_xfer_time
+    global dump_time
     old_cwd = os.getcwd()
     os.chdir(mig_base)
 
@@ -997,7 +963,7 @@ def parse_size(size_str):
 
 
 # Transfer the previously created pre-dump using nc (同步版本)
-def xfer_pre_dump(cs, parent_path, dest, i, port):
+def xfer_pre_dump(cs, parent_path, dest, i):
     global pre_dump_xfer_time_total
 
     # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
@@ -1073,11 +1039,17 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
     transfer_cmd = None
     RSYNC_THRESHOLD = 10 * 1024 * 1024  # 10MB
     if size >= RSYNC_THRESHOLD:
-        # rsync via ssh
-        transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
-    else:
+        # rsync via ssh (keep remote-shell single string; split physical lines)
         transfer_cmd = (
-            f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+            "rsync -av --inplace -e "
+            f"'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' "
+            f"{archive_name} {remote_dir}/"
+        )
+    else:
+        # scp via ssh (split across physical lines for lint)
+        transfer_cmd = (
+            f"scp -q -o StrictHostKeyChecking=no "
+            f"-o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
         )
 
     # 传输时增加重试机制
@@ -1140,7 +1112,11 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
     def _poll_processed():
         marker = os.path.join(parent_path, f".{os.path.basename(archive_name)}.processed")
         err_marker = os.path.join(parent_path, f".{os.path.basename(archive_name)}.processed.err")
-        check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+        # build ssh check command in multiple physical lines to avoid long lines
+        check_cmd = (
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            f"root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+        )
         timeout = 600.0
         end = time.time() + timeout
         while time.time() < end:
@@ -1167,87 +1143,81 @@ def xfer_pre_dump(cs, parent_path, dest, i, port):
 
 
 # Transfer the previosuly created dump using rsync
-def xfer_final(cs, image_path, dest, compress, port):
+def xfer_final(cs, image_path, dest, compress):
     global dump_xfer_time
+    # Unified implementation:
+    global total_compression_time
 
-    # print("xfer DUMP")
-    # 创建压缩包并通过 SSH 传输
-    if compress == 0:
-        # 无压缩
-        f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
-        # 创建压缩包并通过 SSH 传输
-    elif compress >= 1 and compress <= 4:
-        # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
-        start = time.perf_counter() * 1000
-        tar_name = os.path.join(mig_base, "final_dump.tar")
-        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
-        lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+    # Prepare archive file (tar or tar.lzo)
+    try:
+        if compress == 0:
+            archive_name = os.path.join(mig_base, "final_dump.tar")
+            # measure tar creation time even when no compression is used
+            try:
+                start = time.perf_counter() * 1000
+                subprocess.run(["tar", "-cf", archive_name, "-C", image_path, "."], check=True)
+                end = time.perf_counter() * 1000
+                try:
+                    total_compression_time += end - start
+                except Exception:
+                    # best-effort: ensure presence of the global
+                    pass
+            except subprocess.CalledProcessError as e:
+                print(f"Create final tar failed: {e}")
+                error()
+        elif 1 <= compress <= 4:
+            tar_name = os.path.join(mig_base, "final_dump.tar")
+            lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
+            lzo_gpu_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu"))
 
-        # 先创建tar文件
-        cmd_create_tar = f"tar -cf {tar_name} -C {image_path} ."
-        ret = os.system(cmd_create_tar)
-        if ret != 0:
-            exit_code = ret >> 8
-            print(f"Create final tar failed, ExitCode: {exit_code}")
-            raise RuntimeError("tar final dump failed")
+            subprocess.run(["tar", "-cf", tar_name, "-C", image_path, "."], check=True)
+            start = time.perf_counter() * 1000
+            subprocess.run([lzo_gpu_path, f"-{compress}", tar_name, lzo_name], check=True)
+            end = time.perf_counter() * 1000
+            total_compression_time += end - start
+            try:
+                os.remove(tar_name)
+            except Exception:
+                pass
+            archive_name = lzo_name
+        else:
+            raise ValueError(f"不支持的压缩等级: {compress}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to create/compress final archive: {e}")
+        error()
+    except Exception as e:
+        print(f"Unexpected error while preparing final archive: {e}")
+        error()
 
-        # 再压缩为lzo
-        cmd_compress = f"{lzo_gpu_path} -{compress} {tar_name} {lzo_name}"
-        ret = os.system(cmd_compress)
-        if ret != 0:
-            exit_code = ret >> 8
-            print(f"LZO compress final dump failed, ExitCode: {exit_code}")
-            raise RuntimeError("lzo_gpu compress final dump failed")
-        end = time.perf_counter() * 1000
-        global total_compression_time
-        total_compression_time += end - start  # 累加压缩时间
-        # 删除临时tar文件
-        try:
-            os.remove(tar_name)
-        except OSError as e:
-            print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
-
-        # 通过nc传输lzo文件
-        f"nc -q 0 {dest} {port} < {lzo_name}"
-    else:
-        raise ValueError(f"不支持的压缩等级: {compress}")
-    # 传输到目标服务器：使用 scp/rsync 选择
-    # 如果是已生成的文件(lzo或tar), 找到要传输的实际文件
-    if compress == 0:
-        # tar via stdout handled earlier as cmd_tar; but we now prefer to create a file and scp it
-        # 使用 tar -cf - | ssh dest "cat > /path/to/image_archive.tar"
-        archive_name = os.path.join(mig_base, "final_dump.tar.gz")
-        # 生成压缩tar.gz
-        cmd_make = f"tar -czf {archive_name} -C {image_path} ."
-        ret = os.system(cmd_make)
-        if ret != 0:
-            print("Create final tar.gz failed")
-            error()
-    elif compress >= 1 and compress <= 4:
-        lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
-        archive_name = lzo_name
-    else:
-        raise ValueError(f"不支持的压缩等级: {compress}")
-
-    # 选择传输工具
+    # choose transfer method (rsync for large files, scp for small)
     RSYNC_THRESHOLD = 10 * 1024 * 1024
-    size = os.path.getsize(archive_name)
+    try:
+        size = os.path.getsize(archive_name)
+    except Exception as e:
+        print(f"Cannot stat archive {archive_name}: {e}")
+        error()
+
     remote_dir = f"root@{dest}:{image_path}"
     if size >= RSYNC_THRESHOLD:
-        transfer_cmd = f"rsync -av --inplace -e 'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' {archive_name} {remote_dir}/"
+        transfer_cmd = (
+            "rsync -av --inplace -e "
+            f"'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' "
+            f"{archive_name} {remote_dir}/"
+        )
     else:
         transfer_cmd = (
-            f"scp -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
+            f"scp -q -o StrictHostKeyChecking=no "
+            f"-o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
         )
 
-    print(f"Transferring final dump to {dest} using: {transfer_cmd}")
-    # final transfer with retries
+    # perform transfer with retries and exponential backoff
     max_retries = 3
     attempt = 0
     dump_xfer_time = 0
     success = False
     while attempt < max_retries:
         attempt += 1
+        print(f"Transferring final dump to {dest} using: {transfer_cmd} (attempt {attempt})")
         start = time.perf_counter() * 1000
         ret = os.system(transfer_cmd)
         end = time.perf_counter() * 1000
@@ -1259,14 +1229,15 @@ def xfer_final(cs, image_path, dest, compress, port):
         else:
             print(f"Final dump transfer failed (attempt {attempt}), ExitCode: {ret}")
             if attempt < max_retries:
-                backoff = 2**attempt
+                backoff = 2 ** attempt
                 print(f"Retrying after {backoff}s...")
                 time.sleep(backoff)
 
     if not success:
+        print("Final dump transfer failed after retries")
         error()
 
-    # 通知目标端解包并处理，等待短时ACK
+    # notify destination to extract/process and wait for immediate ACK
     try:
         notify = json.dumps(
             {
@@ -1292,10 +1263,13 @@ def xfer_final(cs, image_path, dest, compress, port):
         print(f"Error notifying destination about final archive: {e}")
         error()
 
-    # 对 final dump 在主流程中同步等待目标处理完成（最长等待600s）
+    # wait synchronously for destination to write processed marker (or .processed.err)
     marker = os.path.join(image_path, f".{os.path.basename(archive_name)}.processed")
     err_marker = os.path.join(image_path, f".{os.path.basename(archive_name)}.processed.err")
-    check_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+    check_cmd = (
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        f"root@{dest} 'test -f {marker} && echo OK || (test -f {err_marker} && echo ERR || echo NO)'"
+    )
     timeout = 600.0
     end_time = time.time() + timeout
     processed_ok = False
@@ -1307,7 +1281,25 @@ def xfer_final(cs, image_path, dest, compress, port):
                 processed_ok = True
                 break
             if out == "ERR":
-                print("Final dump extraction failed on destination")
+                print("Final dump extraction failed on destination; fetching diagnostics...")
+                # fetch diagnostics from destination's err file
+                fetch_cmd = (
+                    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                    f"root@{dest} 'cat {err_marker} || true'"
+                )
+                try:
+                    fetch_proc = subprocess.run(
+                        fetch_cmd,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    diag = fetch_proc.stdout.strip()
+                    if diag:
+                        print("Destination diagnostics:\n" + diag)
+                except Exception as fe:
+                    print(f"Failed to fetch diagnostics from destination: {fe}")
                 error()
         except Exception as e:
             print(f"Error polling final processed marker: {e}")
@@ -1317,10 +1309,16 @@ def xfer_final(cs, image_path, dest, compress, port):
         print("Timed out waiting for destination to process final archive")
         error()
 
+    # cleanup local archive
+    try:
+        if os.path.exists(archive_name):
+            os.remove(archive_name)
+    except Exception:
+        pass
+
 
 # Run the pre-dump iteration and transfer it to the destination
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
-    global port_list
     iter_terminate = False
     last_iter = 1
     if dirtymap:
@@ -1378,7 +1376,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
                 iter_terminate = True
 
         # 传输当前迭代的 pre-dump
-        xfer_pre_dump(cs, last_path, dest, last_iter, port_list[last_iter - 1])
+        xfer_pre_dump(cs, last_path, dest, last_iter)
         if iter_terminate:
             break
         last_iter += 1
@@ -1552,18 +1550,12 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
     work_path = []
     global dirtymap_path
     dirtymap_path = mig_base + "/dirty_map"
-    global port_list
-    port_list = [INIT_PORT]
-
     if pre:
         for i in range(1, max_iter + 1):
             pathname = mig_base + "/parent_{}".format(i)
             parent_path.append(pathname)
             pathname = mig_base + "/pd_log_{}".format(i)
             work_path.append(pathname)
-            port_list.append(INIT_PORT + i)  # del +1
-
-    print("post_list: {0}", port_list)
     print("parent_path: {0}", parent_path)
     prepare(mig_base, image_path, parent_path, work_path)
 
@@ -1733,7 +1725,6 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
             print(f"Container may dump {esti_dump_page} bytes of memory pages")
         else:
             # 没有启用dirty-map时，使用最大predump大小进行估算
-            global max_predump_size
             esti_dump_size_pre = max_predump_size + esti_dump_size_post
             print(f"Estimated dump size from max predump: {esti_dump_size_pre} bytes")
 
@@ -1768,7 +1759,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
             print(f"创建转储后同步标记失败: {e}")
 
     # 传输容器剩余状态
-    xfer_final(cs, image_path, dest, compress, port_list[-1])
+    xfer_final(cs, image_path, dest, compress)
 
     # 等待强制同步完成 - 检查标记文件是否已被删除
     if rootfs and sync_rootfs_process and sync_rootfs_process.poll() is None:
@@ -1832,9 +1823,11 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
         print(f"  Remaining {time_left} seconds...")
 
         if time_left <= 0:
-            print(
-                f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, live-migration may encountered issues"
+            msg = (
+                f"Warning: exceed {max_wait_time} seconds without receiving "
+                "restore confirmation, live-migration may encountered issues"
             )
+            print(msg)
     # If there is something in input to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
     for s in inputready:
@@ -1842,7 +1835,10 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
         print("answer:", answer)
         if "runc restored" in answer:
             # 使用正则表达式提取数据
-            pattern = r"runc restored .* successfully with (\d+\.\d+) ms(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
+            pattern = (
+                r"runc restored .* successfully with (\d+\.\d+) ms"
+                r"(?:, total_uffd_copy: (\d+\.\d+) KB, rpf_handle_time: (\d+\.\d+) ms)?"
+            )
             match = re.search(pattern, answer)
             if match:
                 rst_time = float(match.group(1))

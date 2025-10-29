@@ -38,7 +38,7 @@ if __name__ == "__main__":
         "--mt-dsl", default="32:3,64:1,512:4,1024:1,2048:1", help="memtier: --data-size-list (权重必须是整数)."
     )
     parser.add_argument("--mt-rand", action="store_true", default=True, help="memtier: use random keys (-R).")
-    parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
+    parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
 
@@ -99,7 +99,6 @@ def run_remote_cmd(cmd, target_ip=None, ignore_error=False, background=False):
     # 如果background=True，则在目标机器上使用 nohup; 返回后台启动的 PID（通过 echo $!）
     if background:
         # 确保输出重定向，ssh 会返回包含 pid 的一行
-        # 使用双引号包裹远程命令以正确展开 $!
         remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
         full_cmd = f"ssh {target_ip} \"{remote_cmd}\""
     else:
@@ -149,13 +148,21 @@ def destination_prepare():
     # 停止 destination 后台进程并移除 pidfile（如果存在）
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     stop_cmd = (
-        f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+        "if [ -f "
+        f"{dest_pidfile}"
+        "]; then kill -TERM $(cat "
+        f"{dest_pidfile}"
+        ") 2>/dev/null || true; rm -f "
+        f"{dest_pidfile}"
+        "; fi"
     )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
 
-    # recvtty_cmd = f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock > /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
+    # recvtty_cmd = (
+    #     f"PATH=$PATH:/root/go/bin recvtty -m null /runc/containers/{container_name}/console.sock "
+    #     "> /tmp/recvtty_debug.log 2>&1 & & echo $! > /tmp/recvtty_source.pid"
+    # )
     # run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
-
     recvtty_cmd = (
         "PATH=$PATH:/root/go/bin "
         f"nohup recvtty -m null /runc/containers/{container_name}/console.sock "
@@ -164,10 +171,13 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
-    dest_log = f"/tmp/{globals().get('DEST_SCRIPT', 'destination.py').replace('.', '_')}_{container_name}_{ts}.log"
+    script_name = globals().get('DEST_SCRIPT', 'destination.py').replace('.', '_')
+    dest_log = f"/tmp/{script_name}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = (
-    f"nohup python3 /runc/dirty-track/mig-scripts/{globals().get('DEST_SCRIPT', 'destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+        f"nohup python3 /runc/dirty-track/mig-scripts/{script_name}.py > {dest_log} 2>&1 "
+        "& echo $! > "
+        f"{dest_pidfile}"
     )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
@@ -210,12 +220,19 @@ def source_prepare():
         (f"cp -r /runc/containers/{container_name}.bak /runc/containers/{container_name}", False),
         # 启动console.sock并把进程号存储起来,后续清理时kill掉
         (
-            f"nohup recvtty -m null /runc/containers/{container_name}/console.sock > /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid",
+            (
+                f"nohup recvtty -m null /runc/containers/{container_name}/console.sock "
+                "> /dev/null 2>&1 & echo $! > /tmp/recvtty_source.pid"
+            ),
             False,
         ),
         # 启动容器
         (
-            f"runc run --console-socket /runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} {container_name}",
+            (
+                "runc run --console-socket "
+                f"/runc/containers/{container_name}/console.sock -d -b /runc/containers/{container_name} "
+                f"{container_name}"
+            ),
             False,
         ),
     ]
@@ -417,7 +434,8 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         base_cmds.extend(
             [
                 f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
+                f"match ip dst {dst} flowid {classid}",
                 f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
             ]
         )
