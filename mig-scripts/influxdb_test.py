@@ -77,17 +77,17 @@ def run_cmd(cmd, ignore_error=False):
     print("Executing:", cmd)
     result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 and not ignore_error:
-        print("Command failed:", result.stderr)
+        print("Command failed with error:", result.stderr)
         sys.exit(1)
-    else:
-        print(result.stdout)
+    print(result.stdout)
+    return result
     return result
 
 
 def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
     """Execute command on remote machine."""
     if background:
-        cmd = f"nohup {cmd}  &"
+        cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
 
     full_cmd = f"ssh {target_ip} '{cmd}'"
     print("Executing remotely:", end=" ")
@@ -96,8 +96,8 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
     if result.returncode != 0 and not ignore_error:
         print("Remote command failed with error:", result.stderr)
         sys.exit(1)
-    else:
-        print(result.stdout)
+    print(result.stdout)
+    return result
     return result
 
 
@@ -119,13 +119,18 @@ def destination_prepare():
     start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
     # 等待目标端写入 pidfile
-    for _ in range(10):
+    # 等待目标端写入 pidfile（指数退避，最多 10 次）
+    wait = 0.5
+    max_attempts = 10
+    for attempt in range(max_attempts):
         res = run_remote_cmd(f"test -f {dest_pidfile}", DEST_IP, ignore_error=True)
         if getattr(res, "returncode", 1) == 0:
             break
-        time.sleep(0.5)
+        time.sleep(wait)
+        wait = min(wait * 2, 5)
     else:
         print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
+        _ = run_remote_cmd(f"ls -l {dest_pidfile} || true", DEST_IP, ignore_error=True)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 

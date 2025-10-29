@@ -85,13 +85,18 @@ def destination_prepare():
     start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
     # 等待目标端写入 pidfile
-    for _ in range(10):
+    # 等待目标端写入 pidfile（指数退避，最多 10 次）
+    wait = 0.5
+    max_attempts = 10
+    for attempt in range(max_attempts):
         res = run_remote_cmd(f"test -f {dest_pidfile}", DEST_IP, ignore_error=True)
         if getattr(res, "returncode", 1) == 0:
             break
-        time.sleep(0.5)
+        time.sleep(wait)
+        wait = min(wait * 2, 5)
     else:
         print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
+        _ = run_remote_cmd(f"ls -l {dest_pidfile} || true", DEST_IP, ignore_error=True)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 
@@ -284,9 +289,11 @@ def configure_network():
 def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
     """Execute command on remote machine."""
     if background:
-        cmd = f"nohup {cmd}  &"
+        remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
+        full_cmd = f"ssh {target_ip} \"{remote_cmd}\""
+    else:
+        full_cmd = f"ssh {target_ip} '{cmd}'"
 
-    full_cmd = f"ssh {target_ip} '{cmd}'"
     print("Executing remotely:", end=" ")
     print(f"(on {target_ip}):", cmd)
     result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

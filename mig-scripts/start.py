@@ -19,6 +19,7 @@ def run_cmd(cmd, ignore_error=False):
         sys.exit(1)
     else:
         print(result.stdout)
+    return result
 
 
 # def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
@@ -44,8 +45,8 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
 
     if background:
         # 关键点：重定向 stdin/out/err，并让 ssh -n 不转发本地 stdin
-        remote = f"nohup {cmd} >/tmp/remote_bg.log 2>&1 < /dev/null & echo $! > /tmp/remote_bg.pid"
-        full_cmd = f"ssh -n {target_ip} '{remote}'"
+        remote_cmd = f"nohup {cmd} >/tmp/remote_bg.log 2>&1 < /dev/null & echo $!"
+        full_cmd = f"ssh -n {target_ip} \"{remote_cmd}\""
     else:
         full_cmd = f"ssh {target_ip} '{cmd}'"
 
@@ -268,19 +269,23 @@ def destination_prepare(args):
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     # 使用仓库中的脚本完整路径，避免远程默认工作目录导致找不到脚本
     start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     result = run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
-    # 等待目标端写入 pidfile，避免 race condition
-    for _ in range(10):
+    # 等待目标端写入 pidfile（指数退避，最多 10 次）
+    wait = 0.5
+    max_attempts = 10
+    for attempt in range(max_attempts):
         res = run_remote_cmd(f"test -f {dest_pidfile}", target_ip=DEST_IP, ignore_error=True)
         if getattr(res, "returncode", 1) == 0:
             break
-        time.sleep(0.5)
+        time.sleep(wait)
+        wait = min(wait * 2, 5)
     else:
         print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
+        _ = run_remote_cmd(f"ls -l {dest_pidfile} || true", target_ip=DEST_IP, ignore_error=True)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 

@@ -61,6 +61,7 @@ def run_cmd(cmd, ignore_error=False):
         sys.exit(1)
     else:
         print(result.stdout)
+    return result
 
 
 def run_remote_cmd(cmd, target_ip=None, ignore_error=False, background=False):
@@ -70,13 +71,12 @@ def run_remote_cmd(cmd, target_ip=None, ignore_error=False, background=False):
     if not target_ip:
         target_ip = DEST_IP
 
-    # 如果background=True，则在目标机器上使用nohup和&将进程放入后台
     if background:
-        # 使用nohup和&后台运行，让ssh立即返回
-        # 同时将输出重定向到文件，防止阻塞
-        cmd = f"nohup {cmd}  &"
+        remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
+        full_cmd = f"ssh {target_ip} \"{remote_cmd}\""
+    else:
+        full_cmd = f"ssh {target_ip} '{cmd}'"
 
-    full_cmd = f"ssh {target_ip} '{cmd}'"
     print("Executing remotely on", target_ip, ":", cmd)
     result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 and not ignore_error:
@@ -131,18 +131,22 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.','_')}_{container_name}_{ts}.log"
+    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
-    # 等待目标端写入 pidfile
-    for _ in range(10):
+    # 等待目标端写入 pidfile（指数退避，最多 10 次）
+    wait = 0.5
+    max_attempts = 10
+    for attempt in range(max_attempts):
         res = run_remote_cmd(f"test -f {dest_pidfile}", target_ip=DEST_IP, ignore_error=True)
         if getattr(res, "returncode", 1) == 0:
             break
-        time.sleep(0.5)
+        time.sleep(wait)
+        wait = min(wait * 2, 5)
     else:
         print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
+        _ = run_remote_cmd(f"ls -l {dest_pidfile} || true", target_ip=DEST_IP, ignore_error=True)
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 
@@ -503,4 +507,3 @@ if __name__ == "__main__":
                 update_keepalived_priority(70)
                 update_keepalived_priority(30, True, DEST_IP)
             time.sleep(17)  #
-
