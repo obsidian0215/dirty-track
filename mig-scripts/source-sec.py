@@ -2162,9 +2162,9 @@ if __name__ == "__main__":
         output_values.extend([int(round(rpf_handle_time)), "{:.2f}".format(total_uffd_copy)])
     if pre:
         output_values.append(int(round(pre_dump_iters)))
-    print("aaaaaaaaaaaaaaaa")
+    # print("aaaaaaaaaaaaaaaa")
     if compress > 0:
-        print("bbbbbbbbbbbb")
+        # print("bbbbbbbbbbbb")
         output_values.append(int(round(total_compression_time)))
         # output_values.append(int(round(compression_ratio)))
         output_values.append("{:.2f}".format(compression_ratio))

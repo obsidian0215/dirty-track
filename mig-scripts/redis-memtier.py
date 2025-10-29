@@ -11,6 +11,9 @@ from script_defaults import choose_scripts, get_default_ips
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
 
+# default bandwidth
+BANDWIDTH = "25mbit"
+
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
@@ -36,6 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--mt-rand", action="store_true", default=True, help="memtier: use random keys (-R).")
     parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
+    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
 
     parsed_args = parser.parse_args()
 
@@ -45,6 +49,7 @@ if __name__ == "__main__":
     CLIENT_IP = parsed_args.client_ip  # [memtier] changed
     VIP = parsed_args.vip
     runs = parsed_args.runs
+    BANDWIDTH = parsed_args.bandwidth
     # set source script selection
     src, dst = choose_scripts(getattr(parsed_args, "sec", False))
     globals()["SOURCE_SCRIPT"] = src
@@ -61,7 +66,11 @@ if __name__ == "__main__":
 # 定义实验类型与参数
 experiments = {
     # "post-copy": "-post -d --tcp-established --shell-job",
-    "pre-copy": "-pre -d --tcp-established --shell-job -z 0",
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -431,11 +440,11 @@ def clean_configure_network():
 
 def configure_network():
     """配置网络限制"""
-    source_rules = [{"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}]
-    dest_rules = [{"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
+    source_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP}]
     if YCSB_IP:
-        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": YCSB_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": YCSB_IP})
+        source_rules.append({"rate": BANDWIDTH, "delay": "0.5ms", "dst": YCSB_IP})
+        dest_rules.append({"rate": BANDWIDTH, "delay": "0.05ms", "dst": YCSB_IP})
 
     # 配置source的网络限制 (source->dest, source->ycsb)
     configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
@@ -449,8 +458,8 @@ def configure_network():
             interface="ens33",
             rules=[
                 # {"rate": "50mbit", "delay": "1ms", "dst": VIP if VIP else SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP},
+                {"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": BANDWIDTH, "delay": "0.05ms", "dst": DEST_IP},
             ],
             is_remote=True,  # 远程执行
             target_ip=YCSB_IP,

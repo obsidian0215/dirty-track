@@ -9,6 +9,8 @@ from script_defaults import choose_scripts, get_default_ips
 
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+# default bandwidth
+BANDWIDTH = "25mbit"
 # 场景配置：Redis的video和sensor场景
 scene_configs = {
     "video": {
@@ -261,11 +263,11 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def configure_network():
     """配置网络限制"""
-    source_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}]
-    dest_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
+    source_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP}]
     if CLIENT_IP:
-        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": BANDWIDTH, "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": BANDWIDTH, "delay": "0.05ms", "dst": CLIENT_IP})
 
     # 配置source的网络限制
     configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
@@ -278,8 +280,8 @@ def configure_network():
         configure_network_do(
             interface="ens33",
             rules=[
-                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP},
+                {"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": BANDWIDTH, "delay": "0.05ms", "dst": DEST_IP},
             ],
             is_remote=True,  # 远程执行
             target_ip=CLIENT_IP,
@@ -308,7 +310,11 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
 # 定义实验类型
 experiments = {
     # "post-copy": "-post -d --tcp-established --shell-job",
-    "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -407,6 +413,7 @@ def main():
     parser.add_argument("--ttl", type=int, help="TTL (video场景)")
     parser.add_argument("--payload-size-kb", type=int, help="负载大小(KB)")
     parser.add_argument("--sensors-per-device", type=int, help="每设备传感器数")
+    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
     parser.add_argument("--runs", type=int, default=1, help="每个实验类型的运行次数")
     parser.add_argument(
         "--experiment-types",
@@ -421,6 +428,8 @@ def main():
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
     # 根据 --sec 切换为 secure 变体
+    # set bandwidth
+    globals()["BANDWIDTH"] = getattr(args, "bandwidth", BANDWIDTH)
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(args, "sec", False))
 
     experiment_types_to_run = args.experiment_types if args.experiment_types else list(experiments.keys())

@@ -24,13 +24,19 @@ import time
 from script_defaults import choose_scripts, get_default_ips
 
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
+# default bandwidth (can be overridden by --bandwidth)
+BANDWIDTH = "25mbit"
 
 # default script to call; can be switched to source-sec.py via --sec
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
 # 定义实验类型
 experiments = {
-    "pre-copy": "-pre -d --tcp-established --shell-job -z 1"
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "post-copy": "-post -d --tcp-established --shell-job"
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
@@ -295,11 +301,11 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def configure_network():
     """配置网络限制"""
-    source_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}]
-    dest_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
+    source_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP}]
     if CLIENT_IP:
-        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": BANDWIDTH, "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": BANDWIDTH, "delay": "0.05ms", "dst": CLIENT_IP})
 
     # 配置source的网络限制
     configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
@@ -312,8 +318,8 @@ def configure_network():
         configure_network_do(
             interface="ens33",
             rules=[
-                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP},
+                {"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": BANDWIDTH, "delay": "0.05ms", "dst": DEST_IP},
             ],
             is_remote=True,  # 远程执行
             target_ip=CLIENT_IP,
@@ -402,7 +408,7 @@ def run_migration(experiment_args, container_name):
 
 def main():
     # 使用参数值更新全局变量
-    global SOURCE_IP, DEST_IP, CLIENT_IP
+    global SOURCE_IP, DEST_IP, CLIENT_IP, BANDWIDTH
     parser = argparse.ArgumentParser(description="InfluxDB自动化负载测试脚本")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="迁移源IP")
     parser.add_argument("-d", "--dest-ip", default=DEST_IP, help="迁移目标IP")
@@ -432,12 +438,14 @@ def main():
         help="要运行的实验类型，默认全部",
     )
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
+    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
 
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
+    BANDWIDTH = args.bandwidth
 
     # set script selection
     global SOURCE_SCRIPT

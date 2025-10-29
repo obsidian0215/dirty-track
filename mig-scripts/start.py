@@ -10,6 +10,9 @@ from script_defaults import choose_scripts, get_default_ips
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
+# default bandwidth
+BANDWIDTH = "25mbit"
+
 
 def run_cmd(cmd, ignore_error=False):
     print("Executing on source:", cmd)
@@ -368,11 +371,11 @@ def clean_configure_network():
 
 
 def configure_network():
-    source_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": DEST_IP}]
-    dest_rules = [{"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
+    source_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP}]
     if VIP_IP:
-        source_rules.append({"rate": "25mbit", "delay": "0.5ms", "dst": CLIENT_IP})
-        dest_rules.append({"rate": "25mbit", "delay": "0.05ms", "dst": CLIENT_IP})
+        source_rules.append({"rate": BANDWIDTH, "delay": "0.5ms", "dst": CLIENT_IP})
+        dest_rules.append({"rate": BANDWIDTH, "delay": "0.05ms", "dst": CLIENT_IP})
 
     # 配置source的网络限制  source->dest  source->client
     configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
@@ -385,8 +388,8 @@ def configure_network():
         configure_network_do(
             interface="ens33",
             rules=[
-                {"rate": "25mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "25mbit", "delay": "0.05ms", "dst": DEST_IP},
+                {"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": BANDWIDTH, "delay": "0.05ms", "dst": DEST_IP},
             ],
             is_remote=True,  # 远程执行
             target_ip=CLIENT_IP,  # 远程执行命令机器 IP
@@ -396,11 +399,11 @@ def configure_network():
 # 定义实验类型与参数
 experiments = {
     # "post-copy": "-post -d --tcp-established --shell-job",
-    # "pre-copy": "-pre -d --tcp-established --shell-job",
-    # "pre-copy": "-pre -d --tcp-established --shell-job -z 1",
-    # "pre-copy": "-pre -d --tcp-established --shell-job -z 2",
-    "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
-    # "pre-copy": "-pre -d --tcp-established --shell-job -z 4",
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
@@ -422,12 +425,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sec", action="store_true", help="use secure source/destination scripts (source-sec.py / destination-sec.py)"
     )
+    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
     DEST_IP = args.dest_ip
     CLIENT_IP = args.client_ip
     VIP_IP = args.virtual_ip
+    # set bandwidth global
+    globals()["BANDWIDTH"] = args.bandwidth
     # 选择 source 脚本：使用 centralized helper
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
     # print(DEST_IP)

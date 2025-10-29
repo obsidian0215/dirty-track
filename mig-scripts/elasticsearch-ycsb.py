@@ -11,6 +11,9 @@ SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
+# default bandwidth
+BANDWIDTH = "25mbit"
+
 # 使用argparse解析命令行参数以动态设置
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Elasticsearch container migration with YCSB testing.")
@@ -24,6 +27,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recordcount", type=int, default=10000, help="Record count for YCSB (recordcount == operationcount)."
     )
+    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
     parser.add_argument("--runs", type=int, default=1, help="Number of experimental runs per experiment type.")
     parsed_args = parser.parse_args()
 
@@ -35,12 +39,18 @@ if __name__ == "__main__":
     RECORD_COUNT = parsed_args.recordcount
     OPERATION_COUNT = RECORD_COUNT  # 两者相等
     runs = parsed_args.runs
+    # set bandwidth
+    globals()["BANDWIDTH"] = getattr(parsed_args, "bandwidth", BANDWIDTH)
     # 根据 --sec 切换为 secure 变体
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(parsed_args, "sec", False))
 
 # 定义实验类型与参数
 experiments = {
-    "pre-copy": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy": "-pre -d --tcp-established --shell-job",
+    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
     # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
     # "post-copy": "-post -d --tcp-established --shell-job",
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
@@ -400,11 +410,11 @@ def clean_configure_network():
 
 def configure_network():
     """配置网络限制"""
-    source_rules = [{"rate": "50mbit", "delay": "0.5ms", "dst": DEST_IP}]
-    dest_rules = [{"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP}]
+    source_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": DEST_IP}]
+    dest_rules = [{"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP}]
     if YCSB_IP:
-        source_rules.append({"rate": "50mbit", "delay": "0.5ms", "dst": YCSB_IP})
-        dest_rules.append({"rate": "50mbit", "delay": "0.05ms", "dst": YCSB_IP})
+        source_rules.append({"rate": BANDWIDTH, "delay": "0.5ms", "dst": YCSB_IP})
+        dest_rules.append({"rate": BANDWIDTH, "delay": "0.05ms", "dst": YCSB_IP})
 
     # 配置source的网络限制 (source->dest, source->ycsb)
     configure_network_do(interface="enp2s0", rules=source_rules, is_remote=False)  # 本地执行
@@ -418,8 +428,8 @@ def configure_network():
             interface="ens33",
             rules=[
                 # {"rate": "50mbit", "delay": "1ms", "dst": VIP if VIP else SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.5ms", "dst": SOURCE_IP},
-                {"rate": "50mbit", "delay": "0.05ms", "dst": DEST_IP},
+                {"rate": BANDWIDTH, "delay": "0.5ms", "dst": SOURCE_IP},
+                {"rate": BANDWIDTH, "delay": "0.05ms", "dst": DEST_IP},
             ],
             is_remote=True,  # 远程执行
             target_ip=YCSB_IP,
