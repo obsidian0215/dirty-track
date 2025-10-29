@@ -127,6 +127,8 @@ def get_compressed_files_size(directory, compress_level):
     except Exception as e:
         print(f"Error scanning directory {directory}: {e}")
         return total_size
+    # 返回计算到的总大小（字节）
+    return total_size
 
 
 total_compression_time = 0.0  # 毫秒
@@ -2127,11 +2129,15 @@ if __name__ == "__main__":
         total_uncompressed_size = pre_dump_size_total + dump_size
 
         compression_ratio = 0.0
-        if total_uncompressed_size > 0:
+        if total_uncompressed_size > 0 and total_compressed_size and total_compressed_size > 0:
             # 压缩率 = (压缩后大小 / 压缩前大小) * 100%
-            compression_ratio = total_uncompressed_size / total_compressed_size
+            compression_ratio = (total_compressed_size / total_uncompressed_size) * 100.0
 
-        print(f"Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB")
+        if total_compressed_size and total_compressed_size > 0:
+            print(f"Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB")
+        else:
+            print("Total LZO (compressed) size: N/A")
+
         # print(f'Total Original (uncompressed) size: {total_uncompressed_size / 1024:.3f} KB')
         print(f"Compression Ratio: {compression_ratio:.2f} %")
     # [新功能结束]
