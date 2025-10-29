@@ -4,14 +4,11 @@ import subprocess
 import sys
 import time
 
-from script_defaults import choose_scripts
+from script_defaults import choose_scripts, get_default_ips
 
-# 默认设置
-SOURCE_IP = "192.168.37.159"
-DEST_IP = "192.168.37.161"
-CLIENT_IP = "192.168.37.158"
+# 默认设置（从集中 defaults 读取）
+SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
-VIP = "192.168.37.150"
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
 

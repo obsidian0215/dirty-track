@@ -14,6 +14,7 @@ import time
 from _thread import start_new_thread
 from typing import Dict
 import psutil
+from script_defaults import get_default_ips
 
 compress = False
 restore_info = None
@@ -26,7 +27,8 @@ transfer_processes: Dict[int, subprocess.Popen] = {}
 
 # 确保线程安全
 process_lock = threading.Lock()
-VIP = "192.168.37.150"
+# VIP 默认从集中配置加载，可由上层脚本通过命令行参数覆盖
+_, _, _, VIP = get_default_ips()
 rst_time = 0.0
 vip_transfer_complete = False  # 标记VIP转移是否完成
 
