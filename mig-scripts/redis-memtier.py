@@ -99,6 +99,7 @@ def run_remote_cmd(cmd, target_ip=None, ignore_error=False, background=False):
         sys.exit(1)
     else:
         print(result.stdout)
+    return result
 
 
 def run_client_cmd(
@@ -148,9 +149,17 @@ def destination_prepare():
     dest_log = f"/tmp/{globals().get('DEST_SCRIPT', 'destination.py').replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = (
-        f"nohup python3 {globals().get('DEST_SCRIPT', 'destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    f"nohup python3 /runc/dirty-track/mig-scripts/{globals().get('DEST_SCRIPT', 'destination.py')} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     )
     run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    # 等待目标端写入 pidfile
+    for _ in range(10):
+        res = run_remote_cmd(f"test -f {dest_pidfile}", target_ip=DEST_IP, ignore_error=True)
+        if getattr(res, "returncode", 1) == 0:
+            break
+        time.sleep(0.5)
+    else:
+        print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 

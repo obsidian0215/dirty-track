@@ -98,6 +98,7 @@ def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
         sys.exit(1)
     else:
         print(result.stdout)
+    return result
 
 
 def destination_prepare():
@@ -115,8 +116,16 @@ def destination_prepare():
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
-    start_dest_cmd = f"nohup python3 {DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
+    start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
     run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
+    # 等待目标端写入 pidfile
+    for _ in range(10):
+        res = run_remote_cmd(f"test -f {dest_pidfile}", DEST_IP, ignore_error=True)
+        if getattr(res, "returncode", 1) == 0:
+            break
+        time.sleep(0.5)
+    else:
+        print(f"Warning: destination pidfile {dest_pidfile} not found on {DEST_IP} after wait")
     print(f"Started remote destination on {DEST_IP}, log: {dest_log}, pidfile: {dest_pidfile}")
 
 
@@ -315,7 +324,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene):
     run_remote_cmd("rm -f /tmp/bench_client.pid /tmp/bench_run.log || true", CLIENT_IP, ignore_error=True)
 
     # 设置环境变量并执行bench（load）
-    bench_dir = "/root/dirty-track/experiment/migration/influxdb"
+    bench_dir = "/runc/dirty-track/experiment/migration/influxdb"
     bench_file = scene_config["bench"].split("/")[-1]
 
     def args_to_str(d):
