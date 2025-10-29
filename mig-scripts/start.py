@@ -3,6 +3,8 @@ import re
 import subprocess
 import sys
 import time
+import os
+from datetime import datetime
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -230,16 +232,55 @@ def source_prepare(args):
         run_cmd(c, ignore_error=ign)
 
 
-def source_run_migration(args, exp_args):
+def _extract_stats_from_output(output_text: str):
+    """从 source 脚本的 stdout 中提取最后一行带有 tab 分隔的统计值行。"""
+    stats_line = None
+    for line in output_text.splitlines():
+        if "\t" in line and re.search(r"\d", line):
+            stats_line = line.strip()
+    return stats_line
+
+
+def _ensure_results_dir():
+    base = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    results_dir = os.path.join(base, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
+def _append_result(exp_name: str, container: str, run_index: int, stats_line: str):
+    results_dir = _ensure_results_dir()
+    fname = os.path.join(results_dir, f"{exp_name}.tsv")
+    is_new = not os.path.exists(fname)
+    ts = datetime.utcnow().isoformat() + "Z"
+    with open(fname, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write("timestamp\tcontainer\trun\tstats\n")
+        f.write(f"{ts}\t{container}\t{run_index}\t{stats_line}\n")
+
+
+def source_run_migration(args, exp_args, run_index: int, exp_name: str):
     container_name = args.container
-    # 开启工具测试
+    # 开启工具测试 (后台)
     run_remote_cmd(
         "wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/", CLIENT_IP, ignore_error=True, background=True
     )
 
     time.sleep(3)  # 等待bench启动稳定
-    # 执行 source 脚本进行迁移 (可切换为 secure 变体)
-    run_cmd(f"python3 {SOURCE_SCRIPT} {container_name} {DEST_IP} {exp_args}")
+    # 执行 source 脚本进行迁移 (可切换为 secure 变体)，并捕获输出
+    result = run_cmd(f"python3 {SOURCE_SCRIPT} {container_name} {DEST_IP} {exp_args}")
+
+    # 从 stdout 提取统计行并写入 results 文件
+    stdout = getattr(result, "stdout", "") or ""
+    stats = _extract_stats_from_output(stdout)
+    if stats:
+        try:
+            _append_result(exp_name, container_name, run_index, stats)
+            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
+        except Exception as e:
+            print(f"Failed to write stats file: {e}")
+    else:
+        print("No statistics line found in source output; skipping result write.")
 
 
 def source_clean(args):
@@ -276,7 +317,7 @@ def destination_prepare(args):
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     # 使用仓库中的脚本完整路径，避免远程默认工作目录导致找不到脚本
     start_dest_cmd = f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 & echo $! > {dest_pidfile}"
-    result = run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
+    run_remote_cmd(start_dest_cmd, target_ip=DEST_IP, ignore_error=False, background=False)
     # 等待目标端写入 pidfile（指数退避，最多 10 次）
     wait = 0.5
     max_attempts = 10
@@ -456,7 +497,7 @@ if __name__ == "__main__":
                 configure_network()
 
                 # 执行迁移
-                source_run_migration(args, exp_args)
+                source_run_migration(args, exp_args, i, exp_name)
                 # input()
                 print(f"======== Finished {exp_name} experiment run {i} ========")
             except Exception as e:

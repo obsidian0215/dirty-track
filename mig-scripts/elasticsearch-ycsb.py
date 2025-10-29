@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from result_writer import extract_stats_from_output, append_result
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -436,7 +437,7 @@ def configure_network():
         )
 
 
-def source_run_migration(exp_args):
+def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     # 启动容器
     # container_cmd = "runc run --console-socket /runc/containers/elasticsearch/console.sock -d -b /runc/containers/elasticsearch elasticsearch"
     # run_cmd(container_cmd)
@@ -464,7 +465,19 @@ def source_run_migration(exp_args):
     time.sleep(6)  # 等待YCSB启动稳定
     # 执行 source 脚本进行迁移（支持 secure 变体）
     migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} --file-locks elasticsearch {DEST_IP}"
-    run_cmd(migration_cmd)
+    result = run_cmd(migration_cmd)
+
+    # 尝试从 stdout 中提取统计行并写入 results
+    try:
+        stdout = getattr(result, "stdout", "") or ""
+        stats = extract_stats_from_output(stdout)
+        if stats:
+            append_result(exp_name, "elasticsearch", run_index, stats)
+            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
+        else:
+            print("No statistics line found in source output; skipping result write.")
+    except Exception as e:
+        print(f"Error writing stats: {e}")
 
     # clean
     cleanup_cmd = "kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true"
@@ -488,7 +501,7 @@ if __name__ == "__main__":
                 source_prepare()
 
                 # 执行迁移（此步骤结束说明source.py执行完成，迁移完成）
-                source_run_migration(exp_args)
+                source_run_migration(exp_args, i, exp_name)
 
                 print(f"======== Finished {exp_name} experiment run {i} ========")
             except Exception as e:

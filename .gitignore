@@ -14,4 +14,5 @@ experiment/light-dt-ro/MEMORY-TEST-README.md
 mig-scripts/log/
 __pycache__/
 *.pyc
-
+*-report.txt
+mig-scripts/results/

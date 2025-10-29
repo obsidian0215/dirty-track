@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from result_writer import extract_stats_from_output, append_result
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -321,7 +322,7 @@ experiments = {
 }
 
 
-def source_run_migration(exp_args, scene_config, extra_args, scene):
+def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0, exp_name="unknown"):
     container_name = "redis"
     time.sleep(6)  # 等待容器启动稳定
 
@@ -372,7 +373,19 @@ def source_run_migration(exp_args, scene_config, extra_args, scene):
 
     # 执行 source 脚本进行迁移（支持 secure 变体）
     migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} {container_name} {DEST_IP}"
-    run_cmd(migration_cmd)
+    result = run_cmd(migration_cmd)
+
+    # 尝试从 stdout 中提取统计行并写入 results
+    try:
+        stdout = getattr(result, "stdout", "") or ""
+        stats = extract_stats_from_output(stdout)
+        if stats:
+            append_result(exp_name, "redis", run_index, stats)
+            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
+        else:
+            print("No statistics line found in source output; skipping result write.")
+    except Exception as e:
+        print(f"Error writing stats: {e}")
 
     # clean
 
@@ -479,7 +492,7 @@ def main():
                 #     extra_args['--sensors-per-device'] = args.sensors_per_device
 
                 # 执行迁移（包含bench测试）
-                source_run_migration(exp_args, scene_config, extra_args, args.scene)
+                source_run_migration(exp_args, scene_config, extra_args, args.scene, run_num, exp_name)
                 print(f"Bench test and migration completed successfully for {exp_name} run {run_num}.")
 
                 print(f"Experiment {exp_name}, run {run_num} completed.")

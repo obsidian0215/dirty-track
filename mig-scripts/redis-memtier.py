@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from result_writer import extract_stats_from_output, append_result
 
 # default script selection
 from script_defaults import choose_scripts, get_default_ips
@@ -500,7 +501,7 @@ def build_memtier_cmd():
     return " ".join(parts)
 
 
-def source_run_migration(exp_args):
+def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     time.sleep(6)  # 等待容器启动稳定
 
     print("Running memtier (load + run) on the client machine...")
@@ -526,7 +527,19 @@ def source_run_migration(exp_args):
 
     # ===== 执行迁移 =====
     migration_cmd = f"python3 {SOURCE_SCRIPT} {exp_args} redis {DEST_IP}"
-    run_cmd(migration_cmd)
+    result = run_cmd(migration_cmd)
+
+    # 尝试从 stdout 中提取统计行并写入 results
+    try:
+        stdout = getattr(result, "stdout", "") or ""
+        stats = extract_stats_from_output(stdout)
+        if stats:
+            append_result(exp_name, "redis", run_index, stats)
+            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
+        else:
+            print("No statistics line found in source output; skipping result write.")
+    except Exception as e:
+        print(f"Error writing stats: {e}")
 
     # ===== 清理源端 recvtty =====
     cleanup_cmd = "kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true"
@@ -550,7 +563,7 @@ if __name__ == "__main__":
                 source_prepare()
 
                 # 执行迁移（此步骤结束说明source.py执行完成，迁移完成）
-                source_run_migration(exp_args)
+                source_run_migration(exp_args, i, exp_name)
 
                 print(f"======== Finished {exp_name} experiment run {i} ========")
             except Exception as e:
