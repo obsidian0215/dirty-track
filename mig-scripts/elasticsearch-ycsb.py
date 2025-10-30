@@ -395,6 +395,13 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
     if is_remote and not target_ip:
         raise ValueError("Target IP must be provided for remote execution.")
 
+    cleanup_cmd = f"sudo tc qdisc del dev {interface} root"
+    print(f"Executing cleanup: {cleanup_cmd}")
+    if is_remote:
+        run_remote_cmd(cleanup_cmd, target_ip=target_ip, ignore_error=True)
+    else:
+        run_cmd(cleanup_cmd, ignore_error=True)
+
     # 基础命令
     base_cmds = [
         f"sudo tc qdisc add dev {interface} root handle 1: htb",
