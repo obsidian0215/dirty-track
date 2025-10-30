@@ -102,7 +102,7 @@ max_predump_size = 0
 def get_compressed_files_size(directory, compress_level):
     """
     计算目录下 (仅限顶层) 的压缩文件总大小。
-    根据 compress_level 决定是查找 .tar.gz 还是 .lzo。
+    根据 compress_level 决定是查找 .tar 还是 .lzo。
     """
     total_size = 0
     if not os.path.isdir(directory):
@@ -111,7 +111,7 @@ def get_compressed_files_size(directory, compress_level):
 
     # 根据压缩级别确定要查找的文件后缀
     if compress_level == 0:
-        suffix_to_find = ".tar.gz"
+        suffix_to_find = ".tar"
     elif compress_level >= 1:
         suffix_to_find = ".lzo"
     else:
@@ -1146,9 +1146,7 @@ def xfer_pre_dump(cs, parent_path, dest, i):
 
 # Transfer the previosuly created dump using rsync
 def xfer_final(cs, image_path, dest, compress):
-    global dump_xfer_time
-    # Unified implementation:
-    global total_compression_time
+    global dump_xfer_time, total_compression_time
 
     # Prepare archive file (tar or tar.lzo)
     try:
@@ -2089,14 +2087,31 @@ if __name__ == "__main__":
         print("Total pre-dump size: {:.3f} KB".format(pre_dump_size_total / 1024))  # 转换为 KB
     print("Total dump size:{:.3f} KB".format(dump_size / 1024))  # 转换为 KB
 
+    compression_overhead = total_compression_time if total_compression_time > 0 else 0.0
+
     if pre and not post:
-        total_time = pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time
+        total_time = (
+            pre_dump_time_total
+            + pre_dump_xfer_time_total
+            + dump_time
+            + dump_xfer_time
+            + rst_time
+            + compression_overhead
+        )
     elif not pre and post:
-        total_time = dump_time + dump_xfer_time + rst_time + rpf_handle_time
+        total_time = dump_time + dump_xfer_time + rst_time + rpf_handle_time + compression_overhead
     elif pre and post:
         total_time = (
-            pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time + rpf_handle_time
+            pre_dump_time_total
+            + pre_dump_xfer_time_total
+            + dump_time
+            + dump_xfer_time
+            + rst_time
+            + rpf_handle_time
+            + compression_overhead
         )
+    else:
+        total_time = dump_time + dump_xfer_time + rst_time + compression_overhead
 
     stop_time = dump_time + dump_xfer_time + rst_time
 
@@ -2115,32 +2130,27 @@ if __name__ == "__main__":
     # 迁移完成后，执行后处理
     # for excel
 
-    # [修改] 计算压缩率并为 output_values 准备变量
-    compression_ratio = 0.0  # 默认初始化
-    # [新] 计算并打印压缩率
+    total_uncompressed_size = pre_dump_size_total + dump_size
+    total_compressed_size = 0.0
+    compression_ratio = 0.0
+
     if compress >= 0:
-        # 1. 计算 LZO 文件总大小 (分子)
-        # mig_base 在 __main__ 块的开头 (约 1756 行) 已经定义
-        # total_lzo_size = get_lzo_files_size(mig_base)
-        total_compressed_size = get_compressed_files_size(mig_base, compress)  # <-- 修正后的调用
-        # 2. 计算未压缩数据总大小 (分母)
-        # pre_dump_size_total 和 dump_size 是全局变量,
-        # 并在 migrate() 函数末尾通过 get_dump_size() 填充
-        total_uncompressed_size = pre_dump_size_total + dump_size
+        total_compressed_size = get_compressed_files_size(mig_base, compress)
 
-        compression_ratio = 0.0
-        if total_uncompressed_size > 0 and total_compressed_size and total_compressed_size > 0:
-            # 压缩率 = (压缩后大小 / 压缩前大小) * 100%
+        if total_uncompressed_size > 0 and total_compressed_size > 0:
             compression_ratio = (total_compressed_size / total_uncompressed_size) * 100.0
+        elif total_uncompressed_size > 0:
+            compression_ratio = 100.0 if compress == 0 else 0.0
 
-        if total_compressed_size and total_compressed_size > 0:
-            print(f"Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB")
+        if total_compressed_size > 0:
+            print(f"Total compressed size: {total_compressed_size / 1024:.3f} KB")
         else:
-            print("Total LZO (compressed) size: N/A")
+            print("Total compressed size: N/A")
 
-        # print(f'Total Original (uncompressed) size: {total_uncompressed_size / 1024:.3f} KB')
+        if total_uncompressed_size > 0:
+            print(f"Total original size: {total_uncompressed_size / 1024:.3f} KB")
+
         print(f"Compression Ratio: {compression_ratio:.2f} %")
-    # [新功能结束]
 
     # 输出数据行
     output_values = []
@@ -2164,11 +2174,8 @@ if __name__ == "__main__":
     if pre:
         output_values.append(int(round(pre_dump_iters)))
     # print("aaaaaaaaaaaaaaaa")
-    if compress > 0:
-        # print("bbbbbbbbbbbb")
-        output_values.append(int(round(total_compression_time)))
-        # output_values.append(int(round(compression_ratio)))
-        output_values.append("{:.2f}".format(compression_ratio))
+    output_values.append(int(round(total_compression_time)))
+    output_values.append("{:.2f}".format(compression_ratio))
     print("\t".join(map(str, output_values)))
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")

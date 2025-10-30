@@ -102,7 +102,7 @@ max_predump_size = 0
 def get_compressed_files_size(directory, compress_level):
     """
     计算目录下 (仅限顶层) 的压缩文件总大小。
-    根据 compress_level 决定是查找 .tar.gz 还是 .lzo。
+    根据 compress_level 决定是查找 .tar 还是 .lzo。
     """
     total_size = 0
     if not os.path.isdir(directory):
@@ -111,7 +111,7 @@ def get_compressed_files_size(directory, compress_level):
 
     # 根据压缩级别确定要查找的文件后缀
     if compress_level == 0:
-        suffix_to_find = ".tar.gz"
+        suffix_to_find = ".tar"
     elif compress_level >= 1:
         suffix_to_find = ".lzo"
     else:
@@ -1028,7 +1028,7 @@ def xfer_pre_dump(parent_path, dest, i, port):
     if compress == 0:
         # 无压缩
         # archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
-        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.gz")
+        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
         cmd_tar = f"tar -cf {archive_name} -C {parent_path} ."
     elif compress >= 1 and compress <= 4:
         # 使用lzo_gpu压缩
@@ -1113,14 +1113,22 @@ def xfer_pre_dump(parent_path, dest, i, port):
 
 # Transfer the previosuly created dump using rsync
 def xfer_final(image_path, dest, compress, port):
-    global dump_xfer_time
+    global dump_xfer_time, total_compression_time
 
     # print("xfer DUMP")
     # 创建压缩包并通过 SSH 传输
     if compress == 0:
-        # 无压缩
-        cmd_tar = f"tar -cf - -C {image_path} . | nc -q 0 {dest} {port}"
-        # 创建压缩包并通过 SSH 传输
+        # 无额外压缩：创建 gzip tar 包并单独测量打包时间，再通过 nc 发送
+        tar_name = os.path.join(mig_base, "final_dump.tar")
+        start_comp = time.perf_counter() * 1000
+        cmd_create_tar = f"tar -cf {tar_name} -C {image_path} ."
+        ret = os.system(cmd_create_tar)
+        end_comp = time.perf_counter() * 1000
+        if ret != 0:
+            exit_code = ret >> 8
+            raise RuntimeError("tar final dump failed: {exit_code}")
+        total_compression_time += end_comp - start_comp
+        cmd_tar = f"nc -q 0 {dest} {port} < {tar_name}"
     elif compress >= 1 and compress <= 4:
         # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
         start = time.perf_counter() * 1000
@@ -1144,7 +1152,6 @@ def xfer_final(image_path, dest, compress, port):
             print(f"LZO compress final dump failed, ExitCode: {exit_code}")
             raise RuntimeError("lzo_gpu compress final dump failed")
         end = time.perf_counter() * 1000
-        global total_compression_time
         total_compression_time += end - start  # 累加压缩时间
         # 删除临时tar文件
         try:
@@ -1165,6 +1172,12 @@ def xfer_final(image_path, dest, compress, port):
     dump_xfer_time = end - start
     if ret != 0:
         error()
+
+    if compress == 0:
+        try:
+            os.remove(tar_name)
+        except OSError as e:
+            print(f"警告：无法删除临时final tar文件 {tar_name}: {e}")
 
 
 # Run the pre-dump iteration and transfer it to the destination
@@ -1943,14 +1956,31 @@ if __name__ == "__main__":
         print("Total pre-dump size: {:.3f} KB".format(pre_dump_size_total / 1024))  # 转换为 KB
     print("Total dump size:{:.3f} KB".format(dump_size / 1024))  # 转换为 KB
 
+    compression_overhead = total_compression_time if total_compression_time > 0 else 0.0
+
     if pre and not post:
-        total_time = pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time
+        total_time = (
+            pre_dump_time_total
+            + pre_dump_xfer_time_total
+            + dump_time
+            + dump_xfer_time
+            + rst_time
+            + compression_overhead
+        )
     elif not pre and post:
-        total_time = dump_time + dump_xfer_time + rst_time + rpf_handle_time
+        total_time = dump_time + dump_xfer_time + rst_time + rpf_handle_time + compression_overhead
     elif pre and post:
         total_time = (
-            pre_dump_time_total + pre_dump_xfer_time_total + dump_time + dump_xfer_time + rst_time + rpf_handle_time
+            pre_dump_time_total
+            + pre_dump_xfer_time_total
+            + dump_time
+            + dump_xfer_time
+            + rst_time
+            + rpf_handle_time
+            + compression_overhead
         )
+    else:
+        total_time = dump_time + dump_xfer_time + rst_time + compression_overhead
 
     stop_time = dump_time + dump_xfer_time + rst_time
 
@@ -1969,64 +1999,84 @@ if __name__ == "__main__":
     # 迁移完成后，执行后处理
     # for excel
 
-    # [修改] 计算压缩率并为 output_values 准备变量
-    compression_ratio = 0.0  # 默认初始化
-    # [新] 计算并打印压缩率
+    # 计算压缩相关统计
+    total_uncompressed_size = pre_dump_size_total + dump_size
+    total_compressed_size = 0.0
+    compression_ratio = 100.0
+
     if compress >= 0:
-        # 1. 计算 LZO 文件总大小 (分子)
-        # mig_base 在 __main__ 块的开头 (约 1756 行) 已经定义
-        # total_lzo_size = get_lzo_files_size(mig_base)
-        total_compressed_size = get_compressed_files_size(mig_base, compress)  # <-- 修正后的调用
-        # 2. 计算未压缩数据总大小 (分母)
-        # pre_dump_size_total 和 dump_size 是全局变量,
-        # 并在 migrate() 函数末尾通过 get_dump_size() 填充
-        total_uncompressed_size = pre_dump_size_total + dump_size
+        total_compressed_size = get_compressed_files_size(mig_base, compress)
+        if compress == 0:
+            compression_ratio = 100.0
+        elif total_uncompressed_size > 0 and total_compressed_size > 0:
+            compression_ratio = (total_compressed_size / total_uncompressed_size) * 100.0
+        else:
+            compression_ratio = 0.0
 
-        compression_ratio = 0.0
+        if total_compressed_size > 0:
+            print(f"Total compressed size: {total_compressed_size / 1024:.3f} KB")
+        else:
+            print("Total compressed size: N/A")
+
         if total_uncompressed_size > 0:
-            # 压缩率 = (压缩后大小 / 压缩前大小) * 100%
-            compression_ratio = total_uncompressed_size / total_compressed_size
+            print(f"Total original size: {total_uncompressed_size / 1024:.3f} KB")
 
-        print(f"Total LZO (compressed) size: {total_compressed_size / 1024:.3f} KB")
-        # print(f'Total Original (uncompressed) size: {total_uncompressed_size / 1024:.3f} KB')
         print(f"Compression Ratio: {compression_ratio:.2f} %")
-    # [新功能结束]
 
     # 输出数据行
+    output_metrics = []
     output_values = []
 
     if pre:
+        output_metrics.extend(["pre_dump_time_total_ms", "pre_dump_xfer_time_total_ms"])
         output_values.extend([int(round(pre_dump_time_total)), int(round(pre_dump_xfer_time_total))])
+    else:
+        output_metrics.extend(["pre_dump_time_total_ms", "pre_dump_xfer_time_total_ms"])
+        output_values.extend(["NA", "NA"])
 
+    output_metrics.extend(["dump_time_ms", "dump_xfer_time_ms", "restore_time_ms"])
     output_values.extend([int(round(dump_time)), int(round(dump_xfer_time)), int(round(rst_time))])
 
+    output_metrics.append("pre_dump_size_kb")
     if pre:
-        output_values.append("{:.2f}".format(pre_dump_size_total / 1024))  # 预拷贝大小以KB为单位
+        output_values.append("{:.2f}".format(pre_dump_size_total / 1024))
     else:
-        output_values.append("")
+        output_values.append("NA")
 
-    output_values.append("{:.2f}".format(dump_size / 1024))  # dump_size以KB为单位
+    output_metrics.append("dump_size_kb")
+    output_values.append("{:.2f}".format(dump_size / 1024))
 
-    output_values.extend([int(round(total_time)), int(round(stop_time))])
-    output_values.append(int(round(total_size)))
+    output_metrics.extend(["total_time_ms", "downtime_ms", "total_migrate_size_kb"])
+    output_values.extend([int(round(total_time)), int(round(stop_time)), int(round(total_size))])
+
     if post:
+        output_metrics.extend(["faulted_pages_xfer_time_ms", "faulted_pages_size_kb"])
         output_values.extend([int(round(rpf_handle_time)), "{:.2f}".format(total_uffd_copy)])
-    if pre:
-        output_values.append(int(round(pre_dump_iters)))
-    # print("aaaaaaaaaaaaaaaa")
-    if compress > 0:
-        # print("bbbbbbbbbbbb")
-        output_values.append(int(round(total_compression_time)))
-        # output_values.append(int(round(compression_ratio)))
-        output_values.append("{:.2f}".format(compression_ratio))
-    print("\t".join(map(str, output_values)))
+    else:
+        output_metrics.extend(["faulted_pages_xfer_time_ms", "faulted_pages_size_kb"])
+        output_values.extend(["NA", "NA"])
+
+    output_metrics.append("pre_dump_iterations")
+    output_values.append(int(round(pre_dump_iters)) if pre else "NA")
+
+    output_metrics.append("total_compression_time_ms")
+    output_values.append(int(round(total_compression_time)))
+
+    output_metrics.append("compression_ratio_percent")
+    output_values.append("{:.2f}".format(compression_ratio))
+
+    metrics_line = "\t".join(map(str, output_metrics))
+    values_line = "\t".join(map(str, output_values))
+
+    print(f"METRIC_HEADER\t{metrics_line}")
+    print(f"METRIC_VALUES\t{values_line}")
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")
 
-    output_line = "\t".join(map(str, output_values))
-    # 将结果追加写入 results.txt 文件
+    # 将结果追加写入 results.txt 文件，包含指标与取值
     with open("results.txt", "a") as f:
-        f.write(output_line + "\n")
+        f.write(metrics_line + "\n")
+        f.write(values_line + "\n")
 
     if diskless:
         post_process(max_iter)

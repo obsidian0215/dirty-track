@@ -550,9 +550,9 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     # 尝试从 stdout 中提取统计行并写入 results
     try:
         stdout = getattr(result, "stdout", "") or ""
-        stats = extract_stats_from_output(stdout)
+        header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats)
+            append_result(exp_name, "redis", run_index, stats, header, exp_args)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

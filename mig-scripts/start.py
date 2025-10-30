@@ -6,6 +6,8 @@ import time
 import os
 from datetime import datetime
 
+from result_writer import append_result, extract_stats_from_output
+
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
 
@@ -238,34 +240,6 @@ def source_prepare(args):
     for c, ign in cmds:
         run_cmd(c, ignore_error=ign)
 
-
-def _extract_stats_from_output(output_text: str):
-    """从 source 脚本的 stdout 中提取最后一行带有 tab 分隔的统计值行。"""
-    stats_line = None
-    for line in output_text.splitlines():
-        if "\t" in line and re.search(r"\d", line):
-            stats_line = line.strip()
-    return stats_line
-
-
-def _ensure_results_dir():
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    results_dir = os.path.join(base, "results")
-    os.makedirs(results_dir, exist_ok=True)
-    return results_dir
-
-
-def _append_result(exp_name: str, container: str, run_index: int, stats_line: str):
-    results_dir = _ensure_results_dir()
-    fname = os.path.join(results_dir, f"{exp_name}.tsv")
-    is_new = not os.path.exists(fname)
-    ts = datetime.utcnow().isoformat() + "Z"
-    with open(fname, "a", encoding="utf-8") as f:
-        if is_new:
-            f.write("timestamp\tcontainer\trun\tstats\n")
-        f.write(f"{ts}\t{container}\t{run_index}\t{stats_line}\n")
-
-
 def source_run_migration(args, exp_args, run_index: int, exp_name: str):
     container_name = args.container
     # 开启工具测试 (后台)
@@ -279,10 +253,10 @@ def source_run_migration(args, exp_args, run_index: int, exp_name: str):
 
     # 从 stdout 提取统计行并写入 results 文件
     stdout = getattr(result, "stdout", "") or ""
-    stats = _extract_stats_from_output(stdout)
+    header, stats = extract_stats_from_output(stdout)
     if stats:
         try:
-            _append_result(exp_name, container_name, run_index, stats)
+            append_result(exp_name, container_name, run_index, stats, header, exp_args)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         except Exception as e:
             print(f"Failed to write stats file: {e}")
