@@ -21,6 +21,8 @@ import sys
 import time
 from result_writer import extract_stats_from_output, append_result
 
+from cmd_utils import run_cmd, run_remote_cmd
+
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
 
@@ -79,33 +81,6 @@ scene_configs = {
         },
     },
 }
-
-
-def run_cmd(cmd, ignore_error=False):
-    print("Executing:", cmd)
-    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Command failed with error:", result.stderr)
-        sys.exit(1)
-    print(result.stdout)
-    return result
-
-
-def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
-    """Execute command on remote machine."""
-    if background:
-        cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
-
-    full_cmd = f"ssh {target_ip} '{cmd}'"
-    print("Executing remotely:", end=" ")
-    print(f"(on {target_ip}):", cmd)
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Remote command failed with error:", result.stderr)
-        sys.exit(1)
-    print(result.stdout)
-    return result
-
 
 def destination_prepare():
     container_name = "influxdb"  # 假设InfluxDB容器名为influxdb
@@ -276,27 +251,29 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
 
 
 def clean_configure_network():
-    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True, quiet=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True, quiet=True)
     if CLIENT_IP:
-        run_remote_cmd("sudo tc qdisc del dev ens33 root", CLIENT_IP, ignore_error=True)
+        run_remote_cmd("sudo tc qdisc del dev ens33 root", CLIENT_IP, ignore_error=True, quiet=True)
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
-    """配置网络规则，使用 tc 命令设置带宽和延迟"""
+    """Configure tc shaping rules locally or remotely."""
     if is_remote and not target_ip:
-        raise ValueError("Target IP must be provided for remote execution.")
+        raise ValueError("configure_network_do requires target_ip when is_remote=True")
 
     cleanup_cmd = f"sudo tc qdisc del dev {interface} root"
-    print(f"Executing cleanup: {cleanup_cmd}")
-    if is_remote:
-        run_remote_cmd(cleanup_cmd, target_ip=target_ip, ignore_error=True)
-    else:
-        run_cmd(cleanup_cmd, ignore_error=True)
+    init_cmd = f"sudo tc qdisc add dev {interface} root handle 1: htb"
+    remote_ip = str(target_ip) if is_remote else None
 
-    base_cmds = [
-        f"sudo tc qdisc add dev {interface} root handle 1: htb",
-    ]
+    if remote_ip:
+        print(f"[net] clearing rules on remote:{remote_ip} {interface}")
+        run_remote_cmd(cleanup_cmd, remote_ip, ignore_error=True, quiet=True)
+        run_remote_cmd(init_cmd, remote_ip, ignore_error=ignore_error, quiet=True)
+    else:
+        print(f"[net] clearing rules on local {interface}")
+        run_cmd(cleanup_cmd, ignore_error=True, quiet=True)
+        run_cmd(init_cmd, ignore_error=ignore_error, quiet=True)
 
     for idx, rule in enumerate(rules, start=1):
         classid = f"1:{idx}"
@@ -304,22 +281,20 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
         rate = rule["rate"]
         delay = rule["delay"]
         dst = rule["dst"]
+        location = f"remote:{remote_ip}" if remote_ip else "local"
+        print(f"[net] rule#{idx} on {location}: dst={dst} rate={rate} delay={delay}")
 
-        base_cmds.extend(
-            [
-                f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
-                f"match ip dst {dst} flowid {classid}",
-                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
-            ]
-        )
+        cmds = [
+            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
+            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
+        ]
 
-    for cmd in base_cmds:
-        print(f"Executing network config: {cmd}")
-        if is_remote:
-            run_remote_cmd(cmd, target_ip=target_ip, ignore_error=ignore_error)
-        else:
-            run_cmd(cmd, ignore_error=ignore_error)
+        for cmd in cmds:
+            if remote_ip:
+                run_remote_cmd(cmd, remote_ip, ignore_error=ignore_error, quiet=True)
+            else:
+                run_cmd(cmd, ignore_error=ignore_error, quiet=True)
 
 
 def configure_network():

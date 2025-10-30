@@ -6,6 +6,7 @@ import time
 import os
 from datetime import datetime
 
+from cmd_utils import run_cmd, run_remote_cmd
 from result_writer import append_result, extract_stats_from_output
 
 # 默认设置
@@ -16,55 +17,6 @@ SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 
 # default bandwidth
 BANDWIDTH = "25mbit"
-
-
-def run_cmd(cmd, ignore_error=False):
-    print("Executing on source:", cmd)
-    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Command failed with error:", result.stderr)
-        sys.exit(1)
-    else:
-        print(result.stdout)
-    return result
-
-
-# def run_remote_cmd(cmd,target_ip,ignore_error=False, background=False):
-#     # 如果background=True，则在目标机器上使用nohup和&将进程放入后台
-#     if background:
-#         # 使用nohup和&后台运行，让ssh立即返回
-#         # 同时将输出重定向到文件，防止阻塞
-#         cmd = f"nohup {cmd}  &"
-
-#     full_cmd = f"ssh {target_ip} \"{cmd}\""
-#     print("Executing remotely:", full_cmd)
-#     result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-#     if result.returncode != 0 and not ignore_error:
-#         print("Remote command failed with error:", result.stderr)
-#         sys.exit(1)
-#     else:
-#         print(result.stdout)
-
-
-def run_remote_cmd(cmd, target_ip, ignore_error=False, background=False):
-    if not target_ip:
-        raise ValueError("target_ip is required for run_remote_cmd")
-
-    if background:
-        # 关键点：重定向 stdin/out/err，并让 ssh -n 不转发本地 stdin
-        remote_cmd = f"nohup {cmd} >/tmp/remote_bg.log 2>&1 < /dev/null & echo $!"
-        full_cmd = f"ssh -n {target_ip} \"{remote_cmd}\""
-    else:
-        full_cmd = f"ssh {target_ip} '{cmd}'"
-
-    print("Executing remotely:", full_cmd)
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Remote command failed with error:", result.stderr)
-        sys.exit(1)
-    else:
-        print(result.stdout)
-    return result
 
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
@@ -244,7 +196,10 @@ def source_run_migration(args, exp_args, run_index: int, exp_name: str):
     container_name = args.container
     # 开启工具测试 (后台)
     run_remote_cmd(
-        "wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/", CLIENT_IP, ignore_error=True, background=True
+        "wrk -t4 -c50 -d120s --timeout 10s http://192.168.2.100/",
+        target_ip=CLIENT_IP,
+        ignore_error=True,
+        background=True,
     )
 
     time.sleep(3)  # 等待bench启动稳定
@@ -358,45 +313,42 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
     - target_ip: 远程目标机器的 IP 地址 (仅在 is_remote=True 时有效)。
     - ignore_error: 是否忽略错误 (默认: False)。
     """
-    if is_remote and not target_ip:
-        raise ValueError("Target IP must be provided for remote execution.")
-
     cleanup_cmd = f"sudo tc qdisc del dev {interface} root"
-    print(f"Executing cleanup: {cleanup_cmd}")
+    init_cmd = f"sudo tc qdisc add dev {interface} root handle 1: htb"
+    remote_ip = None
+
     if is_remote:
-        run_remote_cmd(cleanup_cmd, target_ip=target_ip, ignore_error=True)
+        if not target_ip:
+            raise ValueError("Target IP must be provided for remote execution.")
+        remote_ip = str(target_ip)
+        print(f"[net] clearing rules on remote:{remote_ip} {interface}")
+        run_remote_cmd(cleanup_cmd, target_ip=remote_ip, ignore_error=True, quiet=True)
+        run_remote_cmd(init_cmd, target_ip=remote_ip, ignore_error=ignore_error, quiet=True)
     else:
-        run_cmd(cleanup_cmd, ignore_error=True)
+        print(f"[net] clearing rules on local {interface}")
+        run_cmd(cleanup_cmd, ignore_error=True, quiet=True)
+        run_cmd(init_cmd, ignore_error=ignore_error, quiet=True)
 
-    # 基础命令
-    base_cmds = [
-        f"sudo tc qdisc add dev {interface} root handle 1: htb",
-    ]
-
-    # 动态添加规则
     for idx, rule in enumerate(rules, start=1):
         classid = f"1:{idx}"
         handle = f"{10 * idx}:"
         rate = rule["rate"]
         delay = rule["delay"]
         dst = rule["dst"]
+        location = f"remote:{remote_ip}" if remote_ip else "local"
+        print(f"[net] rule#{idx} on {location}: dst={dst} rate={rate} delay={delay}")
 
-        base_cmds.extend(
-            [
-                f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
-                f"match ip dst {dst} flowid {classid}",
-                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
-            ]
-        )
+        cmds = [
+            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
+            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
+        ]
 
-    # 执行命令 (本地或远程)
-    for cmd in base_cmds:
-        print(f"Executing: {cmd}")
-        if is_remote:
-            run_remote_cmd(cmd, target_ip=target_ip, ignore_error=ignore_error)
-        else:
-            run_cmd(cmd, ignore_error=ignore_error)
+        for cmd in cmds:
+            if remote_ip:
+                run_remote_cmd(cmd, target_ip=remote_ip, ignore_error=ignore_error, quiet=True)
+            else:
+                run_cmd(cmd, ignore_error=ignore_error, quiet=True)
 
 
 def clean_configure_network():
@@ -510,6 +462,6 @@ if __name__ == "__main__":
                 destination_clean(args)
                 clean_configure_network()
 
-            print("======== sleep ========")
+            # print("======== sleep ========")
             # time.sleep(30000) #
             # input()

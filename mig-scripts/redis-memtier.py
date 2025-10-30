@@ -5,6 +5,8 @@ import sys
 import time
 from result_writer import extract_stats_from_output, append_result
 
+from cmd_utils import run_cmd, run_remote_cmd
+
 # default script selection
 from script_defaults import choose_scripts, get_default_ips
 
@@ -79,61 +81,18 @@ experiments = {
     # "hybrid": "-pre -post -d --tcp-established --shell-job",
     # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
+def run_client_cmd(cmd, *, ignore_error=False, background=False, quiet=False):
+    """Execute a command on the memtier client host."""
+    if not CLIENT_IP:
+        raise ValueError("CLIENT_IP is not configured for run_client_cmd")
 
-
-def run_cmd(cmd, ignore_error=False):
-    print("Executing on source:", cmd)
-    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Command failed with error:", result.stderr)
-        sys.exit(1)
-    else:
-        print(result.stdout)
-    return result
-
-
-def run_remote_cmd(cmd, target_ip=None, ignore_error=False, background=False):
-    """
-    Execute command on remote machine.
-    """
-    if not target_ip:
-        target_ip = DEST_IP
-
-    # 如果background=True，则在目标机器上使用 nohup; 返回后台启动的 PID（通过 echo $!）
+    remote_cmd = cmd
     if background:
-        # 确保输出重定向，ssh 会返回包含 pid 的一行
-        remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
-        full_cmd = f"ssh {target_ip} \"{remote_cmd}\""
-    else:
-        full_cmd = f"ssh {target_ip} '{cmd}'"
+        remote_cmd = f"nohup {cmd} < /dev/null & echo $!"
 
-    print("Executing remotely on", target_ip, ":", cmd)
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Remote command failed with error:", result.stderr)
-        sys.exit(1)
-    else:
-        # 打印 stdout 帮助调试；如果是后台启动，stdout 通常包含 pid
-        print(result.stdout)
-    return result
-
-
-def run_client_cmd(
-    cmd, ignore_error=False, background=False
-):  # [memtier] changed: 通用客户端执行函数（替代 run_ycsb_cmd）
-    if background:
-        remote_cmd = f"nohup {cmd} > /dev/null 2>&1 & echo $!"
-        full_cmd = f"ssh {CLIENT_IP} \"{remote_cmd}\""
-    else:
-        full_cmd = f"ssh {CLIENT_IP} '{cmd}'"
-
-    print("Executing on client (memtier) machine:", full_cmd)  # [memtier] changed
-    result = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0 and not ignore_error:
-        print("Client command failed with error:", result.stderr)
-        sys.exit(1)
-    else:
-        print(result.stdout)
+    result = run_remote_cmd(remote_cmd, CLIENT_IP, ignore_error=ignore_error, quiet=quiet)
+    if not ignore_error and getattr(result, "returncode", 0) != 0:
+        sys.exit(result.returncode or 1)
     return result
 
 
@@ -402,69 +361,51 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
-    """
-    配置网络规则，使用 `tc` 命令设置带宽和延迟，支持本地和远程执行。
-
-    参数:
-    - interface: 网络接口名称，例如 "ens33"。
-    - rules: 规则列表，每个规则是一个字典，包含:
-        - `rate`: 带宽限制，例如 "100mbit"。
-        - `delay`: 延迟，例如 "3ms"。
-        - `dst`: 目标 IP 地址，例如 "192.168.37.157"。
-    - is_remote: 是否在远程机器上执行 (默认: False)。
-    - target_ip: 远程目标机器的 IP 地址 (仅在 is_remote=True 时有效)。
-    - ignore_error: 是否忽略错误 (默认: False)。
-
-    返回:
-    - None
-    """
+    """Apply tc shaping rules locally or on a remote host."""
     if is_remote and not target_ip:
-        raise ValueError("Target IP must be provided for remote execution.")
+        raise ValueError("configure_network_do requires target_ip when is_remote=True")
 
     cleanup_cmd = f"sudo tc qdisc del dev {interface} root"
-    print(f"Executing cleanup: {cleanup_cmd}")
-    if is_remote:
-        run_remote_cmd(cleanup_cmd, target_ip=target_ip, ignore_error=True)
+    init_cmd = f"sudo tc qdisc add dev {interface} root handle 1: htb"
+    remote_ip = str(target_ip) if is_remote else None
+
+    if remote_ip:
+        print(f"[net] clearing rules on remote:{remote_ip} {interface}")
+        run_remote_cmd(cleanup_cmd, remote_ip, ignore_error=True, quiet=True)
+        run_remote_cmd(init_cmd, remote_ip, ignore_error=ignore_error, quiet=True)
     else:
-        run_cmd(cleanup_cmd, ignore_error=True)
+        print(f"[net] clearing rules on local {interface}")
+        run_cmd(cleanup_cmd, ignore_error=True, quiet=True)
+        run_cmd(init_cmd, ignore_error=ignore_error, quiet=True)
 
-    # 基础命令
-    base_cmds = [
-        f"sudo tc qdisc add dev {interface} root handle 1: htb",
-    ]
-
-    # 动态添加规则
     for idx, rule in enumerate(rules, start=1):
         classid = f"1:{idx}"
         handle = f"{10 * idx}:"
         rate = rule["rate"]
         delay = rule["delay"]
         dst = rule["dst"]
+        location = f"remote:{remote_ip}" if remote_ip else "local"
+        print(f"[net] rule#{idx} on {location}: dst={dst} rate={rate} delay={delay}")
 
-        base_cmds.extend(
-            [
-                f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-                f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 "
-                f"match ip dst {dst} flowid {classid}",
-                f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
-            ]
-        )
+        cmds = [
+            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
+            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
+            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
+        ]
 
-    # 执行命令 (本地或远程)
-    for cmd in base_cmds:
-        print(f"Executing: {cmd}")
-        if is_remote:
-            run_remote_cmd(cmd, target_ip=target_ip, ignore_error=ignore_error)
-        else:
-            run_cmd(cmd, ignore_error=ignore_error)
+        for cmd in cmds:
+            if remote_ip:
+                run_remote_cmd(cmd, remote_ip, ignore_error=ignore_error, quiet=True)
+            else:
+                run_cmd(cmd, ignore_error=ignore_error, quiet=True)
 
 
 def clean_configure_network():
-    """清空网络配置"""
-    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True)
+    """Remove tc shaping rules from all participating hosts."""
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True, quiet=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True, quiet=True)
     if YCSB_IP:
-        run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=YCSB_IP, ignore_error=True)
+        run_remote_cmd("sudo tc qdisc del dev ens33 root", YCSB_IP, ignore_error=True, quiet=True)
 
 
 def configure_network():
