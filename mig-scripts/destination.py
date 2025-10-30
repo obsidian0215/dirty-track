@@ -13,7 +13,7 @@ import threading
 import time
 from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import psutil
 from script_defaults import get_default_ips
@@ -31,6 +31,7 @@ iteration_list: List[int] = []
 port_list: List[int] = [INIT_PORT]
 transfer_processes: Dict[int, subprocess.Popen] = {}
 last_iter = 0
+FINAL_DATA_PORT: Optional[int] = None
 
 # 确保线程安全
 process_lock = threading.Lock()
@@ -114,6 +115,8 @@ def handle_prepare(prepare_info):
     prep_start = time.perf_counter()
     cpu_prep_start = psutil.cpu_percent(interval=None)
 
+    _reset_transfer_state()
+
     path = prepare_info["path"]
     image_path = prepare_info["image_path"]
 
@@ -156,7 +159,7 @@ def handle_prepare(prepare_info):
                 cmd = f"nc -lp {port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
             else:
                 raise ValueError(f"不支持的压缩等级: {compress}")
-            # logger.info(f"启动 ncat 监听端口 {port}，解压到 {extract_path}")
+            logger.info(f"启动预拷贝监听: iter={iter_num}, port={port}, path={extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             # print("process id:",process)
             # 将进程记录到字典中
@@ -166,6 +169,8 @@ def handle_prepare(prepare_info):
         # 最后一个端口用于解压到 image_path
         if port_list:
             last_port = port_list[-1]
+            global FINAL_DATA_PORT
+            FINAL_DATA_PORT = last_port
             # os.makedirs(image_path, exist_ok=True)
             extract_path = image_path
             if compress == 0:
@@ -179,7 +184,7 @@ def handle_prepare(prepare_info):
                 raise ValueError(f"不支持的压缩等级: {compress}")
                 # cmd = f"nc -lp {last_port} "
                 # cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
-            # logger.info(f"启动 ncat 监听端口 {last_port}，解压到 {extract_path}")
+            logger.info(f"启动最终镜像监听: port={last_port}, path={extract_path}")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             with process_lock:
                 transfer_processes[last_port] = process
@@ -497,6 +502,50 @@ def _wait_all_transfers_done(timeout=30.0, interval=0.1):
     return False
 
 
+def _reset_transfer_state():
+    """Ensure per-run transfer bookkeeping starts from a clean slate."""
+    global iteration_list, port_list, FINAL_DATA_PORT
+
+    # Terminate any stale listeners that might linger from a previous run.
+    with process_lock:
+        for proc in transfer_processes.values():
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+        transfer_processes.clear()
+
+    iteration_list.clear()
+    port_list.clear()
+    port_list.append(INIT_PORT)
+    FINAL_DATA_PORT = None
+
+
+def _wait_final_transfer_complete(timeout: float = 60.0) -> bool:
+    """Block until the final dump listener finishes extracting data."""
+    final_port = FINAL_DATA_PORT
+    if final_port is None:
+        return True
+
+    with process_lock:
+        proc = transfer_processes.get(final_port)
+
+    if not proc:
+        return True
+
+    try:
+        proc.wait(timeout=timeout)
+        if proc.returncode not in (0, None):
+            logger.error("final transfer on port %s exited with code %s", final_port, proc.returncode)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout waiting for final transfer on port %s", final_port)
+        return False
+
+
 def handle_restore(msg):
     """
     处理 restore 命令，由于使用同步传输，传输在迁移过程中已完成，直接执行恢复操作。
@@ -507,8 +556,12 @@ def handle_restore(msg):
     # print(1211111)
     image_path = msg["restore"]["image_path"]
     desc = os.path.join(image_path, "descriptors.json")
-    # 2) 等待 descriptors.json 存在且大小稳定
-    if not _wait_file_stable(desc, timeout=15.0):
+    # 2) 等待最终镜像解包完成
+    if not _wait_final_transfer_complete(timeout=120.0):
+        return "final dump transfer incomplete"
+
+    # 3) 等待 descriptors.json 存在且大小稳定
+    if not _wait_file_stable(desc, timeout=30.0):
         logger.error("descriptors.json not ready at %s", desc)
         return "descriptors.json not ready"
 
@@ -552,6 +605,8 @@ def handle_restore(msg):
 
         # 清空进程字典
         transfer_processes.clear()
+        global FINAL_DATA_PORT
+        FINAL_DATA_PORT = None
 
         if terminated_count > 0:
             logger.debug(f"共清理了 {terminated_count} 个nc进程")

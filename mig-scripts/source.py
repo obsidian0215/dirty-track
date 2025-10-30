@@ -90,12 +90,12 @@ pre_dump_iters = 0
 pre_dump_time_total = 0.0
 pre_dump_size_total = 0
 esti_dump_time = 0.0
-esti_dump_size_pre = 0
-esti_dump_size_post = 0
+esti_dump_size_pre = 0.0
+esti_dump_size_post = 0.0
 dump_size = 0.0
 dump_xfer_time = 0.0
 port_list = []
-max_predump_size = 0
+max_predump_size = 0.0
 final_archive_size_bytes = 0.0  # 记录最终 dump 压缩包的大小，便于统计时使用
 
 
@@ -1091,23 +1091,29 @@ def xfer_pre_dump(parent_path, dest, i, port):
 
     print(f"Pre-dump {i} archive: {size} Bytes, {(end - start):.3f} ms")
 
-    # 传输到目标服务器
-    nc_cmd = f"nc -q 0 {dest} {port} < {archive_name}"
-    # print(nc_cmd)
+    start = time.perf_counter()
+    with open(archive_name, "rb") as fp:
+        proc = subprocess.run(
+            ["nc", "-q", "0", dest, str(port)],
+            stdin=fp,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+    end = time.perf_counter()
+    transfer_time = (end - start) * 1000.0
 
-    start = time.perf_counter() * 1000
-    ret = os.system(nc_cmd)
-    end = time.perf_counter() * 1000
-    transfer_time = end - start
+    if proc.returncode != 0:
+        print(
+            f"Pre-dump {i} xfer failed with exit code {proc.returncode}. "
+            f"stderr: {proc.stderr.decode('utf-8', errors='ignore')}"
+        )
+        error()
 
     effective_mbps = 0.0
     if transfer_time > 0:
         effective_mbps = (size * 8.0) / (transfer_time / 1000.0) / 1_000_000
     print(f"Pre-dump {i} xfer: {transfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
-
-    if ret != 0:
-        print(f"Pre-dump {i} xfer failed, ExitCode: {ret}")
-        error()
 
     if time_constraint > 0:
         bandwidth_measurements.append(1000.0 * size / transfer_time)
@@ -1136,7 +1142,6 @@ def xfer_final(image_path, dest, compress, port):
         if not os.path.exists(tar_name):
             raise FileNotFoundError(f"Final dump archive not found: {tar_name}")
         final_archive_size_bytes = os.path.getsize(tar_name)
-        send_cmd = f"nc -q 0 {dest} {port} < {tar_name}"
     elif compress >= 1 and compress <= 4:
         # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
         start = time.perf_counter() * 1000
@@ -1171,22 +1176,34 @@ def xfer_final(image_path, dest, compress, port):
         if not os.path.exists(lzo_name):
             raise FileNotFoundError(f"Final dump archive not found: {lzo_name}")
         final_archive_size_bytes = os.path.getsize(lzo_name)
-        send_cmd = f"nc -q 0 {dest} {port} < {lzo_name}"
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
-    start = time.perf_counter() * 1000
-    ret = os.system(send_cmd)
-    end = time.perf_counter() * 1000
-    # print(f"DUMP transfer time {(end - start):.3f} ms")
 
-    # 计算传输时间
-    dump_xfer_time = end - start
+    archive_path = tar_name if compress == 0 else lzo_name
+
+    start = time.perf_counter()
+    with open(archive_path, "rb") as fp:
+        proc = subprocess.run(
+            ["nc", "-q", "0", dest, str(port)],
+            stdin=fp,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+        )
+    end = time.perf_counter()
+    dump_xfer_time = (end - start) * 1000.0
+
+    if proc.returncode != 0:
+        print(
+            f"Final dump transfer failed with exit code {proc.returncode}. "
+            f"stderr: {proc.stderr.decode('utf-8', errors='ignore')}"
+        )
+        error()
+
     effective_mbps = 0.0
     if dump_xfer_time > 0:
         effective_mbps = (final_archive_size_bytes * 8.0) / (dump_xfer_time / 1000.0) / 1_000_000
     print(f"Final dump xfer: {dump_xfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
-    if ret != 0:
-        error()
 
     if compress == 0:
         try:
@@ -1226,19 +1243,13 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
         # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
 
-        dir_size = getdirsize(last_path, "pages")
-        # print("parent_path:",parent_path)
-        # print("last_iter:",last_iter)
+        dir_size = float(getdirsize(last_path, "pages") or 0)
         less_last_path = parent_path[last_iter - 2] if last_iter > 1 else None
-        # print("less_last_path:",less_last_path)
 
         # 更新最大predump大小
         global max_predump_size
         if dir_size > max_predump_size:
             max_predump_size = dir_size
-        # if abs(dir_size - getdirsize(less_last_path, 'pages')) < 1024 * 64 \
-        #             or (dir_size < 1024 * 64) or last_iter == max_iter:     #64KB
-        #     iter_terminate = True
 
         if last_iter == 1:
             # 第一次 pre-dump 不需要比较，直接判断目录大小
@@ -1246,9 +1257,9 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
                 iter_terminate = True
         else:
             # 否则比较两次 pre-dump 目录大小
-            less_last_path = parent_path[last_iter - 2]
+            less_last_size = float(getdirsize(less_last_path, "pages") or 0) if less_last_path else 0.0
             if (
-                abs(dir_size - getdirsize(less_last_path, "pages")) < 1024 * 64
+                abs(dir_size - less_last_size) < 1024 * 64
                 or dir_size < 1024 * 64
                 or last_iter == max_iter
             ):
