@@ -12,6 +12,7 @@ from script_defaults import choose_scripts, get_default_ips
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+SEC_MODE = False
 
 # default bandwidth
 BANDWIDTH = "25mbit"
@@ -44,7 +45,9 @@ if __name__ == "__main__":
     # set bandwidth
     globals()["BANDWIDTH"] = getattr(parsed_args, "bandwidth", BANDWIDTH)
     # 根据 --sec 切换为 secure 变体
-    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(parsed_args, "sec", False))
+    sec_enabled = getattr(parsed_args, "sec", False)
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(sec_enabled)
+    globals()["SEC_MODE"] = sec_enabled
 
 # 定义实验类型与参数
 experiments = {
@@ -532,7 +535,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "elasticsearch", run_index, stats, header, exp_args)
+            append_result(exp_name, "elasticsearch", run_index, stats, header, exp_args, is_secure=SEC_MODE)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

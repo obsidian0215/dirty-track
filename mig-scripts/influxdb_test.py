@@ -30,6 +30,7 @@ BANDWIDTH = "25mbit"
 
 # default script to call; can be switched to source-sec.py via --sec
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+SEC_MODE = False
 
 # 定义实验类型
 experiments = {
@@ -402,7 +403,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "influxdb", run_index, stats, header, exp_args)
+            append_result(exp_name, "influxdb", run_index, stats, header, exp_args, is_secure=SEC_MODE)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")
@@ -482,8 +483,9 @@ def main():
     BANDWIDTH = args.bandwidth
 
     # set script selection
-    global SOURCE_SCRIPT
+    global SOURCE_SCRIPT, DEST_SCRIPT, SEC_MODE
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
+    SEC_MODE = args.sec
 
     # 设置场景特有bucket
     if not args.bucket:

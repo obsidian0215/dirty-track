@@ -11,6 +11,7 @@ from script_defaults import choose_scripts, get_default_ips
 
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+SEC_MODE = False
 # default bandwidth
 BANDWIDTH = "25mbit"
 # 场景配置：Redis的video和sensor场景
@@ -405,7 +406,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args)
+            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")
@@ -468,7 +469,9 @@ def main():
     # 根据 --sec 切换为 secure 变体
     # set bandwidth
     globals()["BANDWIDTH"] = getattr(args, "bandwidth", BANDWIDTH)
-    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(args, "sec", False))
+    sec_enabled = getattr(args, "sec", False)
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(sec_enabled)
+    globals()["SEC_MODE"] = sec_enabled
 
     experiment_types_to_run = args.experiment_types if args.experiment_types else list(experiments.keys())
 

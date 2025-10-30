@@ -33,6 +33,7 @@ def append_result(
     stats_line: Optional[str],
     header_line: Optional[str] = None,
     exp_params: Optional[str] = None,
+    is_secure: Optional[bool] = None,
 ):
     results_dir = _ensure_results_dir()
     fname = os.path.join(results_dir, f"{exp_name}.tsv")
@@ -54,8 +55,13 @@ def append_result(
     with open(fname, "a", encoding="utf-8") as f:
         if is_new:
             f.write(f"# experiment: {exp_name}\n")
+        comment_parts = []
         if exp_params:
-            f.write(f"# params: {exp_params}\n")
+            comment_parts.append(exp_params)
+        if is_secure is not None:
+            comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
+        if comment_parts:
+            f.write(f"# params: {' | '.join(comment_parts)}\n")
         if is_new:
             f.write("\t".join(header_columns) + "\n")
         f.write("\t".join(row_values) + "\n")

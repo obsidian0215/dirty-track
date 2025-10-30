@@ -256,7 +256,7 @@ def source_run_migration(args, exp_args, run_index: int, exp_name: str):
     header, stats = extract_stats_from_output(stdout)
     if stats:
         try:
-            append_result(exp_name, container_name, run_index, stats, header, exp_args)
+            append_result(exp_name, container_name, run_index, stats, header, exp_args, is_secure=getattr(args, "sec", False))
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         except Exception as e:
             print(f"Failed to write stats file: {e}")

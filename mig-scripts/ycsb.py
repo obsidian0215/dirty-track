@@ -16,6 +16,7 @@ YCSB_IP = CLIENT_IP  # 保持向后兼容性
 
 # default bandwidth
 BANDWIDTH = "25mbit"
+SEC_MODE = False
 
 # 使用argparse解析命令行参数以动态设置
 if __name__ == "__main__":
@@ -47,7 +48,9 @@ if __name__ == "__main__":
     REDIS_TIMEOUT = parsed_args.timeout
     runs = parsed_args.runs
     # script selection: allow secure variants
-    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(getattr(parsed_args, "sec", False))
+    sec_enabled = getattr(parsed_args, "sec", False)
+    SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(sec_enabled)
+    globals()["SEC_MODE"] = sec_enabled
     # set bandwidth
     globals()["BANDWIDTH"] = getattr(parsed_args, "bandwidth", BANDWIDTH)
 
@@ -522,7 +525,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args)
+            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

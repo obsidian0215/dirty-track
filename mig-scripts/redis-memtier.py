@@ -16,6 +16,7 @@ YCSB_IP = CLIENT_IP  # 保持向后兼容性
 BANDWIDTH = "25mbit"
 
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
+SEC_MODE = False
 # RECORD_COUNT = 100000
 # OPERATION_COUNT = 100000  # 默认两者相等
 
@@ -52,9 +53,11 @@ if __name__ == "__main__":
     runs = parsed_args.runs
     BANDWIDTH = parsed_args.bandwidth
     # set source script selection
-    src, dst = choose_scripts(getattr(parsed_args, "sec", False))
+    sec_enabled = getattr(parsed_args, "sec", False)
+    src, dst = choose_scripts(sec_enabled)
     globals()["SOURCE_SCRIPT"] = src
     globals()["DEST_SCRIPT"] = dst
+    globals()["SEC_MODE"] = sec_enabled
 
     # memtier 相关参数  # [memtier] changed
     MT_N = parsed_args.mt_n
@@ -559,7 +562,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args)
+            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")
