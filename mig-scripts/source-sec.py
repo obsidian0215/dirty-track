@@ -142,6 +142,7 @@ rst_time = 0.0
 # post
 total_uffd_copy = 0.0
 rpf_handle_time = 0.0
+final_archive_size_bytes = 0.0
 
 # 预估最后一次dump的时间和各种大小
 esti_dump_time = 0.0
@@ -1040,19 +1041,50 @@ def xfer_pre_dump(cs, parent_path, dest, i):
     # 选择传输工具：大文件使用 rsync（可续传+效率），小文件使用 scp
     transfer_cmd = None
     RSYNC_THRESHOLD = 10 * 1024 * 1024  # 10MB
+    remote_archive = os.path.join(parent_path, os.path.basename(archive_name))
+    ssh_base = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"root@{dest}",
+    ]
+
+    # 确保目标端不会因为残留归档而跳过传输
+    try:
+        subprocess.run(
+            ssh_base + [f"rm -f {remote_archive}"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception as cleanup_err:
+        print(f"Warning: failed to remove remote archive {remote_archive}: {cleanup_err}")
+
     if size >= RSYNC_THRESHOLD:
-        # rsync via ssh (keep remote-shell single string; split physical lines)
-        transfer_cmd = (
-            "rsync -av --inplace -e "
-            f"'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' "
-            f"{archive_name} {remote_dir}/"
-        )
+        transfer_cmd = [
+            "rsync",
+            "-av",
+            "--inplace",
+            "--ignore-times",
+            "-e",
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            archive_name,
+            f"{remote_dir}/",
+        ]
     else:
-        # scp via ssh (split across physical lines for lint)
-        transfer_cmd = (
-            f"scp -q -o StrictHostKeyChecking=no "
-            f"-o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
-        )
+        transfer_cmd = [
+            "scp",
+            "-q",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            archive_name,
+            f"{remote_dir}/",
+        ]
 
     # 传输时增加重试机制
     max_retries = 3
@@ -1061,17 +1093,29 @@ def xfer_pre_dump(cs, parent_path, dest, i):
     success = False
     while attempt < max_retries:
         attempt += 1
-        print(f"Transferring pre-dump {i} to {dest} using: {transfer_cmd} (attempt {attempt})")
+        print(f"Transferring pre-dump {i} to {dest} (attempt {attempt})")
         start = time.perf_counter() * 1000
-        ret = os.system(transfer_cmd)
+        result = subprocess.run(
+            transfer_cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         end = time.perf_counter() * 1000
         transfer_time = end - start
-        print(f"Pre-dump {i} xfer attempt {attempt}: {transfer_time:.3f} ms")
-        if ret == 0:
+        effective_mbps = 0.0
+        if transfer_time > 0:
+            effective_mbps = (size * 8.0) / (transfer_time / 1000.0) / 1_000_000
+        print(f"Pre-dump {i} xfer attempt {attempt}: {transfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
+        if result.returncode == 0:
             success = True
             break
         else:
-            print(f"Pre-dump {i} xfer failed (attempt {attempt}), ExitCode: {ret}")
+            print(
+                f"Pre-dump {i} xfer failed (attempt {attempt}), ExitCode: {result.returncode}, "
+                f"stderr: {result.stderr.strip()}"
+            )
             if attempt < max_retries:
                 backoff = 2**attempt
                 print(f"Retrying after {backoff}s...")
@@ -1146,9 +1190,11 @@ def xfer_pre_dump(cs, parent_path, dest, i):
 
 # Transfer the previosuly created dump using rsync
 def xfer_final(cs, image_path, dest, compress):
-    global dump_xfer_time, total_compression_time
+    global dump_xfer_time, total_compression_time, final_archive_size_bytes
 
     # Prepare archive file (tar or tar.lzo)
+    final_archive_size_bytes = 0.0
+
     try:
         if compress == 0:
             archive_name = os.path.join(mig_base, "final_dump.tar")
@@ -1162,6 +1208,8 @@ def xfer_final(cs, image_path, dest, compress):
                 except Exception:
                     # best-effort: ensure presence of the global
                     pass
+                if os.path.exists(archive_name):
+                    final_archive_size_bytes = os.path.getsize(archive_name)
             except subprocess.CalledProcessError as e:
                 print(f"Create final tar failed: {e}")
                 error()
@@ -1180,6 +1228,8 @@ def xfer_final(cs, image_path, dest, compress):
             except Exception:
                 pass
             archive_name = lzo_name
+            if os.path.exists(archive_name):
+                final_archive_size_bytes = os.path.getsize(archive_name)
         else:
             raise ValueError(f"不支持的压缩等级: {compress}")
     except subprocess.CalledProcessError as e:
@@ -1196,19 +1246,54 @@ def xfer_final(cs, image_path, dest, compress):
     except Exception as e:
         print(f"Cannot stat archive {archive_name}: {e}")
         error()
+    else:
+        final_archive_size_bytes = size
 
     remote_dir = f"root@{dest}:{image_path}"
+    remote_archive = os.path.join(image_path, os.path.basename(archive_name))
+
+    ssh_base = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        f"root@{dest}",
+    ]
+
+    try:
+        subprocess.run(
+            ssh_base + [f"rm -f {remote_archive}"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception as cleanup_err:
+        print(f"Warning: failed to remove remote final archive {remote_archive}: {cleanup_err}")
+
     if size >= RSYNC_THRESHOLD:
-        transfer_cmd = (
-            "rsync -av --inplace -e "
-            f"'ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' "
-            f"{archive_name} {remote_dir}/"
-        )
+        transfer_cmd = [
+            "rsync",
+            "-av",
+            "--inplace",
+            "--ignore-times",
+            "-e",
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            archive_name,
+            f"{remote_dir}/",
+        ]
     else:
-        transfer_cmd = (
-            f"scp -q -o StrictHostKeyChecking=no "
-            f"-o UserKnownHostsFile=/dev/null {archive_name} {remote_dir}/"
-        )
+        transfer_cmd = [
+            "scp",
+            "-q",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            archive_name,
+            f"{remote_dir}/",
+        ]
 
     # perform transfer with retries and exponential backoff
     max_retries = 3
@@ -1217,17 +1302,29 @@ def xfer_final(cs, image_path, dest, compress):
     success = False
     while attempt < max_retries:
         attempt += 1
-        print(f"Transferring final dump to {dest} using: {transfer_cmd} (attempt {attempt})")
+        print(f"Transferring final dump to {dest} (attempt {attempt})")
         start = time.perf_counter() * 1000
-        ret = os.system(transfer_cmd)
+        result = subprocess.run(
+            transfer_cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         end = time.perf_counter() * 1000
         dump_xfer_time = end - start
-        print(f"Final dump xfer attempt {attempt}: {dump_xfer_time:.3f} ms")
-        if ret == 0:
+        effective_mbps = 0.0
+        if dump_xfer_time > 0:
+            effective_mbps = (size * 8.0) / (dump_xfer_time / 1000.0) / 1_000_000
+        print(f"Final dump xfer attempt {attempt}: {dump_xfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
+        if result.returncode == 0:
             success = True
             break
         else:
-            print(f"Final dump transfer failed (attempt {attempt}), ExitCode: {ret}")
+            print(
+                f"Final dump transfer failed (attempt {attempt}), ExitCode: {result.returncode}, "
+                f"stderr: {result.stderr.strip()}"
+            )
             if attempt < max_retries:
                 backoff = 2 ** attempt
                 print(f"Retrying after {backoff}s...")
@@ -2086,6 +2183,7 @@ if __name__ == "__main__":
     if pre:
         print("Total pre-dump size: {:.3f} KB".format(pre_dump_size_total / 1024))  # 转换为 KB
     print("Total dump size:{:.3f} KB".format(dump_size / 1024))  # 转换为 KB
+    print("Total compression time: {:.0f} ms".format(total_compression_time))
 
     compression_overhead = total_compression_time if total_compression_time > 0 else 0.0
 
@@ -2136,6 +2234,8 @@ if __name__ == "__main__":
 
     if compress >= 0:
         total_compressed_size = get_compressed_files_size(mig_base, compress)
+        if final_archive_size_bytes > 0:
+            total_compressed_size += final_archive_size_bytes
 
         if total_uncompressed_size > 0 and total_compressed_size > 0:
             compression_ratio = (total_compressed_size / total_uncompressed_size) * 100.0
@@ -2153,37 +2253,59 @@ if __name__ == "__main__":
         print(f"Compression Ratio: {compression_ratio:.2f} %")
 
     # 输出数据行
+    output_metrics = []
     output_values = []
 
     if pre:
+        output_metrics.extend(["pre_dump_time_total_ms", "pre_dump_xfer_time_total_ms"])
         output_values.extend([int(round(pre_dump_time_total)), int(round(pre_dump_xfer_time_total))])
+    else:
+        output_metrics.extend(["pre_dump_time_total_ms", "pre_dump_xfer_time_total_ms"])
+        output_values.extend(["NA", "NA"])
 
+    output_metrics.extend(["dump_time_ms", "dump_xfer_time_ms", "restore_time_ms"])
     output_values.extend([int(round(dump_time)), int(round(dump_xfer_time)), int(round(rst_time))])
 
+    output_metrics.append("pre_dump_size_kb")
     if pre:
-        output_values.append("{:.2f}".format(pre_dump_size_total / 1024))  # 预拷贝大小以KB为单位
+        output_values.append("{:.2f}".format(pre_dump_size_total / 1024))
     else:
-        output_values.append("")
+        output_values.append("NA")
 
-    output_values.append("{:.2f}".format(dump_size / 1024))  # dump_size以KB为单位
+    output_metrics.append("dump_size_kb")
+    output_values.append("{:.2f}".format(dump_size / 1024))
 
-    output_values.extend([int(round(total_time)), int(round(stop_time))])
-    output_values.append(int(round(total_size)))
+    output_metrics.extend(["total_time_ms", "downtime_ms", "total_migrate_size_kb"])
+    output_values.extend([int(round(total_time)), int(round(stop_time)), int(round(total_size))])
+
     if post:
+        output_metrics.extend(["faulted_pages_xfer_time_ms", "faulted_pages_size_kb"])
         output_values.extend([int(round(rpf_handle_time)), "{:.2f}".format(total_uffd_copy)])
-    if pre:
-        output_values.append(int(round(pre_dump_iters)))
-    # print("aaaaaaaaaaaaaaaa")
+    else:
+        output_metrics.extend(["faulted_pages_xfer_time_ms", "faulted_pages_size_kb"])
+        output_values.extend(["NA", "NA"])
+
+    output_metrics.append("pre_dump_iterations")
+    output_values.append(int(round(pre_dump_iters)) if pre else "NA")
+
+    output_metrics.append("total_compression_time_ms")
     output_values.append(int(round(total_compression_time)))
+
+    output_metrics.append("compression_ratio_percent")
     output_values.append("{:.2f}".format(compression_ratio))
-    print("\t".join(map(str, output_values)))
+
+    metrics_line = "\t".join(map(str, output_metrics))
+    values_line = "\t".join(map(str, output_values))
+
+    print(f"METRIC_HEADER\t{metrics_line}")
+    print(f"METRIC_VALUES\t{values_line}")
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")
 
-    output_line = "\t".join(map(str, output_values))
     # 将结果追加写入 results.txt 文件
     with open("results.txt", "a") as f:
-        f.write(output_line + "\n")
+        f.write(metrics_line + "\n")
+        f.write(values_line + "\n")
 
     if diskless:
         post_process(max_iter)

@@ -170,8 +170,7 @@ def handle_prepare(prepare_info):
             extract_path = image_path
             if compress == 0:
                 # 无压缩
-                # cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -zxf - -C {extract_path}"
+                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
             elif compress >= 1 and compress <= 4:
                 # 使用lzo_gpu解压：先解压lzo，再解压tar
                 lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
