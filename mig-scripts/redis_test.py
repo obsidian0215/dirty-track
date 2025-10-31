@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Optional
 from result_writer import extract_stats_from_output, append_result
 import shlex
 
@@ -158,16 +159,69 @@ def source_clean():
 
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
+    """Adjust keepalived priority with concise logging."""
+
     config_path = "/etc/keepalived/keepalived.conf"
     pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
+    prefix = "[vip]"
+    location = "remote" if is_remote else "local"
 
-    restart_cmd = "sudo systemctl restart keepalived"
-    status_cmd = "sudo systemctl is-active keepalived"
+    def modify_file(content: str) -> Optional[str]:
+        match = re.search(pattern, content)
+        if not match:
+            print(f"{prefix} {location}: priority entry not found")
+            return None
+        original_priority = match.group(2)
+        print(f"{prefix} {location}: priority {original_priority} -> {new_priority}")
+        return re.sub(pattern, lambda m: f"{m.group(1)}{new_priority}{m.group(3)}", content, count=1)
+
+    def restart_keepalived_remote(ip: str) -> bool:
+        restart_cmd = "sudo systemctl restart keepalived"
+        status_cmd = "sudo systemctl is-active keepalived"
+        print(f"{prefix} remote: restart keepalived")
+        result = subprocess.run(
+            f"ssh {ip} '{restart_cmd}'",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"{prefix} remote: restart failed -> {result.stderr.strip()}")
+            return False
+        status = subprocess.run(
+            f"ssh {ip} '{status_cmd}'",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if status.returncode == 0 and status.stdout.strip() == "active":
+            print(f"{prefix} remote: keepalived active")
+            return True
+        print(f"{prefix} remote: keepalived not active -> {status.stderr.strip()}")
+        return False
+
+    def restart_keepalived_local() -> bool:
+        restart_cmd = "sudo systemctl restart keepalived"
+        status_cmd = "sudo systemctl is-active keepalived"
+        print(f"{prefix} local: restart keepalived")
+        result = subprocess.run(restart_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print(f"{prefix} local: restart failed -> {result.stderr.strip()}")
+            return False
+        status = subprocess.run(status_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if status.returncode == 0 and status.stdout.strip() == "active":
+            print(f"{prefix} local: keepalived active")
+            return True
+        print(f"{prefix} local: keepalived not active -> {status.stderr.strip()}")
+        return False
 
     try:
         if is_remote:
             if not target_ip:
-                raise ValueError("Target IP required for remote")
+                raise ValueError("target_ip is required when is_remote=True")
+            print(f"{prefix} remote: read {config_path}")
             result = subprocess.run(
                 f"ssh {target_ip} 'cat {config_path}'",
                 shell=True,
@@ -176,58 +230,40 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
                 text=True,
             )
             if result.returncode != 0:
-                print("Failed to read remote config:", result.stderr)
+                print(f"{prefix} remote: read failed -> {result.stderr.strip()}")
                 return False
-            content = result.stdout
-            updated_content = re.sub(pattern, lambda m: f"{m.group(1)}{new_priority}{m.group(3)}", content)
+            updated = modify_file(result.stdout)
+            if updated is None:
+                return False
+            print(f"{prefix} remote: write {config_path}")
             write_result = subprocess.run(
-                f"ssh {target_ip} \"echo '{updated_content}' > {config_path}\"",
+                f"ssh {target_ip} \"cat <<'EOF' > {config_path}\n{updated}\nEOF\"",
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             if write_result.returncode != 0:
-                print("Failed to write remote config:", write_result.stderr)
+                print(f"{prefix} remote: write failed -> {write_result.stderr.strip()}")
                 return False
-            result = subprocess.run(
-                f"ssh {target_ip} '{restart_cmd}'",
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if result.returncode != 0:
-                print("Failed to restart remote keepalived:", result.stderr)
-                return False
-            status = subprocess.run(
-                f"ssh {target_ip} '{status_cmd}'", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            if status.returncode == 0 and status.stdout.strip() == "active":
-                print("Keepalived restarted successfully on remote.")
-                return True
-            else:
-                print("Keepalived failed to restart on remote.")
+            if not restart_keepalived_remote(target_ip):
                 return False
         else:
-            with open(config_path, "r") as f:
+            print(f"{prefix} local: read {config_path}")
+            with open(config_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            updated_content = re.sub(pattern, lambda m: f"{m.group(1)}{new_priority}{m.group(3)}", content)
-            with open(config_path, "w") as f:
-                f.write(updated_content)
-            result = subprocess.run(restart_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode != 0:
-                print("Failed to restart local keepalived:", result.stderr)
+            updated = modify_file(content)
+            if updated is None:
                 return False
-            status = subprocess.run(status_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if status.returncode == 0 and status.stdout.strip() == "active":
-                print("Keepalived restarted successfully locally.")
-                return True
-            else:
-                print("Keepalived failed to restart locally.")
+            print(f"{prefix} local: write {config_path}")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(updated)
+            if not restart_keepalived_local():
                 return False
-    except Exception as e:
-        print(f"Error updating keepalived: {e}")
+        print(f"{prefix} {location}: priority update done")
+        return True
+    except Exception as exc:
+        print(f"{prefix} {location}: error -> {exc}")
         return False
 
 

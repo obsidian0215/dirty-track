@@ -4,6 +4,7 @@ import subprocess
 import shlex
 import sys
 import time
+from typing import Optional
 from result_writer import extract_stats_from_output, append_result
 
 from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
@@ -117,11 +118,12 @@ def destination_prepare():
     run_remote_cmd(recvtty_cmd, target_ip=DEST_IP, ignore_error=False)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
-    script_name = DEST_SCRIPT.replace('.', '_')
-    dest_log = f"/tmp/{script_name}_{container_name}_{ts}.log"
+    dest_script = DEST_SCRIPT
+    log_tag = dest_script.replace('.', '_')
+    dest_log = f"/tmp/{log_tag}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     start_dest_cmd = (
-        f"nohup python3 /runc/dirty-track/mig-scripts/{script_name}.py > {dest_log} 2>&1 "
+        f"nohup python3 /runc/dirty-track/mig-scripts/{dest_script} > {dest_log} 2>&1 "
         "& echo $! > "
         f"{dest_pidfile}"
     )
@@ -200,92 +202,69 @@ def source_clean():
 
 
 def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
-    """
-    修改 keepalived 配置文件中的 priority 参数，支持本地和远程执行。
+    """Adjust keepalived priority with concise logging."""
 
-    参数:
-    - new_priority: 要设置的新优先级 (整数)。
-    - is_remote: 是否在远程机器上执行 (默认: False)。
-    - target_ip: 远程目标机器的 IP 地址 (仅在 is_remote=True 时有效)。
-
-    返回:
-    - True: 修改成功。
-    - False: 修改失败。
-    """
-
-    # 配置文件路径 (固定值)
     config_path = "/etc/keepalived/keepalived.conf"
-    # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
     pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
+    prefix = "[vip]"
+    location = "remote" if is_remote else "local"
 
-    # 定义修改文件的函数
-    def modify_file(content):
-        if not re.search(pattern, content):
-            print("未找到匹配的 vrrp_instance VI_1 块或 priority 参数")
+    def modify_file(content: str) -> Optional[str]:
+        match = re.search(pattern, content)
+        if not match:
+            print(f"{prefix} {location}: priority entry not found")
             return None
+        original_priority = match.group(2)
+        print(f"{prefix} {location}: priority {original_priority} -> {new_priority}")
+        return re.sub(pattern, lambda m: f"{m.group(1)}{new_priority}{m.group(3)}", content, count=1)
 
-        def repl(match):
-            original_priority = match.group(2)
-            print(f"将 VIP 的优先级从 {original_priority} 修改为 {new_priority}")
-            return f"{match.group(1)}{new_priority}{match.group(3)}"
-
-        return re.sub(pattern, repl, content)
-
-    def restart_keepalived(is_remote=False, target_ip=None):
+    def restart_keepalived_remote(ip: str) -> bool:
         restart_cmd = "sudo systemctl restart keepalived"
         status_cmd = "sudo systemctl is-active keepalived"
+        print(f"{prefix} remote: restart keepalived")
+        result = subprocess.run(
+            f"ssh {ip} '{restart_cmd}'",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"{prefix} remote: restart failed -> {result.stderr.strip()}")
+            return False
+        status = subprocess.run(
+            f"ssh {ip} '{status_cmd}'",
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if status.returncode == 0 and status.stdout.strip() == "active":
+            print(f"{prefix} remote: keepalived active")
+            return True
+        print(f"{prefix} remote: keepalived not active -> {status.stderr.strip()}")
+        return False
 
-        if is_remote:
-            if not target_ip:
-                raise ValueError("在远程执行时，必须提供目标机器的 IP 地址。")
-            # 重启远程服务
-            print(f"在远程机器 {target_ip} 重启 keepalived 服务...")
-            result = subprocess.run(
-                f"ssh {target_ip} '{restart_cmd}'",
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(f"远程重启 keepalived 失败: {result.stderr}")
-                return False
-
-            # 检查服务状态
-            status = subprocess.run(
-                f"ssh {target_ip} '{status_cmd}'", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            if status.returncode == 0 and status.stdout.strip() == "active":
-                print("远程 keepalived 服务已成功重启并处于活动状态。")
-                return True
-            else:
-                print("远程 keepalived 服务未能成功重启或未处于活动状态。")
-                return False
-
-        else:
-            # 重启本地服务
-            print("在本地机器重启 keepalived 服务...")
-            result = subprocess.run(restart_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode != 0:
-                print(f"本地重启 keepalived 失败: {result.stderr}")
-                return False
-
-            # 检查服务状态
-            status = subprocess.run(status_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if status.returncode == 0 and status.stdout.strip() == "active":
-                print("本地 keepalived 服务已成功重启并处于活动状态。")
-                return True
-            else:
-                print("本地 keepalived 服务未能成功重启或未处于活动状态。")
-                return False
+    def restart_keepalived_local() -> bool:
+        restart_cmd = "sudo systemctl restart keepalived"
+        status_cmd = "sudo systemctl is-active keepalived"
+        print(f"{prefix} local: restart keepalived")
+        result = subprocess.run(restart_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print(f"{prefix} local: restart failed -> {result.stderr.strip()}")
+            return False
+        status = subprocess.run(status_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if status.returncode == 0 and status.stdout.strip() == "active":
+            print(f"{prefix} local: keepalived active")
+            return True
+        print(f"{prefix} local: keepalived not active -> {status.stderr.strip()}")
+        return False
 
     try:
         if is_remote:
             if not target_ip:
-                raise ValueError("在远程执行时，必须提供目标机器的 IP 地址。")
-
-            # 远程读取配置文件内容
-            print(f"从远程机器 {target_ip} 读取配置文件...")
+                raise ValueError("target_ip is required when is_remote=True")
+            print(f"{prefix} remote: read {config_path}")
             result = subprocess.run(
                 f"ssh {target_ip} 'cat {config_path}'",
                 shell=True,
@@ -294,53 +273,40 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
                 text=True,
             )
             if result.returncode != 0:
-                print(f"远程读取配置文件失败: {result.stderr}")
+                print(f"{prefix} remote: read failed -> {result.stderr.strip()}")
                 return False
-
-            content = result.stdout
-            updated_content = modify_file(content)
-            if updated_content is None:
+            updated = modify_file(result.stdout)
+            if updated is None:
                 return False
-
-            # 将修改后的内容写回远程文件
-            print(f"将修改后的内容写回远程机器 {target_ip}...")
+            print(f"{prefix} remote: write {config_path}")
             write_result = subprocess.run(
-                f"ssh {target_ip} \"echo '{updated_content}' > {config_path}\"",
+                f"ssh {target_ip} \"cat <<'EOF' > {config_path}\n{updated}\nEOF\"",
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             if write_result.returncode != 0:
-                print(f"远程写入配置文件失败: {write_result.stderr}")
+                print(f"{prefix} remote: write failed -> {write_result.stderr.strip()}")
                 return False
-
-            # 重启远程服务
-            if not restart_keepalived(is_remote=True, target_ip=target_ip):
+            if not restart_keepalived_remote(target_ip):
                 return False
         else:
-            # 本地读取配置文件内容
-            print("从本地读取配置文件...")
-            with open(config_path, "r") as f:
+            print(f"{prefix} local: read {config_path}")
+            with open(config_path, "r", encoding="utf-8") as f:
                 content = f.read()
-
-            updated_content = modify_file(content)
-            if updated_content is None:
+            updated = modify_file(content)
+            if updated is None:
                 return False
-
-            # 写回本地配置文件
-            print("将修改后的内容写回本地配置文件...")
-            with open(config_path, "w") as f:
-                f.write(updated_content)
-
-            if not restart_keepalived(is_remote=False):
+            print(f"{prefix} local: write {config_path}")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(updated)
+            if not restart_keepalived_local():
                 return False
-
-        print("成功修改配置文件中的 priority 参数")
+        print(f"{prefix} {location}: priority update done")
         return True
-
-    except Exception as e:
-        print(f"修改配置文件时出错: {e}")
+    except Exception as exc:
+        print(f"{prefix} {location}: error -> {exc}")
         return False
 
 

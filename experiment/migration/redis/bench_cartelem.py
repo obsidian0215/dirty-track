@@ -42,6 +42,39 @@ handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
+class RateLimiter:
+    """Thread-safe token bucket to cap requests-per-second across threads."""
+
+    def __init__(self, rate: Optional[int]):
+        self.rate = rate
+        if rate:
+            self._capacity = float(rate)
+            self._tokens = float(rate)
+            self._last_refill = time.monotonic()
+            self._lock = threading.Lock()
+
+    def acquire(self):
+        if not self.rate:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    refill = elapsed * self._capacity
+                    self._tokens = min(self._capacity, self._tokens + refill)
+                    self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                deficit = 1.0 - self._tokens
+                wait_time = deficit / self._capacity
+
+            time.sleep(wait_time)
+
 class CarTelematicsBench:
     """车联网写入 Redis Stream 的负载发生器"""
     def __init__(self, redis_host: str, redis_port: int, stream_name: str = "vehicle:telemetry",
@@ -78,8 +111,7 @@ class CarTelematicsBench:
 
         # 消息速率控制配置
         self.max_requests_per_second = max_requests_per_second
-        self.request_timestamps = []  # 滑动窗口时间戳列表
-        self.min_interval_per_request = None
+        self._rate_limiter = RateLimiter(max_requests_per_second)
 
         # 数据生命周期管理
         self.target_db_size_mb = target_db_size_mb  # 目标数据库大小(MB)
@@ -114,48 +146,14 @@ class CarTelematicsBench:
         self.last_report_time = 0
         self.last_success_count = 0
 
-        # 计算速率控制参数
-        if self.max_requests_per_second:
-            self.min_interval_per_request = 1.0 / self.max_requests_per_second
-        else:
-            self.min_interval_per_request = None  # 无速率限制
-
     def _rate_controller(self, op_start_time: float):
-        """控制消息发送速率 - 改进版本使用滑动窗口"""
-        if self.min_interval_per_request is None:
-            return  # 无速率限制，使用原有逻辑
-
-        with self.lock:  # 保护整个速率控制逻辑
-            current_time = time.time()
-
-            if hasattr(self, 'request_timestamps') and self.request_timestamps:
-                # 清理过期时间戳（超过1秒）
-                cutoff_time = current_time - 1.0
-                self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
-
-                # 检查是否达到限制
-                if self.max_requests_per_second and len(self.request_timestamps) >= self.max_requests_per_second:
-                    # 计算需要等待的时间
-                    earliest_timestamp = self.request_timestamps[0]
-                    wait_time = self.min_interval_per_request - (current_time - earliest_timestamp)
-                    if wait_time > 0:
-                        time.sleep(wait_time)
-                    # 重新清理
-                    current_time = time.time()
-                    self.request_timestamps = [t for t in self.request_timestamps if t > current_time - 1.0]
-
-            # 记录此次请求
-            if not hasattr(self, 'request_timestamps'):
-                self.request_timestamps = []
-            self.request_timestamps.append(current_time)
-            # 保持列表大小，避免内存膨胀
-            if self.max_requests_per_second:
-                self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
+        """Control global request rate via token bucket."""
+        self._rate_limiter.acquire()
 
     def _init_connection_pool(self):
         """初始化Redis连接池"""
         if self.connection_pool is None:
-            self.connection_pool = redis.ConnectionPool(
+            self.connection_pool = redis.ConnectionPool(  # type: ignore[attr-defined]
                 host=self.redis_host,
                 port=self.redis_port,
                 socket_connect_timeout=self.connect_timeout,
@@ -310,7 +308,7 @@ class CarTelematicsBench:
         return payload
 
     def _worker(self, duration, pool):
-        r = redis.Redis(connection_pool=pool, decode_responses=True)
+        r = redis.Redis(connection_pool=pool, decode_responses=True)  # type: ignore[attr-defined]
         end_time = time.time() + duration
         vehicle_id = None  # 为每个线程维护车辆ID以保持连续性
         op_start_time = time.time()

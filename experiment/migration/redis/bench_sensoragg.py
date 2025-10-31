@@ -44,6 +44,39 @@ handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
+class RateLimiter:
+    """Thread-safe token bucket to enforce a global requests-per-second cap."""
+
+    def __init__(self, rate: Optional[int]):
+        self.rate = rate
+        if rate:
+            self._capacity = float(rate)
+            self._tokens = float(rate)
+            self._last_refill = time.monotonic()
+            self._lock = threading.Lock()
+
+    def acquire(self):
+        if not self.rate:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    refill = elapsed * self._capacity
+                    self._tokens = min(self._capacity, self._tokens + refill)
+                    self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                deficit = 1.0 - self._tokens
+                wait_time = deficit / self._capacity
+
+            time.sleep(wait_time)
+
 class SensorAggBench:
     """增强版传感器聚合基准测试，支持真实传感器模拟、数据规模扩展和连接管理"""
     def __init__(self, redis_host: str, redis_port: int, set_key: str = "sensors:ts",
@@ -111,18 +144,14 @@ class SensorAggBench:
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
-        if self.max_requests_per_second:
-            # 重置速率控制状态
-            self.request_timestamps = []
-            self.request_interval = 1.0 / self.max_requests_per_second
-        else:
-            # 初始化为空列表避免错误
-            self.request_timestamps = []
+        self._rate_limiter = RateLimiter(max_requests_per_second)
+
+        self.request_count = 0
 
     def _init_connection_pool(self):
         """初始化Redis连接池"""
         if self.connection_pool is None:
-            self.connection_pool = redis.ConnectionPool(
+            self.connection_pool = redis.ConnectionPool(  # type: ignore[attr-defined]
                 host=self.redis_host,
                 port=self.redis_port,
                 socket_connect_timeout=self.connect_timeout,
@@ -280,34 +309,11 @@ class SensorAggBench:
         return sensor_data
 
     def _rate_control(self):
-        """实现精确的速率控制"""
-        if not self.max_requests_per_second:
-            return
-
-        current_time = time.time()
-
-        # 清理过期的时间戳（超过1秒）
-        cutoff_time = current_time - 1.0
-        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
-
-        # 如果未达到速率限制，直接允许
-        if len(self.request_timestamps) < self.max_requests_per_second:
-            self.request_timestamps.append(current_time)
-            return
-
-        # 计算需要等待的时间
-        earliest_timestamp = self.request_timestamps[0] if self.request_timestamps else current_time
-        wait_time = self.request_interval - (current_time - earliest_timestamp)
-        if wait_time > 0:
-            time.sleep(wait_time)
-
-        # 记录本次请求时刻
-        self.request_timestamps.append(time.time())
-        # 再次清理以保持列表大小
-        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
+        """Global rate control shared across worker threads."""
+        self._rate_limiter.acquire()
 
     def _worker(self, duration: float, read_pct: int, pool):
-        r = redis.Redis(connection_pool=pool, decode_responses=True)
+        r = redis.Redis(connection_pool=pool, decode_responses=True)  # type: ignore[attr-defined]
         end_time = time.time() + duration
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct

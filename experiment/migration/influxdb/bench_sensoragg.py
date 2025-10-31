@@ -44,6 +44,40 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
 
+class RateLimiter:
+    """Thread-safe token bucket to enforce RPS in multi-threaded writers."""
+
+    def __init__(self, rate: Optional[int]):
+        self.rate = rate
+        if rate:
+            self._capacity = float(rate)
+            self._tokens = float(rate)
+            self._last_refill = time.monotonic()
+            self._lock = threading.Lock()
+
+    def acquire(self):
+        if not self.rate:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    refill = elapsed * self._capacity
+                    self._tokens = min(self._capacity, self._tokens + refill)
+                    self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                deficit = 1.0 - self._tokens
+                wait_time = deficit / self._capacity
+
+            time.sleep(wait_time)
+
+
 class SensorInfluxBench:
     """Enhanced Sensor Aggregator InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "sensor-data",
@@ -88,13 +122,7 @@ class SensorInfluxBench:
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
-        if self.max_requests_per_second:
-            # 重置速率控制状态
-            self.request_timestamps = []
-            self.request_interval = 1.0 / self.max_requests_per_second
-        else:
-            # 初始化为空列表避免错误
-            self.request_timestamps = []
+        self._rate_limiter = RateLimiter(max_requests_per_second)
 
         # Retention配置跟踪
         self._retention_configured = False
@@ -358,30 +386,7 @@ class SensorInfluxBench:
 
     def _rate_control(self):
         """实现精确的速率控制"""
-        if not self.max_requests_per_second:
-            return
-
-        current_time = time.time()
-
-        # 清理过期的时间戳（超过1秒）
-        cutoff_time = current_time - 1.0
-        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
-
-        # 如果未达到速率限制，直接允许
-        if len(self.request_timestamps) < self.max_requests_per_second:
-            self.request_timestamps.append(current_time)
-            return
-
-        # 计算需要等待的时间
-        earliest_timestamp = self.request_timestamps[0] if self.request_timestamps else current_time
-        wait_time = self.request_interval - (current_time - earliest_timestamp)
-        if wait_time > 0:
-            time.sleep(wait_time)
-
-        # 记录本次请求时刻
-        self.request_timestamps.append(time.time())
-        # 再次清理以保持列表大小
-        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
+        self._rate_limiter.acquire()
 
     def _worker(self, duration: float, read_pct: int):
         """Worker thread for mixed read/write operations"""

@@ -38,6 +38,39 @@ handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 
+class RateLimiter:
+    """Thread-safe token bucket shared across worker threads."""
+
+    def __init__(self, rate: Optional[int]):
+        self.rate = rate
+        if rate:
+            self._capacity = float(rate)
+            self._tokens = float(rate)
+            self._last_refill = time.monotonic()
+            self._lock = threading.Lock()
+
+    def acquire(self):
+        if not self.rate:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    refill = elapsed * self._capacity
+                    self._tokens = min(self._capacity, self._tokens + refill)
+                    self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                deficit = 1.0 - self._tokens
+                wait_time = deficit / self._capacity
+
+            time.sleep(wait_time)
+
 
 class SensorHashBench:
     """Hash+List传感器聚合基准测试，完全不同的内存访问模式"""
@@ -89,11 +122,7 @@ class SensorHashBench:
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
-        if self.max_requests_per_second:
-            self.request_timestamps = []
-            self.request_interval = 1.0 / self.max_requests_per_second
-        else:
-            self.request_timestamps = []
+        self._rate_limiter = RateLimiter(max_requests_per_second)
 
         # 监控配置
         self.monitor_interval = 1.0
@@ -108,7 +137,7 @@ class SensorHashBench:
     def _init_connection_pool(self):
         """初始化连接池"""
         if not hasattr(self, '_connection_pool'):
-            self._connection_pool = redis.ConnectionPool(
+            self._connection_pool = redis.ConnectionPool(  # type: ignore[attr-defined]
                 host=self.redis_host,
                 port=self.redis_port,
                 socket_connect_timeout=self.connect_timeout,
@@ -171,24 +200,10 @@ class SensorHashBench:
 
     def _rate_control(self):
         """速率控制"""
-        if not self.max_requests_per_second:
-            return
-
-        current_time = time.time()
-        cutoff_time = current_time - 1.0
-        self.request_timestamps = [t for t in self.request_timestamps if t > cutoff_time]
-
-        if len(self.request_timestamps) >= self.max_requests_per_second:
-            earliest = self.request_timestamps[0]
-            wait_time = self.request_interval - (current_time - earliest)
-            if wait_time > 0:
-                time.sleep(wait_time)
-
-        self.request_timestamps.append(time.time())
-        self.request_timestamps = self.request_timestamps[-self.max_requests_per_second:]
+        self._rate_limiter.acquire()
 
     def _worker(self, duration: float, read_pct: int, pool):
-        r = redis.Redis(connection_pool=pool, decode_responses=True)
+        r = redis.Redis(connection_pool=pool, decode_responses=True)  # type: ignore[attr-defined]
         end_time = time.time() + duration
 
         while time.time() < end_time and not self._stop.is_set():
