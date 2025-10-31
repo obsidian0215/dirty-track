@@ -5,7 +5,7 @@ import sys
 import time
 from result_writer import extract_stats_from_output, append_result
 
-from cmd_utils import run_cmd, run_remote_cmd
+from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 
 # default script selection
 from script_defaults import choose_scripts, get_default_ips
@@ -208,7 +208,7 @@ def source_clean():
     # 清理console.sock
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True)
     # 清理 dirtypages的挂载
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
+    unmount_local_migration_tmpfs(container_name)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd("ps aux | grep 'inotifywait' | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True)

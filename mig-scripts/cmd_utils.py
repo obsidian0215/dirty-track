@@ -1,3 +1,5 @@
+import glob
+import os
 import shlex
 import subprocess
 import sys
@@ -37,11 +39,15 @@ def run_cmd(
     )
 
     if result.returncode != 0:
-        print(f"[{label}] command failed (exit {result.returncode}): {display}")
-        if result.stdout:
-            print("[stdout]\n" + result.stdout.rstrip())
-        if result.stderr:
-            print("[stderr]\n" + result.stderr.rstrip())
+        suppress_output = quiet and ignore_error
+
+        if not suppress_output:
+            print(f"[{label}] command failed (exit {result.returncode}): {display}")
+            if result.stdout:
+                print("[stdout]\n" + result.stdout.rstrip())
+            if result.stderr:
+                print("[stderr]\n" + result.stderr.rstrip())
+
         if not ignore_error:
             sys.exit(result.returncode if result.returncode else 1)
     else:
@@ -70,3 +76,20 @@ def run_remote_cmd(
         full_cmd = f"ssh {target_ip} {quoted}"
 
     return run_cmd(full_cmd, ignore_error=ignore_error, quiet=quiet, label=f"remote:{target_ip}")
+
+
+def unmount_local_migration_tmpfs(
+    container_name: str,
+    *,
+    ignore_error: bool = True,
+    quiet: bool = True,
+) -> None:
+    """Unmount expected tmpfs mountpoints under the container's migrate directory."""
+
+    base = os.path.join("/runc/containers", container_name, "migrate")
+    candidates = [os.path.join(base, leaf) for leaf in ("image", "dirty_map")]
+    candidates.extend(sorted(glob.glob(os.path.join(base, "parent_*"))))
+
+    for path in candidates:
+        if os.path.isdir(path) and os.path.ismount(path):
+            run_cmd(["umount", path], ignore_error=ignore_error, quiet=quiet)

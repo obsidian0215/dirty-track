@@ -6,7 +6,7 @@ import sys
 import time
 from result_writer import extract_stats_from_output, append_result
 
-from cmd_utils import run_cmd, run_remote_cmd
+from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -187,7 +187,7 @@ def source_clean():
     # 清理console.sock
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True)
     # 清理 dirtypages的挂载
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
+    unmount_local_migration_tmpfs(container_name)
     run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
     # run_cmd("rm -rf /runc/containers/elasticsearch/rootfs/usr/share/elasticsearch/data/*", ignore_error=True)
@@ -340,8 +340,6 @@ def update_keepalived_priority(new_priority, is_remote=False, target_ip=None):
         print(f"修改配置文件时出错: {e}")
         return False
 
-
-def clean_configure_network():
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
     """Configure tc shaping rules locally or on a remote host."""
     if is_remote and not target_ip:

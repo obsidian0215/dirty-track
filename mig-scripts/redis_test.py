@@ -6,7 +6,7 @@ import time
 from result_writer import extract_stats_from_output, append_result
 import shlex
 
-from cmd_utils import run_cmd, run_remote_cmd
+from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 
 # 默认设置
 from script_defaults import choose_scripts, get_default_ips
@@ -150,7 +150,7 @@ def source_prepare():
 def source_clean():
     container_name = "redis"
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True)
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
+    unmount_local_migration_tmpfs(container_name)
     run_cmd(f"runc kill {container_name}", ignore_error=True)
     run_cmd(f"runc delete {container_name}", ignore_error=True)
     run_cmd("ps aux | grep 'inotifywait' | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True)

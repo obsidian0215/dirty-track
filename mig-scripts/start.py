@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime
 
-from cmd_utils import run_cmd, run_remote_cmd
+from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 from result_writer import append_result, extract_stats_from_output
 
 # 默认设置
@@ -224,8 +224,8 @@ def source_clean(args):
     container_name = args.container
     # 清理 console.sock
     run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true", ignore_error=True, quiet=True)
-    # 清理 dirtypages 的挂载, 可忽略错误(有时候挂载都清理完毕了)
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True, quiet=True)
+    # 清理 dirtypages 的挂载
+    unmount_local_migration_tmpfs(container_name)
     run_cmd(f"runc kill {container_name}", ignore_error=True, quiet=True)  # 如果容器不存在可忽略错误
     run_cmd(f"runc delete {container_name}", ignore_error=True, quiet=True)  # 如果容器不存在可忽略错误
     run_cmd(
@@ -297,16 +297,14 @@ def destination_clean(args):
     cmds = [
         (f"runc kill {container_name}", True),  # 如果容器不存在可忽略错误
         (f"runc delete {container_name}", True),  # 如果容器不存在可忽略错误
-        ("kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null || true", True),  # 杀死 recvtty 进程
-        ("ps aux | grep 'recvtty' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
-        ("ps aux | grep '[n]c -lp' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
+            ("kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null || true", True),  # 杀死 recvtty 进程
+            ("ps aux | grep 'recvtty' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
     ]
 
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign, quiet=True)
 
     # 兜底直接 pkill nc 监听，确保不遗留还有后台进程
-    run_remote_cmd("pkill -f 'nc -lp'", target_ip=DEST_IP, ignore_error=True, quiet=True)
 
     # 停止 destination 后台进程（如果存在）并移除 pid 文件
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
@@ -370,10 +368,10 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     # 清空网络配置
-    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True)
-    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True)
+    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True, quiet=True)
+    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", target_ip=DEST_IP, ignore_error=True, quiet=True)
     if VIP_IP:
-        run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=CLIENT_IP, ignore_error=True)
+        run_remote_cmd("sudo tc qdisc del dev ens33 root", target_ip=CLIENT_IP, ignore_error=True, quiet=True)
 
 
 def configure_network():
