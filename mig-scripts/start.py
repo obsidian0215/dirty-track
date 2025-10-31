@@ -221,14 +221,22 @@ def source_run_migration(args, exp_args, run_index: int, exp_name: str):
 
 def source_clean(args):
     container_name = args.container
-    # 清理console.sock
-    run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True)
-    # 清理 dirtypages的挂载, 可忽略错误(有时候挂载都清理完毕了)
-    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True)
-    run_cmd(f"runc kill {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
-    run_cmd(f"runc delete {container_name}", ignore_error=True)  # 如果容器不存在可忽略错误
-    run_cmd("ps aux | grep 'inotifywait' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", ignore_error=True)
-    run_cmd("ps aux | grep 'sync_rootfs' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", ignore_error=True)
+    # 清理 console.sock
+    run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null || true", ignore_error=True, quiet=True)
+    # 清理 dirtypages 的挂载, 可忽略错误(有时候挂载都清理完毕了)
+    run_cmd(f"umount /runc/containers/{container_name}/migrate/*", ignore_error=True, quiet=True)
+    run_cmd(f"runc kill {container_name}", ignore_error=True, quiet=True)  # 如果容器不存在可忽略错误
+    run_cmd(f"runc delete {container_name}", ignore_error=True, quiet=True)  # 如果容器不存在可忽略错误
+    run_cmd(
+        "ps aux | grep 'inotifywait' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9",
+        ignore_error=True,
+        quiet=True,
+    )
+    run_cmd(
+        "ps aux | grep 'sync_rootfs' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9",
+        ignore_error=True,
+        quiet=True,
+    )
 
 
 def destination_prepare(args):
@@ -277,26 +285,29 @@ def destination_prepare(args):
 
 
 def destination_clean(args):
-    # 恢复过程结束时杀死recvtty进程
+    # 恢复过程结束时杀死 recvtty 与临时监听
     container_name = args.container
 
     cmds = [
         (f"runc kill {container_name}", True),  # 如果容器不存在可忽略错误
         (f"runc delete {container_name}", True),  # 如果容器不存在可忽略错误
-        ("kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null", True),  # 杀死recvtty进程
+        ("kill -9 $(cat /tmp/recvtty.pid) 2>/dev/null || true", True),  # 杀死 recvtty 进程
         ("ps aux | grep 'recvtty' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
-        # (f"ps aux | grep '[n]c -lp' | awk '{{print $2}}' | xargs -r kill -9", False),
         ("ps aux | grep '[n]c -lp' | grep -v grep | awk '{print \\$2}' | xargs -r kill -9", True),
     ]
 
     for c, ign in cmds:
-        run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+        run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign, quiet=True)
+
+    # 兜底直接 pkill nc 监听，确保不遗留还有后台进程
+    run_remote_cmd("pkill -f 'nc -lp'", target_ip=DEST_IP, ignore_error=True, quiet=True)
+
     # 停止 destination 后台进程（如果存在）并移除 pid 文件
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     stop_cmd = (
         f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
     )
-    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True, quiet=True)
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):

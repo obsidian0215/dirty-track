@@ -40,6 +40,33 @@ _, _, _, VIP = get_default_ips()
 rst_time = 0.0
 vip_transfer_complete = False  # 标记VIP转移是否完成
 
+
+def _monitor_listener_exit(port: int, desc: str, process: subprocess.Popen) -> None:
+    """Background observer that logs stderr when a listener dies unexpectedly."""
+    try:
+        rc = process.wait()
+        if rc not in (0, None):
+            stderr_msg = ""
+            if process.stderr is not None:
+                try:
+                    stderr_msg = process.stderr.read().decode("utf-8", errors="ignore").strip()
+                except Exception as exc:  # pragma: no cover - defensive
+                    stderr_msg = f"<failed to read stderr: {exc}>"
+            if stderr_msg:
+                logger.error("listener %s (port %s) exited with code %s: %s", desc, port, rc, stderr_msg)
+            else:
+                logger.error("listener %s (port %s) exited with code %s (no stderr)", desc, port, rc)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("monitor for listener %s (port %s) raised: %s", desc, port, exc)
+
+
+def _spawn_listener(port: int, cmd: str, desc: str) -> subprocess.Popen:
+    """Create the nc|tar listener and start a watcher for early failures."""
+    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    watcher = threading.Thread(target=_monitor_listener_exit, args=(port, desc, process), daemon=True)
+    watcher.start()
+    return process
+
 PRIORITY_RE = re.compile(r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})", re.S)
 KEEPALIVED_CONF = "/etc/keepalived/keepalived.conf"
 KEEPALIVED_BAK = "/etc/keepalived/keepalived.conf.bak"
@@ -160,9 +187,7 @@ def handle_prepare(prepare_info):
             else:
                 raise ValueError(f"不支持的压缩等级: {compress}")
             logger.info(f"启动预拷贝监听: iter={iter_num}, port={port}, path={extract_path}")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            # print("process id:",process)
-            # 将进程记录到字典中
+            process = _spawn_listener(port, cmd, f"pre-dump iter={iter_num}")
             with process_lock:
                 transfer_processes[port] = process
 
@@ -185,7 +210,7 @@ def handle_prepare(prepare_info):
                 # cmd = f"nc -lp {last_port} "
                 # cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
             logger.info(f"启动最终镜像监听: port={last_port}, path={extract_path}")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = _spawn_listener(last_port, cmd, "final dump")
             with process_lock:
                 transfer_processes[last_port] = process
         # print_transfer_processes()

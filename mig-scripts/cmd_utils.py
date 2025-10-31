@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import sys
 from typing import Optional, Sequence, Union
@@ -62,8 +63,10 @@ def run_remote_cmd(
 
     if background:
         remote_cmd = f"nohup {cmd} >/tmp/remote_bg.log 2>&1 < /dev/null & echo $!"
-        full_cmd: Command = f"ssh -n {target_ip} \"{remote_cmd}\""
+        quoted = shlex.quote(remote_cmd)
+        full_cmd: Command = f"ssh -n {target_ip} {quoted}"
     else:
-        full_cmd = f"ssh {target_ip} '{cmd}'"
+        quoted = shlex.quote(cmd)
+        full_cmd = f"ssh {target_ip} {quoted}"
 
     return run_cmd(full_cmd, ignore_error=ignore_error, quiet=quiet, label=f"remote:{target_ip}")
