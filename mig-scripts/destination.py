@@ -11,12 +11,12 @@ import subprocess
 import sys
 import threading
 import time
-import shlex
+import uuid
 from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-import psutil
+import psutil  # type: ignore[import-not-found]
 from script_defaults import get_default_ips
 
 compress = False
@@ -26,73 +26,223 @@ restore_info = None
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global variable to track port list
-INIT_PORT = 12345
-iteration_list: List[int] = []
-port_list: List[int] = [INIT_PORT]
-transfer_processes: Dict[int, subprocess.Popen] = {}
 last_iter = 0
-FINAL_DATA_PORT: Optional[int] = None
+rnd = os.path
 
-# 确保线程安全
-process_lock = threading.Lock()
+# Transfer management is handled by TransferManager (defined below)
+
+
+class TransferSession:
+    """Single inbound transfer that streams data into tar extraction."""
+
+    def __init__(
+        self,
+        desc: str,
+        extract_path: str,
+        compress: int,
+        expected_bytes: Optional[int],
+        on_finish: Optional[Callable[["TransferSession"], None]],
+    ):
+        self.desc = desc
+        self.extract_path = extract_path
+        self.compress = compress
+        self.expected_bytes = expected_bytes
+        self.token = uuid.uuid4().hex
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.bytes_received = 0
+        self.duration_ms = 0.0
+        self.error: Optional[str] = None
+        self.status: str = "pending"
+        self.done = threading.Event()
+        self.on_finish = on_finish
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        start = time.perf_counter()
+        try:
+            conn, addr = self.sock.accept()
+            with conn:
+                logger.info("transfer %s accepted connection from %s:%s", self.desc, addr[0], addr[1])
+                self.bytes_received = self._receive_stream(conn)
+                self.status = "OK"
+                logger.info(
+                    "transfer %s completed: %s bytes", self.desc, self.bytes_received
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.status = "ERROR"
+            self.error = str(exc)
+            logger.error("transfer %s failed: %s", self.desc, exc)
+        finally:
+            self.duration_ms = (time.perf_counter() - start) * 1000.0
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.done.set()
+            if self.on_finish:
+                try:
+                    self.on_finish(self)
+                except Exception as cb_exc:  # pragma: no cover - defensive
+                    logger.error("transfer %s finalize callback failed: %s", self.desc, cb_exc)
+
+    def _receive_stream(self, conn: socket.socket) -> int:
+        total = 0
+        if self.compress == 0:
+            tar_proc = subprocess.Popen(["tar", "-xf", "-", "-C", self.extract_path], stdin=subprocess.PIPE)
+            sink = tar_proc.stdin
+            lzo_proc = None
+        elif 1 <= self.compress <= 4:
+            lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
+            lzo_proc = subprocess.Popen([lzo_gpu_path, "-d", "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            tar_proc = subprocess.Popen(["tar", "-xf", "-", "-C", self.extract_path], stdin=lzo_proc.stdout)
+            if lzo_proc.stdout:
+                lzo_proc.stdout.close()
+            sink = lzo_proc.stdin
+        else:
+            raise ValueError(f"Unsupported compress level: {self.compress}")
+
+        try:
+            while True:
+                data = conn.recv(1024 * 1024)
+                if not data:
+                    break
+                if sink:
+                    sink.write(data)
+                total += len(data)
+        finally:
+            if sink:
+                try:
+                    sink.close()
+                except Exception:
+                    pass
+
+        tar_rc = tar_proc.wait()
+        if tar_rc != 0:
+            raise RuntimeError(f"tar extraction failed with code {tar_rc}")
+        if self.compress >= 1 and lzo_proc is not None:
+            lzo_rc = lzo_proc.wait()
+            if lzo_rc != 0:
+                raise RuntimeError(f"lzo_gpu decompress failed with code {lzo_rc}")
+
+        return total
+
+    def wait(self, timeout: float) -> bool:
+        return self.done.wait(timeout)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        self.done.set()
+
+
+class TransferManager:
+    def __init__(self) -> None:
+        self.sessions: Dict[str, TransferSession] = {}
+        self.lock = threading.Lock()
+        self.final_token: Optional[str] = None
+        self.final_info: Optional[Dict[str, object]] = None
+        self.final_event = threading.Event()
+
+    def reset(self) -> None:
+        with self.lock:
+            for session in self.sessions.values():
+                session.close()
+            self.sessions.clear()
+            self.final_token = None
+            self.final_info = None
+            self.final_event.clear()
+
+    def _finalize_session(self, session: TransferSession) -> None:
+        result: Dict[str, object] = {
+            "status": session.status,
+            "bytes": session.bytes_received,
+            "duration_ms": session.duration_ms,
+        }
+        if session.error:
+            result["message"] = session.error
+
+        with self.lock:
+            # Remove the session if it is still tracked.
+            self.sessions.pop(session.token, None)
+            if self.final_token == session.token:
+                self.final_info = result
+                self.final_event.set()
+
+    def create_session(
+        self,
+        desc: str,
+        extract_path: str,
+        compress: int,
+        expected_bytes: Optional[int] = None,
+        is_final: bool = False,
+    ) -> TransferSession:
+        os.makedirs(extract_path, exist_ok=True)
+        session = TransferSession(desc, extract_path, compress, expected_bytes, self._finalize_session)
+        with self.lock:
+            self.sessions[session.token] = session
+            if is_final:
+                self.final_token = session.token
+                self.final_info = None
+                self.final_event.clear()
+        return session
+
+    def complete_session(self, token: str, timeout: float = 180.0) -> Dict[str, object]:
+        with self.lock:
+            session = self.sessions.get(token)
+            if not session:
+                if self.final_token == token and self.final_info is not None:
+                    return self.final_info
+                return {"status": "ERROR", "message": "unknown transfer token"}
+
+        if not session.wait(timeout):
+            session.close()
+            with self.lock:
+                self.sessions.pop(token, None)
+                if self.final_token == token:
+                    self.final_info = {"status": "TIMEOUT", "message": "transfer timed out"}
+                    self.final_event.set()
+            return {"status": "TIMEOUT", "message": "transfer timed out"}
+
+        # Session has already finalized via callback; return stored info if available.
+        with self.lock:
+            if self.final_token == token and self.final_info is not None:
+                return self.final_info
+
+        result = {
+            "status": session.status,
+            "bytes": session.bytes_received,
+            "duration_ms": session.duration_ms,
+        }
+        if session.error:
+            result["message"] = session.error
+        return result
+
+    def wait_for_final(self, timeout: float) -> Optional[Dict[str, object]]:
+        with self.lock:
+            token = self.final_token
+            info = self.final_info
+        if token is None:
+            return {"status": "N/A"}
+        if info is not None:
+            return info
+        if not self.final_event.wait(timeout):
+            return None
+        with self.lock:
+            return self.final_info
+
+
+transfer_manager = TransferManager()
 # VIP 默认从集中配置加载，可由上层脚本通过命令行参数覆盖
 _, _, _, VIP = get_default_ips()
 rst_time = 0.0
 vip_transfer_complete = False  # 标记VIP转移是否完成
-
-
-def _monitor_listener_exit(port: int, desc: str, process: subprocess.Popen) -> None:
-    """Background observer that logs stderr when a listener dies unexpectedly."""
-    try:
-        rc = process.wait()
-        if rc not in (0, None):
-            stderr_msg = ""
-            if process.stderr is not None:
-                try:
-                    stderr_msg = process.stderr.read().decode("utf-8", errors="ignore").strip()
-                except Exception as exc:  # pragma: no cover - defensive
-                    stderr_msg = f"<failed to read stderr: {exc}>"
-            if stderr_msg:
-                logger.error("listener %s (port %s) exited with code %s: %s", desc, port, rc, stderr_msg)
-            else:
-                logger.error("listener %s (port %s) exited with code %s (no stderr)", desc, port, rc)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.error("monitor for listener %s (port %s) raised: %s", desc, port, exc)
-
-
-def _maybe_wrap_with_capture(cmd: str, port: int, desc: str) -> str:
-    """Optionally tee the raw incoming stream to a capture file for debugging."""
-    capture_dir = os.environ.get("DT_CAPTURE_DIR")
-    if not capture_dir:
-        return cmd
-
-    try:
-        os.makedirs(capture_dir, exist_ok=True)
-    except Exception as exc:  # pragma: no cover - best effort debug aid
-        logger.warning("failed to create capture dir %s: %s", capture_dir, exc)
-        return cmd
-
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{desc}_port{port}")
-    capture_path = os.path.join(capture_dir, f"{safe_name}.bin")
-
-    if "|" not in cmd:
-        wrapped = f"{cmd} | tee {shlex.quote(capture_path)}"
-    else:
-        first, rest = cmd.split("|", 1)
-        wrapped = f"{first.strip()} | tee {shlex.quote(capture_path)} | {rest.strip()}"
-
-    logger.debug("listener %s (port %s) capturing stream to %s", desc, port, capture_path)
-    return wrapped
-
-
-def _spawn_listener(port: int, cmd: str, desc: str) -> subprocess.Popen:
-    """Create the nc|tar listener and start a watcher for early failures."""
-    full_cmd = _maybe_wrap_with_capture(cmd, port, desc)
-    process = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    watcher = threading.Thread(target=_monitor_listener_exit, args=(port, desc, process), daemon=True)
-    watcher.start()
-    return process
 
 PRIORITY_RE = re.compile(r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})", re.S)
 KEEPALIVED_CONF = "/etc/keepalived/keepalived.conf"
@@ -177,70 +327,46 @@ def handle_prepare(prepare_info):
     parent_paths = prepare_info.get("parent_path", [])
     compress = prepare_info.get("compress", 0)
 
-    # 初始化监听端口列表和迭代列表
-    for parent in parent_paths:
-        iter_suffix = parent.split("_")[-1]
-        try:
-            iter_num = int(iter_suffix)
-        except ValueError:
-            logger.error(f"无法解析迭代号，从 parent_path 中提取的迭代号为 {iter_suffix}")
-            continue
-        iteration_list.append(iter_num)
-        port = INIT_PORT + iter_num
-        port_list.append(port)
-    print("port_list:", port_list)
-    # input()
     path_exist = os.path.exists(path)
     if not path_exist and not os.path.exists(os.path.dirname(path)):
-        reply = "Cannot find corresponding container bundle"
-        logger.error(reply)
+        reply = json.dumps({"status": "ERROR", "message": "Cannot find corresponding container bundle"})
+        logger.error("Cannot find corresponding container bundle")
     else:
         prepare(path, image_path, parent_paths)
 
-        # 根据端口和迭代列表，启动ncat进程监听
-        for parent, iter_num, port in zip(parent_paths, iteration_list, port_list):
-            # 定义解压路径
-            extract_path = parent
-            # 启动 ncat 监听并解压的管道命令
-            # 命令: nc -lp {port} -q 1 -w 10 | tar -xzf - -C {extract_path}
-            # 添加 -w 10 超时，-q 1 在输入结束后退出
-            if compress == 0:
-                # 无压缩
-                cmd = f"nc -lp {port} -q 1 -w 300 | tar -xf - -C {extract_path}"
-            elif compress >= 1 and compress <= 4:
-                # 使用lzo_gpu解压：先解压lzo，再解压tar
-                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
-                cmd = f"nc -lp {port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
-            else:
-                raise ValueError(f"不支持的压缩等级: {compress}")
-            logger.info(f"启动预拷贝监听: iter={iter_num}, port={port}, path={extract_path}")
-            process = _spawn_listener(port, cmd, f"pre-dump iter={iter_num}")
-            with process_lock:
-                transfer_processes[port] = process
+        session_details: List[Dict[str, object]] = []
+        for idx, parent in enumerate(parent_paths):
+            if not parent:
+                continue
+            iter_num: Optional[int] = None
+            match = re.search(r"(\d+)$", parent)
+            if match:
+                try:
+                    iter_num = int(match.group(1))
+                except ValueError:
+                    iter_num = None
 
-        # 最后一个端口用于解压到 image_path
-        if port_list:
-            last_port = port_list[-1]
-            global FINAL_DATA_PORT
-            FINAL_DATA_PORT = last_port
-            # os.makedirs(image_path, exist_ok=True)
-            extract_path = image_path
-            if compress == 0:
-                # 无压缩
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | tar -xf - -C {extract_path}"
-            elif compress >= 1 and compress <= 4:
-                # 使用lzo_gpu解压：先解压lzo，再解压tar
-                lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
-                cmd = f"nc -lp {last_port} -q 1 -w 300 | {lzo_gpu_path} -d - | tar -xf - -C {extract_path}"
-            else:
-                raise ValueError(f"不支持的压缩等级: {compress}")
-                # cmd = f"nc -lp {last_port} "
-                # cmd1 = f"tar -xf {extract_path}.tar -C {extract_path}"
-            logger.info(f"启动最终镜像监听: port={last_port}, path={extract_path}")
-            process = _spawn_listener(last_port, cmd, "final dump")
-            with process_lock:
-                transfer_processes[last_port] = process
-        # print_transfer_processes()
+            session = transfer_manager.create_session(
+                desc=f"pre-dump-{iter_num if iter_num is not None else idx}",
+                extract_path=parent,
+                compress=compress,
+            )
+            session_details.append(
+                {
+                    "token": session.token,
+                    "port": session.port,
+                    "path": parent,
+                    "iteration": iter_num if iter_num is not None else idx,
+                    "type": "pre_dump",
+                }
+            )
+
+        final_session = transfer_manager.create_session(
+            desc="final-dump",
+            extract_path=image_path,
+            compress=compress,
+            is_final=True,
+        )
 
         prep_end = time.perf_counter()
         cpu_prep_end = psutil.cpu_percent(interval=None)
@@ -248,9 +374,40 @@ def handle_prepare(prepare_info):
         prep_cpu = cpu_prep_end - cpu_prep_start
         logger.info(f"handle_prepare completed in {prep_elapsed:.3f} ms, CPU usage change: {prep_cpu:.2f}%")
 
-        reply = "OK"
+        reply_payload = {
+            "status": "OK",
+            "compress": compress,
+            "sessions": {
+                "pre_dump": session_details,
+                "final": {
+                    "token": final_session.token,
+                    "port": final_session.port,
+                    "path": image_path,
+                    "type": "final",
+                },
+            },
+        }
+
+        reply = json.dumps(reply_payload)
 
     return reply
+
+
+def handle_transfer_status(request: Dict[str, Any]) -> str:
+    token = request.get("token")
+    if not token:
+        return json.dumps({"status": "ERROR", "message": "missing transfer token"})
+
+    timeout_ms = request.get("timeout_ms")
+    timeout_sec = 180.0
+    if timeout_ms is not None:
+        try:
+            timeout_sec = max(0.0, float(timeout_ms) / 1000.0)
+        except (TypeError, ValueError):
+            return json.dumps({"status": "ERROR", "message": "invalid timeout_ms"})
+
+    result = transfer_manager.complete_session(str(token), timeout=timeout_sec)
+    return json.dumps(result)
 
 
 def transfer_vip():
@@ -517,16 +674,6 @@ def perform_restore(msg):
     return reply
 
 
-def print_transfer_processes():
-    if not transfer_processes:
-        print("transfer_processes 字典为空。")
-    else:
-        print("当前 transfer_processes 内容:")
-        for port, process in transfer_processes.items():
-            status = "运行中" if process.poll() is None else f"已结束 (退出码: {process.returncode})"
-            print(f"  端口: {port}, PID: {process.pid}, 状态: {status}, 命令: {process.args}")
-
-
 def _wait_file_stable(path, timeout=10.0, interval=0.1):
     import os
     import time
@@ -539,63 +686,27 @@ def _wait_file_stable(path, timeout=10.0, interval=0.1):
             if last is not None and sz == last:
                 return True
             last = sz
-        time.sleep(interval)
-    return False
-
-
-def _wait_all_transfers_done(timeout=30.0, interval=0.1):
-    end = time.time() + timeout
-    while time.time() < end:
-        with process_lock:
-            alive = [p for p in transfer_processes.values() if p and p.poll() is None]
-        if not alive:
-            return True
-        time.sleep(interval)
-    return False
-
-
 def _reset_transfer_state():
-    """Ensure per-run transfer bookkeeping starts from a clean slate."""
-    global iteration_list, port_list, FINAL_DATA_PORT
-
-    # Terminate any stale listeners that might linger from a previous run.
-    with process_lock:
-        for proc in transfer_processes.values():
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1.0)
-                except Exception:
-                    proc.kill()
-        transfer_processes.clear()
-
-    iteration_list.clear()
-    port_list.clear()
-    port_list.append(INIT_PORT)
-    FINAL_DATA_PORT = None
+    """Clear previous transfer sessions and reset per-run flags."""
+    transfer_manager.reset()
+    global vip_transfer_complete, rst_time
+    vip_transfer_complete = False
+    rst_time = 0.0
 
 
 def _wait_final_transfer_complete(timeout: float = 60.0) -> bool:
-    """Block until the final dump listener finishes extracting data."""
-    final_port = FINAL_DATA_PORT
-    if final_port is None:
-        return True
-
-    with process_lock:
-        proc = transfer_processes.get(final_port)
-
-    if not proc:
-        return True
-
-    try:
-        proc.wait(timeout=timeout)
-        if proc.returncode not in (0, None):
-            logger.error("final transfer on port %s exited with code %s", final_port, proc.returncode)
-            return False
-        return True
-    except subprocess.TimeoutExpired:
-        logger.error("Timeout waiting for final transfer on port %s", final_port)
+    """Block until the final dump session reports completion."""
+    result = transfer_manager.wait_for_final(timeout)
+    if result is None:
+        logger.error("Timeout waiting for final transfer completion")
         return False
+
+    status = result.get("status") if isinstance(result, dict) else None
+    if status in ("OK", "N/A"):
+        return True
+
+    logger.error("Final transfer did not complete successfully: %s", result)
+    return False
 
 
 def handle_restore(msg):
@@ -633,37 +744,8 @@ def handle_restore(msg):
 
     # 异步启动进程清理任务，让主线程快速响应
     def _cleanup_worker():
-        terminated_count = 0
-        with process_lock:
-            for port, process in list(transfer_processes.items()):
-                if process and process.poll() is None:  # 进程仍在运行
-                    try:
-                        logger.debug(f"终止仍在运行的nc进程 (端口 {port}, PID {process.pid})")
-                        process.terminate()
-
-                        # 等待进程优雅退出，最多等待3秒
-                        try:
-                            process.wait(timeout=3.0)
-                            logger.debug(f"进程 {process.pid} 已退出")
-                        except subprocess.TimeoutExpired:
-                            logger.warning(f"进程 {process.pid} 未退出，强制杀死")
-                            process.kill()
-                            process.wait()
-                            logger.info(f"进程 {process.pid} 已被强制杀死")
-
-                        terminated_count += 1
-                    except Exception as e:
-                        logger.error(f"清理进程 {process.pid} 时出错: {e}")
-
-        # 清空进程字典
-        transfer_processes.clear()
-        global FINAL_DATA_PORT
-        FINAL_DATA_PORT = None
-
-        if terminated_count > 0:
-            logger.debug(f"共清理了 {terminated_count} 个nc进程")
-        else:
-            logger.debug("没有需要清理的nc进程")
+        transfer_manager.reset()
+        logger.debug("transfer sessions cleaned up after restore")
 
     # 使用线程池异步执行清理
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cleanup")
@@ -741,6 +823,8 @@ def migrate_server():
 
                     case {"prepare": prepare_info}:
                         reply = handle_prepare(prepare_info)
+                    case {"transfer_status": status_info}:
+                        reply = handle_transfer_status(status_info)
                     case {"restore": _}:
                         # 如果所有传输已完成，立即执行恢复
                         # 所有传输指last_iter及之前的传输，和最大端口对应的传输

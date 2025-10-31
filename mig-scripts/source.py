@@ -19,8 +19,8 @@ import threading
 import time
 try:
     # fcntl is POSIX-only (Linux/Unix). Wrap import to allow static analysis on other platforms.
-    import fcntl
-    from fcntl import ioctl
+    import fcntl  # type: ignore
+    from fcntl import ioctl  # type: ignore
 except Exception:
     fcntl = None
     ioctl = None
@@ -95,12 +95,9 @@ esti_dump_size_pre = 0.0
 esti_dump_size_post = 0.0
 dump_size = 0.0
 dump_xfer_time = 0.0
-port_list = []
 max_predump_size = 0.0
 final_archive_size_bytes = 0.0  # 记录最终 dump 压缩包的大小，便于统计时使用
 
-
-# [修改] 重命名并修正函数
 def get_compressed_files_size(directory, compress_level):
     """
     计算目录下 (仅限顶层) 的压缩文件总大小。
@@ -108,7 +105,6 @@ def get_compressed_files_size(directory, compress_level):
     """
     total_size = 0
     if not os.path.isdir(directory):
-        print(f"Warning: Directory not found, cannot calculate compressed size: {directory}")
         return 0
 
     # 根据压缩级别确定要查找的文件后缀
@@ -315,9 +311,101 @@ bandwidth_measurements = []  # List to store individual bandwidth measurements (
 average_bandwidth = 0.0  # Average bandwidth (Bytes/s)
 bandwidth_stddev = 0.0  # Standard deviation of bandwidth (Bytes/s)
 
+CONTROL_COMMAND_TIMEOUT = 30.0  # seconds
+
+
+def _recv_control_json(sock, timeout):
+    """Receive a JSON response (or simple status string) from the control channel."""
+    deadline = time.monotonic() + timeout
+    buffer = bytearray()
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        readable, _, _ = select.select([sock], [], [], remaining)
+        if not readable:
+            continue
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+
+        try:
+            text = buffer.decode("utf-8")
+        except UnicodeDecodeError:
+            # Wait for more data if partial multibyte sequence
+            continue
+
+        stripped = text.strip()
+        if not stripped:
+            continue
+
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            status_upper = stripped.upper()
+            if status_upper in {"OK", "ERROR"}:
+                msg = None if status_upper == "OK" else stripped
+                return {"status": status_upper, "message": msg}
+            # Not a full JSON payload yet, continue reading
+            continue
+
+    if buffer:
+        text = buffer.decode("utf-8", errors="replace").strip()
+        if text:
+            status_upper = text.upper()
+            if status_upper in {"OK", "ERROR"}:
+                msg = None if status_upper == "OK" else text
+                return {"status": status_upper, "message": msg}
+            return {"status": "ERROR", "message": text}
+
+    raise TimeoutError("Timed out waiting for control channel response")
+
+
+def _send_control_command(sock, payload, timeout=CONTROL_COMMAND_TIMEOUT):
+    if isinstance(payload, (bytes, bytearray)):
+        message_bytes = bytes(payload)
+    elif isinstance(payload, str):
+        message_bytes = payload.encode("utf-8")
+    else:
+        message_bytes = json.dumps(payload).encode("utf-8")
+    sock.sendall(message_bytes)
+    return _recv_control_json(sock, timeout)
+
+
+def _await_transfer_completion(control_sock, token, timeout=180.0):
+    request = {
+        "transfer_status": {
+            "token": token,
+            "timeout_ms": int(max(timeout, 0) * 1000),
+        }
+    }
+    response = _send_control_command(control_sock, request, timeout=max(timeout + 5.0, CONTROL_COMMAND_TIMEOUT))
+    status = response.get("status")
+    if status in ("OK", "N/A"):
+        return response
+    raise RuntimeError(f"transfer {token} failed: {response}")
+
+
+def _stream_file_to_socket(file_path, host, port):
+    total_sent = 0
+    start = time.perf_counter()
+    with socket.create_connection((host, port)) as data_sock, open(file_path, "rb") as fp:
+        while True:
+            chunk = fp.read(1024 * 1024)
+            if not chunk:
+                break
+            data_sock.sendall(chunk)
+            total_sent += len(chunk)
+    duration_ms = (time.perf_counter() - start) * 1000.0
+    return total_sent, duration_ms
+
 
 # 通过ioctl设置脏页跟踪的目录路径
 def ioctl_set_dirty_map_path(device_fd, path):
+    if ioctl is None:
+        raise RuntimeError("ioctl support is unavailable on this platform")
     # 路径字符串打包为定长字节数组
     buf = struct.pack(f"{len(path)}s", path.encode("utf-8"))
     # 调用 ioctl 传递路径给内核模块
@@ -326,6 +414,8 @@ def ioctl_set_dirty_map_path(device_fd, path):
 
 # 通过ioctl启动指定进程的脏页跟踪
 def ioctl_start_pid(device_fd, pid):
+    if ioctl is None:
+        raise RuntimeError("ioctl support is unavailable on this platform")
     # pid_t在Python中可以用struct.pack来打包
     buf = bytearray(struct.pack("I", pid))
     ioctl(device_fd, IOCTL_START_PID, buf)
@@ -334,6 +424,8 @@ def ioctl_start_pid(device_fd, pid):
 
 # 通过ioctl停止指定进程的脏页跟踪
 def ioctl_stop_pid(device_fd, pid):
+    if ioctl is None:
+        raise RuntimeError("ioctl support is unavailable on this platform")
     buf = bytearray(struct.pack("I", pid))
     ioctl(device_fd, IOCTL_STOP_PID, buf)
     # ret = struct.unpack_from('I', buf)[0]
@@ -341,6 +433,8 @@ def ioctl_stop_pid(device_fd, pid):
 
 # 通过ioctl获取脏页跟踪的目录路径
 def ioctl_get_dirty_map_path(device_fd):
+    if ioctl is None:
+        raise RuntimeError("ioctl support is unavailable on this platform")
     buf = bytearray(struct.pack("256s", b"\0" * 256))
     ioctl(device_fd, IOCTL_GET_DIRTY_MAP_PATH, buf)
     # 解包路径字符串
@@ -350,6 +444,8 @@ def ioctl_get_dirty_map_path(device_fd):
 
 # 获取runc容器进程树的PID
 def get_runc_container_pidtree(container_name):
+    if psutil is None:
+        raise RuntimeError("psutil is required to inspect container process tree")
     container_pids.clear()  # 先清空pid列表
     container_pid_path = f"/run/runc/{container_name}/state.json"
     if not os.path.exists(container_pid_path):
@@ -380,7 +476,7 @@ def get_runc_container_pidtree(container_name):
 
 
 def error():
-    print("Something did not work. Exiting!")
+    print("Something did not work. Exiting!", file=sys.stderr)
     # 确保在程序终止时停止 sync_rootfs 进程
     stop_sync_rootfs()
 
@@ -394,11 +490,14 @@ def _run_command_checked(cmd, desc):
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         printable = " ".join(shlex.quote(part) for part in cmd)
-        print(f"{desc} failed (exit {proc.returncode}): {printable}")
+        message = f"{desc} failed (exit {proc.returncode}): {printable}"
+        print(message, file=sys.stderr)
         if proc.stdout:
-            print("[stdout]\n" + proc.stdout.strip())
+            print("[stdout]", file=sys.stderr)
+            print(proc.stdout.strip(), file=sys.stderr)
         if proc.stderr:
-            print("[stderr]\n" + proc.stderr.strip())
+            print("[stderr]", file=sys.stderr)
+            print(proc.stderr.strip(), file=sys.stderr)
         error()
 
 
@@ -981,11 +1080,13 @@ def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inpu
     #             error()
     #     cmd += ' --page-server {}:27'.format(dest)
     if postcopy:
+        if fcntl is None:
+            raise RuntimeError("post-copy mode requires fcntl support on this platform")
         cmd += " --lazy-pages"
         cmd += " --page-server localhost:27"
         read_fd, write_fd = os.pipe()
-        fdflags = fcntl.fcntl(write_fd, fcntl.F_GETFD)
-        fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)
+        fdflags = fcntl.fcntl(write_fd, fcntl.F_GETFD)  # type: ignore[attr-defined]
+        fcntl.fcntl(write_fd, fcntl.F_SETFD, fdflags & ~fcntl.FD_CLOEXEC)  # type: ignore[attr-defined]
         cmd += " --status-fd " + str(write_fd)
     if dirtymap:
         cmd += " --use-dirty-map --dirty-map-dir " + dirtymap_path
@@ -1034,46 +1135,44 @@ def parse_size(size_str):
     return size
 
 
-# Transfer the previously created pre-dump using nc (同步版本)
-def xfer_pre_dump(parent_path, dest, i, port):
+def xfer_pre_dump(parent_path, dest, iteration, session, control_sock):
     global pre_dump_xfer_time_total, total_compression_time
 
-    # print(f"开始传输 PRE-DUMP {i} 到 {dest}")
+    if not session:
+        raise RuntimeError(f"missing transfer session for pre-dump iteration {iteration}")
+
+    token = session.get("token")
+    port = session.get("port")
+    if not token or port is None:
+        raise RuntimeError(f"invalid session descriptor for iteration {iteration}: {session}")
+
+    port = int(port)
+
     # 创建压缩包
     if compress == 0:
-        # 无压缩
-        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
+        archive_name = os.path.join(mig_base, f"pre_dump_{iteration}.tar")
         cmd_tar = ["tar", "-cf", archive_name, "-C", parent_path, "."]
     elif compress >= 1 and compress <= 4:
-        # 使用lzo_gpu压缩
-        tar_name = os.path.join(mig_base, f"pre_dump_{i}.tar")
-        archive_name = os.path.join(mig_base, f"pre_dump_{i}.tar.lzo")
-        # 先创建tar文件
+        tar_name = os.path.join(mig_base, f"pre_dump_{iteration}.tar")
+        archive_name = os.path.join(mig_base, f"pre_dump_{iteration}.tar.lzo")
         cmd_tar = ["tar", "-cf", tar_name, "-C", parent_path, "."]
-        # 再使用lzo_gpu压缩
         lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
         cmd_compress = [lzo_gpu_path, f"-{compress}", tar_name, archive_name]
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
 
-    # print(cmd_tar)
     start = time.perf_counter() * 1000
 
     if compress == 0:
-        # 无压缩，直接创建tar文件
-        _run_command_checked(cmd_tar, f"Create tar pre_dump_{i}")
+        _run_command_checked(cmd_tar, f"Create tar pre_dump_{iteration}")
     else:
-        # 有压缩：先创建tar文件，再压缩
-        _run_command_checked(cmd_tar, f"Create tar pre_dump_{i}")
+        _run_command_checked(cmd_tar, f"Create tar pre_dump_{iteration}")
 
-        # 检查tar文件是否存在
         if not os.path.exists(tar_name):
             raise FileNotFoundError(f"TAR file {tar_name} not found")
 
-        # 再进行lzo压缩
-        _run_command_checked(cmd_compress, f"lzo_gpu compress pre_dump_{i}")
+        _run_command_checked(cmd_compress, f"lzo_gpu compress pre_dump_{iteration}")
 
-        # 删除中间的tar文件
         try:
             os.remove(tar_name)
         except OSError as e:
@@ -1081,56 +1180,61 @@ def xfer_pre_dump(parent_path, dest, i, port):
 
     end = time.perf_counter() * 1000
 
-    global total_compression_time
     total_compression_time += end - start
     if not os.path.exists(archive_name):
         raise FileNotFoundError(f"Archive file {archive_name} not found")
 
     size = os.path.getsize(archive_name)
     if size == 0:
-        raise ValueError(f"pre_dump_{i} archive size is 0")
+        raise ValueError(f"pre_dump_{iteration} archive size is 0")
 
-    print(f"Pre-dump {i} archive: {size} Bytes, {(end - start):.3f} ms")
+    print(f"Pre-dump {iteration} archive: {size} Bytes, {(end - start):.3f} ms")
 
-    start = time.perf_counter()
-    with open(archive_name, "rb") as fp:
-        proc = subprocess.run(
-            ["nc", "-q", "0", dest, str(port)],
-            stdin=fp,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-    end = time.perf_counter()
-    transfer_time = (end - start) * 1000.0
-
-    if proc.returncode != 0:
-        print(
-            f"Pre-dump {i} xfer failed with exit code {proc.returncode}. "
-            f"stderr: {proc.stderr.decode('utf-8', errors='ignore')}"
-        )
-        error()
+    try:
+        sent_bytes, transfer_time = _stream_file_to_socket(archive_name, dest, port)
+    except Exception as exc:
+        raise RuntimeError(f"pre-dump {iteration} transfer failed: {exc}") from exc
 
     effective_mbps = 0.0
     if transfer_time > 0:
-        effective_mbps = (size * 8.0) / (transfer_time / 1000.0) / 1_000_000
-    print(f"Pre-dump {i} xfer: {transfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
+        effective_mbps = (sent_bytes * 8.0) / (transfer_time / 1000.0) / 1_000_000
+    print(f"Pre-dump {iteration} xfer: {transfer_time:.3f} ms ({effective_mbps:.2f} Mbps) -> {dest}:{port}")
 
-    if time_constraint > 0:
-        bandwidth_measurements.append(1000.0 * size / transfer_time)
+    try:
+        ack = _await_transfer_completion(control_sock, token)
+    except Exception as exc:
+        raise RuntimeError(f"pre-dump {iteration} completion check failed: {exc}") from exc
+
+    if ack.get("status") != "OK":
+        print(f"Pre-dump {iteration} transfer reported failure: {ack}")
+        error()
+
+    ack_bytes = ack.get("bytes")
+    ack_duration = ack.get("duration_ms")
+    if ack_bytes is not None and ack_duration is not None:
+        print("  Destination reported %.0f bytes, %.3f ms" % (float(ack_bytes), float(ack_duration)))
+
+    if time_constraint > 0 and transfer_time > 0:
+        bandwidth_measurements.append(1000.0 * sent_bytes / transfer_time)
 
     pre_dump_xfer_time_total += transfer_time
 
 
-# Transfer the previosuly created dump using netcat
-def xfer_final(image_path, dest, compress, port):
+def xfer_final(image_path, dest, compress, session, control_sock):
     global dump_xfer_time, total_compression_time, final_archive_size_bytes
 
-    # print("xfer DUMP")
-    # 创建压缩包并通过 SSH 传输
+    if not session:
+        raise RuntimeError("missing final transfer session descriptor")
+
+    token = session.get("token")
+    port = session.get("port")
+    if not token or port is None:
+        raise RuntimeError(f"invalid final session descriptor: {session}")
+
+    port = int(port)
+
     final_archive_size_bytes = 0.0
     if compress == 0:
-        # 无额外压缩：创建 gzip tar 包并单独测量打包时间，再通过 nc 发送
         tar_name = os.path.join(mig_base, "final_dump.tar")
         start_comp = time.perf_counter() * 1000
         cmd_create_tar = ["tar", "-cf", tar_name, "-C", image_path, "."]
@@ -1140,60 +1244,57 @@ def xfer_final(image_path, dest, compress, port):
         if not os.path.exists(tar_name):
             raise FileNotFoundError(f"Final dump archive not found: {tar_name}")
         final_archive_size_bytes = os.path.getsize(tar_name)
+        archive_path = tar_name
     elif compress >= 1 and compress <= 4:
-        # 使用lzo_gpu压缩：先创建tar文件，再压缩成本地lzo文件，最后传输
         start = time.perf_counter() * 1000
         tar_name = os.path.join(mig_base, "final_dump.tar")
         lzo_name = os.path.join(mig_base, "final_dump.tar.lzo")
         lzo_gpu_path = os.path.join(os.path.dirname(__file__), "../lzo_gpu/lzo_gpu")
 
-        # 先创建tar文件
         cmd_create_tar = ["tar", "-cf", tar_name, "-C", image_path, "."]
         _run_command_checked(cmd_create_tar, "tar final dump")
 
-        # 再压缩为lzo
         cmd_compress = [lzo_gpu_path, f"-{compress}", tar_name, lzo_name]
         _run_command_checked(cmd_compress, "lzo_gpu compress final dump")
         end = time.perf_counter() * 1000
-        total_compression_time += end - start  # 累加压缩时间
-        # 删除临时tar文件
+        total_compression_time += end - start
+
         try:
             os.remove(tar_name)
         except OSError as e:
             print(f"警告：无法删除临时tar文件 {tar_name}: {e}")
 
-        # 通过nc传输lzo文件
         if not os.path.exists(lzo_name):
             raise FileNotFoundError(f"Final dump archive not found: {lzo_name}")
         final_archive_size_bytes = os.path.getsize(lzo_name)
+        archive_path = lzo_name
     else:
         raise ValueError(f"不支持的压缩等级: {compress}")
 
-    archive_path = tar_name if compress == 0 else lzo_name
+    try:
+        sent_bytes, dump_xfer_time = _stream_file_to_socket(archive_path, dest, port)
+    except Exception as exc:
+        raise RuntimeError(f"final dump transfer failed: {exc}") from exc
 
-    start = time.perf_counter()
-    with open(archive_path, "rb") as fp:
-        proc = subprocess.run(
-            ["nc", "-q", "0", dest, str(port)],
-            stdin=fp,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-    end = time.perf_counter()
-    dump_xfer_time = (end - start) * 1000.0
-
-    if proc.returncode != 0:
-        print(
-            f"Final dump transfer failed with exit code {proc.returncode}. "
-            f"stderr: {proc.stderr.decode('utf-8', errors='ignore')}"
-        )
-        error()
-
+    final_archive_size_bytes = float(sent_bytes)
     effective_mbps = 0.0
     if dump_xfer_time > 0:
-        effective_mbps = (final_archive_size_bytes * 8.0) / (dump_xfer_time / 1000.0) / 1_000_000
-    print(f"Final dump xfer: {dump_xfer_time:.3f} ms ({effective_mbps:.2f} Mbps)")
+        effective_mbps = (sent_bytes * 8.0) / (dump_xfer_time / 1000.0) / 1_000_000
+    print(f"Final dump xfer: {dump_xfer_time:.3f} ms ({effective_mbps:.2f} Mbps) -> {dest}:{port}")
+
+    try:
+        ack = _await_transfer_completion(control_sock, token)
+    except Exception as exc:
+        raise RuntimeError(f"final dump completion check failed: {exc}") from exc
+
+    if ack.get("status") != "OK":
+        print(f"Final dump transfer reported failure: {ack}")
+        error()
+
+    ack_bytes = ack.get("bytes")
+    ack_duration = ack.get("duration_ms")
+    if ack_bytes is not None and ack_duration is not None:
+        print("  Destination reported %.0f bytes, %.3f ms" % (float(ack_bytes), float(ack_duration)))
 
     if compress == 0:
         try:
@@ -1208,7 +1309,7 @@ def xfer_final(image_path, dest, compress, port):
 
 
 # Run the pre-dump iteration and transfer it to the destination
-def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
+def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_session):
     iter_terminate = False
     last_iter = 1
     if dirtymap:
@@ -1259,8 +1360,11 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
             if read_max_scount(container_pids, dirtymap_path) >= 3:
                 iter_terminate = True
 
-        # 传输当前迭代的 pre-dump
-        xfer_pre_dump(last_path, dest, last_iter, port_list[last_iter - 1])
+        session = resolve_session(last_iter, last_path)
+        if not session:
+            raise RuntimeError(f"no transfer session available for pre-dump iteration {last_iter}")
+
+        xfer_pre_dump(last_path, dest, last_iter, session, cs)
         if iter_terminate:
             break
         last_iter += 1
@@ -1383,8 +1487,6 @@ def get_dump_size(image_path, pre_dump):
             error()
 
 
-INIT_PORT = 12345
-
 
 def update_image_parent(mig_base: str, latest_parent: str):
     """
@@ -1434,20 +1536,20 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
     work_path = []
     global dirtymap_path
     dirtymap_path = mig_base + "/dirty_map"
-    global port_list
-    port_list = [INIT_PORT]
 
     if pre:
         for i in range(1, max_iter + 1):
-            pathname = mig_base + "/parent_{}".format(i)
-            parent_path.append(pathname)
-            pathname = mig_base + "/pd_log_{}".format(i)
-            work_path.append(pathname)
-            port_list.append(INIT_PORT + i)  # del +1
+            parent_dir = f"{mig_base}/parent_{i}"
+            parent_path.append(parent_dir)
+            work_path.append(f"{mig_base}/pd_log_{i}")
 
-    print("post_list: {0}", port_list)
-    print("parent_path: {0}", parent_path)
+    print("parent_path:", parent_path)
     prepare(mig_base, image_path, parent_path, work_path)
+
+    pre_sessions_by_path = {}
+    pre_sessions_by_iter = {}
+    pre_sessions_fallback = {}
+    final_session = None
 
     real_dump_0(mig_base, runc_args=runc_args)
 
@@ -1482,41 +1584,70 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     inputs = [cs, sys.stdin]
 
+    prepare_payload = {
+        "prepare": {
+            "path": mig_base,
+            "image_path": image_path,
+            "compress": compress,
+        }
+    }
     if pre:
-        prepare_cmd = json.dumps(
-            {
-                "prepare": {
-                    "path": mig_base,
-                    "image_path": image_path,
-                    "parent_path": parent_path,  # parent_path为列表
-                    "compress": compress,
-                }
-            }
-        )
-    else:
-        prepare_cmd = json.dumps(
-            {
-                "prepare": {
-                    "path": mig_base,
-                    "image_path": image_path,
-                    "compress": compress,
-                    # 不包含 parent_path
-                }
-            }
+        prepare_payload["prepare"]["parent_path"] = parent_path
+
+    try:
+        prepare_reply = _send_control_command(cs, prepare_payload, timeout=60.0)
+    except TimeoutError as exc:
+        print(f"Timeout waiting for prepare acknowledgement: {exc}")
+        error()
+    except Exception as exc:
+        print(f"Failed to execute prepare command: {exc}")
+        error()
+
+    status = str(prepare_reply.get("status", "OK")).upper() if isinstance(prepare_reply, dict) else "OK"
+    if status != "OK":
+        print(f"Destination prepare failed: {prepare_reply}")
+        error()
+
+    session_catalog = prepare_reply.get("sessions", {}) if isinstance(prepare_reply, dict) else {}
+    if not isinstance(session_catalog, dict):
+        session_catalog = {}
+    pre_sessions_raw = session_catalog.get("pre_dump", []) if session_catalog else []
+    final_session = session_catalog.get("final") if session_catalog else None
+
+    for idx, entry in enumerate(pre_sessions_raw, start=1):
+        path = entry.get("path")
+        if path:
+            pre_sessions_by_path[path] = entry
+        iteration_val = entry.get("iteration")
+        if isinstance(iteration_val, str) and iteration_val.isdigit():
+            iteration_val = int(iteration_val)
+        if isinstance(iteration_val, int):
+            pre_sessions_by_iter[iteration_val] = entry
+        pre_sessions_fallback[idx] = entry
+
+    if final_session is None:
+        print("Destination did not provide final transfer session metadata")
+        error()
+
+    def resolve_pre_session(iteration, path):
+        return (
+            pre_sessions_by_path.get(path)
+            or pre_sessions_by_iter.get(iteration)
+            or pre_sessions_fallback.get(iteration)
         )
 
-    cs.send(bytes(prepare_cmd, encoding="utf-8"))
-    inputready, outputready, exceptready = select.select(inputs, [], [], 4)
-    # If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-    if inputready:
-        for s in inputready:
-            answer = s.recv(1024).decode("utf-8")
-            # print(answer)
-            pattern = r"OK"
-            match = re.search(pattern, answer)
-            if not match:
-                print(answer)
-                error()
+    if pre_sessions_raw:
+        session_summary = []
+        for entry in pre_sessions_raw:
+            iter_label = entry.get("iteration")
+            port_label = entry.get("port")
+            session_summary.append(f"{iter_label}:{port_label}")
+        print("Prepared pre-dump sessions:", ", ".join(session_summary))
+    else:
+        print("No pre-dump sessions required")
+
+    if final_session:
+        print("Final transfer session port:", final_session.get("port"))
 
     if rootfs:
         search_cmd = "runc list | grep " + container
@@ -1559,8 +1690,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
                 if ret != 0:
                     error()
 
-        # iter pre-dump
-        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap)
+        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_pre_session)
         global pre_dump_iters
         pre_dump_iters = last_iter
         # 使用同步传输，所有传输已在iterate_predump中完成，无需发送确认消息
@@ -1649,7 +1779,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
             print(f"创建转储后同步标记失败: {e}")
 
     # 传输容器剩余状态
-    xfer_final(image_path, dest, compress, port_list[-1])
+    xfer_final(image_path, dest, compress, final_session, cs)
 
     # 等待强制同步完成 - 检查标记文件是否已被删除
     if rootfs and sync_rootfs_process and sync_rootfs_process.poll() is None:
