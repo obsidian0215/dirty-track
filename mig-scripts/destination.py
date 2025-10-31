@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import shlex
 from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
@@ -60,9 +61,35 @@ def _monitor_listener_exit(port: int, desc: str, process: subprocess.Popen) -> N
         logger.error("monitor for listener %s (port %s) raised: %s", desc, port, exc)
 
 
+def _maybe_wrap_with_capture(cmd: str, port: int, desc: str) -> str:
+    """Optionally tee the raw incoming stream to a capture file for debugging."""
+    capture_dir = os.environ.get("DT_CAPTURE_DIR")
+    if not capture_dir:
+        return cmd
+
+    try:
+        os.makedirs(capture_dir, exist_ok=True)
+    except Exception as exc:  # pragma: no cover - best effort debug aid
+        logger.warning("failed to create capture dir %s: %s", capture_dir, exc)
+        return cmd
+
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{desc}_port{port}")
+    capture_path = os.path.join(capture_dir, f"{safe_name}.bin")
+
+    if "|" not in cmd:
+        wrapped = f"{cmd} | tee {shlex.quote(capture_path)}"
+    else:
+        first, rest = cmd.split("|", 1)
+        wrapped = f"{first.strip()} | tee {shlex.quote(capture_path)} | {rest.strip()}"
+
+    logger.debug("listener %s (port %s) capturing stream to %s", desc, port, capture_path)
+    return wrapped
+
+
 def _spawn_listener(port: int, cmd: str, desc: str) -> subprocess.Popen:
     """Create the nc|tar listener and start a watcher for early failures."""
-    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    full_cmd = _maybe_wrap_with_capture(cmd, port, desc)
+    process = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     watcher = threading.Thread(target=_monitor_listener_exit, args=(port, desc, process), daemon=True)
     watcher.start()
     return process

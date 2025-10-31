@@ -1,9 +1,10 @@
 import argparse
+import os
 import re
+import shlex
 import subprocess
 import sys
 import time
-import os
 from datetime import datetime
 
 from cmd_utils import run_cmd, run_remote_cmd
@@ -263,8 +264,13 @@ def destination_prepare(args):
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
     dest_pidfile = f"/tmp/destination_{container_name}.pid"
     # 使用仓库中的脚本完整路径，避免远程默认工作目录导致找不到脚本
+    capture_dir = os.environ.get("DT_CAPTURE_DIR")
+    env_prefix = ""
+    if capture_dir:
+        env_prefix = f"DT_CAPTURE_DIR={shlex.quote(capture_dir)} "
+
     start_dest_cmd = (
-        f"nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} "
+        f"{env_prefix}nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} "
         "2>&1 & echo $! > "
         f"{dest_pidfile}"
     )
