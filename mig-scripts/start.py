@@ -223,6 +223,17 @@ def destination_prepare(args):
     ]
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+    # 启动前，先尝试停止已存在的 destination 进程，避免端口占用
+    dest_pidfile_pre = f"/tmp/destination_{container_name}.pid"
+    stop_prev_cmd = (
+        f"if [ -f {dest_pidfile_pre} ]; then kill -TERM $(cat {dest_pidfile_pre}) 2>/dev/null || true; rm -f {dest_pidfile_pre}; fi"
+    )
+    run_remote_cmd(stop_prev_cmd, target_ip=DEST_IP, ignore_error=True, quiet=True)
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print \\$2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, target_ip=DEST_IP, ignore_error=True, quiet=True)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
@@ -276,6 +287,12 @@ def destination_clean(args):
         f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
     )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True, quiet=True)
+    # 兜底清理任何遗留的 destination 脚本
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print \\$2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, target_ip=DEST_IP, ignore_error=True, quiet=True)
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):

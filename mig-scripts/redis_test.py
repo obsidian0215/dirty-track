@@ -79,6 +79,17 @@ def destination_prepare():
         "> /tmp/recvtty_debug.log 2>&1 & echo $! > /tmp/recvtty_destination.pid"
     )
     run_remote_cmd(recvtty_cmd, DEST_IP, ignore_error=False)
+    # 启动前，先尝试停止已存在的 destination 进程，避免端口占用
+    dest_pidfile_pre = f"/tmp/destination_{container_name}.pid"
+    stop_prev_cmd = (
+        f"if [ -f {dest_pidfile_pre} ]; then kill -TERM $(cat {dest_pidfile_pre}) 2>/dev/null || true; rm -f {dest_pidfile_pre}; fi"
+    )
+    run_remote_cmd(stop_prev_cmd, DEST_IP, ignore_error=True)
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print $2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, DEST_IP, ignore_error=True)
     # 启动 destination 后台进程以接收归档，并把输出写入 /tmp（可通过 --sec 切换）
     ts = int(time.time())
     dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{container_name}_{ts}.log"
@@ -121,6 +132,12 @@ def destination_clean():
         f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
     )
     run_remote_cmd(stop_cmd, DEST_IP, ignore_error=True)
+    # 兜底：清理任何仍在运行的 destination 脚本
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print $2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, DEST_IP, ignore_error=True)
 
 
 def source_prepare():

@@ -109,6 +109,12 @@ def destination_prepare():
         "; fi"
     )
     run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
+    # 兜底：强制清理遗留的 destination.py/destination-sec.py，避免端口被占用
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print $2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, target_ip=DEST_IP, ignore_error=True)
 
     recvtty_cmd = (
         "PATH=$PATH:/root/go/bin "
@@ -156,6 +162,19 @@ def destination_clean():
 
     for c, ign in cmds:
         run_remote_cmd(c, target_ip=DEST_IP, ignore_error=ign)
+
+    # 停止 destination 后台进程（如果存在）并移除 pid 文件
+    dest_pidfile = f"/tmp/destination_{container_name}.pid"
+    stop_cmd = (
+        f"if [ -f {dest_pidfile} ]; then kill -TERM $(cat {dest_pidfile}) 2>/dev/null || true; rm -f {dest_pidfile}; fi"
+    )
+    run_remote_cmd(stop_cmd, target_ip=DEST_IP, ignore_error=True)
+    # 兜底清理任何遗留的 destination 脚本
+    kill_leftover = (
+        "ps aux | grep -E 'mig-scripts/(destination|destination-sec)\\.py' | "
+        "grep -v grep | awk '{print $2}' | xargs -r kill -9"
+    )
+    run_remote_cmd(kill_leftover, target_ip=DEST_IP, ignore_error=True)
 
 
 def source_prepare():
