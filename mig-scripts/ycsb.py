@@ -470,6 +470,9 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
 
 
 if __name__ == "__main__":
+    import atexit
+    # 进程退出时做一次最终网络清理（统一善后）
+    atexit.register(clean_configure_network)
     # 确保网络配置初始化
     # update_keepalived_priority(70)
     # update_keepalived_priority(30,True,DEST_IP)
@@ -479,6 +482,8 @@ if __name__ == "__main__":
         for i in range(1, runs + 1):
             print(f"======== Running {exp_name} experiment run {i} ========")
             try:
+                # 确保本轮开始前未残留任何限速规则，避免影响 load 阶段
+                clean_configure_network()
                 # 准备目标节点
                 destination_prepare()
 
@@ -504,7 +509,6 @@ if __name__ == "__main__":
                 # destination_clean(args)
 
                 # 清理网络配置
-                clean_configure_network()
                 # 还原keepalived配置
                 update_keepalived_priority(70)
                 update_keepalived_priority(30, True, DEST_IP)

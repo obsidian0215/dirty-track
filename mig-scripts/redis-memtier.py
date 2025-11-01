@@ -3,6 +3,7 @@ import re
 import subprocess
 import sys
 import time
+import atexit
 from typing import Optional
 from result_writer import extract_stats_from_output, append_result
 
@@ -389,10 +390,53 @@ def configure_network_do(interface, rules, is_remote=False, target_ip=None, igno
 
 def clean_configure_network():
     """Remove tc shaping rules from all participating hosts."""
-    run_cmd("sudo tc qdisc del dev enp2s0 root", ignore_error=True, quiet=True)
-    run_remote_cmd("sudo tc qdisc del dev enp2s0 root", DEST_IP, ignore_error=True, quiet=True)
+    def _tc_clear_all(iface: str, *, is_remote: bool = False, ip: Optional[str] = None):
+        # 同时清理 egress(root) 与 ingress，以避免历史脚本残留的 ingress/ifb 规则导致限速仍然生效
+        cmds = [
+            f"sudo tc qdisc del dev {iface} root",
+            f"sudo tc qdisc del dev {iface} ingress",
+        ]
+        for cmd in cmds:
+            if is_remote and ip:
+                run_remote_cmd(cmd, ip, ignore_error=True, quiet=True)
+            else:
+                run_cmd(cmd, ignore_error=True, quiet=True)
+
+        # 尝试清理常见的 ifb 设备（若未使用/不存在会被忽略）
+        if is_remote and ip:
+            run_remote_cmd("sudo tc qdisc del dev ifb0 root", ip, ignore_error=True, quiet=True)
+            run_remote_cmd("sudo ip link set ifb0 down", ip, ignore_error=True, quiet=True)
+        else:
+            run_cmd("sudo tc qdisc del dev ifb0 root", ignore_error=True, quiet=True)
+            run_cmd("sudo ip link set ifb0 down", ignore_error=True, quiet=True)
+
+    def _tc_dump(iface: str, *, is_remote: bool = False, ip: Optional[str] = None):
+        show_cmd = f"sudo tc qdisc show dev {iface}"
+        location = f"remote:{ip}" if is_remote and ip else "local"
+        print(f"[net] {location} before-clean: {iface}")
+        if is_remote and ip:
+            run_remote_cmd(show_cmd, ip, ignore_error=True, quiet=False)
+        else:
+            run_cmd(show_cmd, ignore_error=True, quiet=False)
+
+    # dump 当前状态，方便定位问题
+    _tc_dump("enp2s0", is_remote=False)
+    _tc_dump("enp2s0", is_remote=True, ip=DEST_IP)
     if YCSB_IP:
-        run_remote_cmd("sudo tc qdisc del dev ens33 root", YCSB_IP, ignore_error=True, quiet=True)
+        _tc_dump("ens33", is_remote=True, ip=YCSB_IP)
+
+    # 执行清理
+    _tc_clear_all("enp2s0", is_remote=False)
+    _tc_clear_all("enp2s0", is_remote=True, ip=DEST_IP)
+    if YCSB_IP:
+        _tc_clear_all("ens33", is_remote=True, ip=YCSB_IP)
+
+    # 清理后再 dump 一次以确认已清空
+    print("[net] post-clean state")
+    _tc_dump("enp2s0", is_remote=False)
+    _tc_dump("enp2s0", is_remote=True, ip=DEST_IP)
+    if YCSB_IP:
+        _tc_dump("ens33", is_remote=True, ip=YCSB_IP)
 
 
 def configure_network():
@@ -507,11 +551,15 @@ if __name__ == "__main__":
     # update_keepalived_priority(70)
     # update_keepalived_priority(30,True,DEST_IP)
     # clean_configure_network()
+    # 进程退出时做一次最终网络清理（统一善后）
+    atexit.register(clean_configure_network)
     # 主流程
     for exp_name, exp_args in experiments.items():
         for i in range(1, runs + 1):
             print(f"======== Running {exp_name} experiment run {i} ========")
             try:
+                # 确保本轮开始前未残留任何限速规则，避免影响 load 阶段
+                clean_configure_network()
                 # 准备目标节点
                 destination_prepare()
 
@@ -537,7 +585,6 @@ if __name__ == "__main__":
                 # destination_clean(args)
 
                 # 清理网络配置
-                clean_configure_network()
                 # 还原keepalived配置
                 update_keepalived_priority(70)
                 update_keepalived_priority(30, True, DEST_IP)

@@ -472,6 +472,7 @@ def run_migration(experiment_args, container_name):
 
 
 def main():
+    import atexit
     # 使用参数值更新全局变量
     global SOURCE_IP, DEST_IP, CLIENT_IP, BANDWIDTH
     parser = argparse.ArgumentParser(description="InfluxDB自动化负载测试脚本")
@@ -536,6 +537,8 @@ def main():
         for run_num in range(1, args.runs + 1):
             print(f"-------- Experiment {exp_name}, run {run_num} --------")
             try:
+                # 确保本轮开始前未残留任何限速规则，避免影响 load 阶段
+                clean_configure_network()
                 # 环境准备（总是执行）
                 print("Preparing destination and source environments...")
                 destination_prepare()
@@ -602,7 +605,7 @@ def main():
                 destination_clean()
                 source_clean()
                 # 清理网络配置
-                clean_configure_network()
+                # 迭代结尾不再清理网络，避免与开头重复；由 atexit 统一善后
 
             time.sleep(17)  # 等待清理缓冲
 

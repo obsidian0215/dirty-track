@@ -400,6 +400,9 @@ experiments = {
 
 # 主流程
 if __name__ == "__main__":
+    import atexit
+    # 进程退出时做一次最终网络清理（统一善后）
+    atexit.register(clean_configure_network)
     parser = argparse.ArgumentParser(description="Automate container migration using runc and CRIU.")
     parser.add_argument("-c", "--container", required=True, help="The name of the container to migrate.")
     parser.add_argument("-t", "--tool", required=False, help="Specify the test tool to use.")
@@ -456,7 +459,7 @@ if __name__ == "__main__":
                 # input()
                 source_clean(args)
                 destination_clean(args)
-                clean_configure_network()
+                # 迭代结尾不再清理网络，避免与开头重复；由 atexit 统一善后
 
                 # 还原keepalived配置
                 update_keepalived_priority(70)

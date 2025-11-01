@@ -497,6 +497,8 @@ def main():
         for run_num in range(1, args.runs + 1):
             print(f"-------- Experiment {exp_name}, run {run_num} --------")
             try:
+                # 确保本轮开始前未残留任何限速规则，避免影响 load 阶段
+                clean_configure_network()
                 # 环境准备（总是执行）
                 print("Preparing destination and source environments...")
                 destination_prepare()
@@ -548,8 +550,6 @@ def main():
             finally:
                 # 清理资源（总是清理）
                 print("Cleaning up resources...")
-                # 清理网络配置
-                clean_configure_network()
                 destination_clean()
                 source_clean()
                 # clean_configure_network()
@@ -565,4 +565,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import atexit
+    # 进程退出时做一次最终网络清理（统一善后）
+    atexit.register(clean_configure_network)
     main()
