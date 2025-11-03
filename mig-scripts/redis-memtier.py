@@ -62,6 +62,7 @@ if __name__ == "__main__":
     globals()["SOURCE_SCRIPT"] = src
     globals()["DEST_SCRIPT"] = dst
     globals()["SEC_MODE"] = sec_enabled
+    print(f"[sec] mode={'on' if sec_enabled else 'off'} using DEST_SCRIPT={dst}, SOURCE_SCRIPT={src}")
 
     # memtier 相关参数  # [memtier] changed
     MT_N = parsed_args.mt_n

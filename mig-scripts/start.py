@@ -427,6 +427,7 @@ if __name__ == "__main__":
     runs = args.runs
     # 选择 source 脚本：使用 centralized helper
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
+    print(f"[sec] mode={'on' if getattr(args,'sec',False) else 'off'} using DEST_SCRIPT={DEST_SCRIPT}, SOURCE_SCRIPT={SOURCE_SCRIPT}")
     # print(DEST_IP)
     # input()
     for exp_name, exp_args in experiments.items():

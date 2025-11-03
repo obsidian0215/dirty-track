@@ -534,6 +534,7 @@ def main():
     global SOURCE_SCRIPT, DEST_SCRIPT, SEC_MODE
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(args.sec)
     SEC_MODE = args.sec
+    print(f"[sec] mode={'on' if SEC_MODE else 'off'} using DEST_SCRIPT={DEST_SCRIPT}, SOURCE_SCRIPT={SOURCE_SCRIPT}")
 
     # 设置场景特有bucket
     if not args.bucket:

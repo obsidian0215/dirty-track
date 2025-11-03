@@ -60,6 +60,7 @@ if __name__ == "__main__":
     globals()["SOURCE_SCRIPT"] = src
     globals()["DEST_SCRIPT"] = dst
     globals()["SEC_MODE"] = sec_enabled
+    print(f"[sec] mode={'on' if sec_enabled else 'off'} using DEST_SCRIPT={dst}, SOURCE_SCRIPT={src}")
 
 # 定义实验类型与参数
 experiments = {

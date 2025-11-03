@@ -467,7 +467,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
 
 def main():
     # 使用参数值更新全局变量
-    global SOURCE_IP, DEST_IP, CLIENT_IP, SOURCE_SCRIPT
+    global SOURCE_IP, DEST_IP, CLIENT_IP, SOURCE_SCRIPT, DEST_SCRIPT
     parser = argparse.ArgumentParser(description="Redis自动化负载测试脚本")
     parser.add_argument("-s", "--source-ip", default=SOURCE_IP, help="迁移源IP")
     parser.add_argument("-d", "--dest-ip", default=DEST_IP, help="迁移目标IP")
@@ -503,6 +503,7 @@ def main():
     sec_enabled = getattr(args, "sec", False)
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(sec_enabled)
     globals()["SEC_MODE"] = sec_enabled
+    print(f"[sec] mode={'on' if sec_enabled else 'off'} using DEST_SCRIPT={DEST_SCRIPT}, SOURCE_SCRIPT={SOURCE_SCRIPT}")
 
     experiment_types_to_run = args.experiment_types if args.experiment_types else list(experiments.keys())
 

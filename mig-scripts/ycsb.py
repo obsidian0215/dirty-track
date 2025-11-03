@@ -54,6 +54,7 @@ if __name__ == "__main__":
     sec_enabled = getattr(parsed_args, "sec", False)
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(sec_enabled)
     globals()["SEC_MODE"] = sec_enabled
+    print(f"[sec] mode={'on' if sec_enabled else 'off'} using DEST_SCRIPT={DEST_SCRIPT}, SOURCE_SCRIPT={SOURCE_SCRIPT}")
     # set bandwidth
     globals()["BANDWIDTH"] = getattr(parsed_args, "bandwidth", BANDWIDTH)
 
