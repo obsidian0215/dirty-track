@@ -54,9 +54,9 @@ def append_result(
         row_values.append("")
 
     with open(fname, "a", encoding="utf-8") as f:
+        # If file is new, write experiment header + params + optional extra lines + header row
         if is_new:
             f.write(f"# experiment: {exp_name}\n")
-            # 仅在新文件（本实验第一次循环）写入参数摘要，避免每次循环重复
             comment_parts = []
             if exp_params:
                 comment_parts.append(exp_params)
@@ -64,11 +64,45 @@ def append_result(
                 comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
             if comment_parts:
                 f.write(f"# params: {' | '.join(comment_parts)}\n")
-            # 额外的参数行（例如将 workload 的 load/run 拆成两行）
             if extra_param_lines:
                 for line in extra_param_lines:
                     if line:
                         f.write(f"# params: {line}\n")
-        if is_new:
             f.write("\t".join(header_columns) + "\n")
+            f.write("\t".join(row_values) + "\n")
+            return
+
+        # If file already exists, check whether an equivalent params block is present.
+        # If not, append a params block (main params + extra lines) once before the row.
+        need_params = True
+        try:
+            with open(fname, "r", encoding="utf-8") as fr:
+                contents = fr.read()
+                # Look for a params line that contains both exp_params and secure flag
+                if exp_params:
+                    if f"# params: {exp_params}" in contents:
+                        # if secure provided, verify secure string present near it
+                        if is_secure is None or f"secure={'yes' if is_secure else 'no'}" in contents:
+                            need_params = False
+                else:
+                    # no exp_params passed; if any params line exists, assume present
+                    if "# params:" in contents:
+                        need_params = False
+        except Exception:
+            need_params = True
+
+        if need_params:
+            comment_parts = []
+            if exp_params:
+                comment_parts.append(exp_params)
+            if is_secure is not None:
+                comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
+            if comment_parts:
+                f.write(f"# params: {' | '.join(comment_parts)}\n")
+            if extra_param_lines:
+                for line in extra_param_lines:
+                    if line:
+                        f.write(f"# params: {line}\n")
+
+        # Finally append the row
         f.write("\t".join(row_values) + "\n")
