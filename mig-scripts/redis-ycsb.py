@@ -482,7 +482,21 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
+            params_summary = f"exp: {exp_args}"
+            extra_lines = [
+                f"workload-load: ycsbA redis.host={VIP} redis.port=6379 recordcount={RECORD_COUNT}",
+                f"workload-run: ycsbA redis.host={VIP} redis.port=6379 operationcount={OPERATION_COUNT}",
+            ]
+            append_result(
+                exp_name,
+                "redis",
+                run_index,
+                stats,
+                header,
+                params_summary,
+                is_secure=SEC_MODE,
+                extra_param_lines=extra_lines,
+            )
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

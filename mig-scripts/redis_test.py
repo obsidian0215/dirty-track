@@ -420,7 +420,24 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
     try:
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
+            # 生成 workload 概览（scene 单独在主行；load/run 各一行）
+            def args_to_str(d):
+                return " ".join(f"{k} {v}" for k, v in d.items() if v is not None and v != "")
+            params_summary = f"exp: {exp_args} | scene={scene}"
+            extra_lines = [
+                f"workload-load: {args_to_str(extra_args)}",
+                f"workload-run: {args_to_str(run_args)}",
+            ]
+            append_result(
+                exp_name,
+                "redis",
+                run_index,
+                stats,
+                header,
+                params_summary,
+                is_secure=SEC_MODE,
+                extra_param_lines=extra_lines,
+            )
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

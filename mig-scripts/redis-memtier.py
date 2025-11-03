@@ -534,7 +534,24 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
         stdout = getattr(result, "stdout", "") or ""
         header, stats = extract_stats_from_output(stdout)
         if stats:
-            append_result(exp_name, "redis", run_index, stats, header, exp_args, is_secure=SEC_MODE)
+            # 仅在文件首次创建时写入：将 memtier 的 load 与 run 拆成两行
+            load_summary = "workload-load: memtier c=5 t=4 ratio=9:1 dsl=32:3,64:4,128:3,512:1,1024:1"
+            run_summary = (
+                "workload-run: memtier "
+                f"n=210000 c={MT_C} t={MT_T} ratio=6:1 dsl=32:2,64:4,128:5,512:4,1024:1,2048:1"
+                + (" rand=on" if MT_RAND else " rand=off")
+            )
+            params_summary = f"exp: {exp_args}"
+            append_result(
+                exp_name,
+                "redis",
+                run_index,
+                stats,
+                header,
+                params_summary,
+                is_secure=SEC_MODE,
+                extra_param_lines=[load_summary, run_summary],
+            )
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
         else:
             print("No statistics line found in source output; skipping result write.")

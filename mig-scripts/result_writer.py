@@ -34,6 +34,7 @@ def append_result(
     header_line: Optional[str] = None,
     exp_params: Optional[str] = None,
     is_secure: Optional[bool] = None,
+    extra_param_lines: Optional[list] = None,
 ):
     results_dir = _ensure_results_dir()
     fname = os.path.join(results_dir, f"{exp_name}.tsv")
@@ -55,13 +56,19 @@ def append_result(
     with open(fname, "a", encoding="utf-8") as f:
         if is_new:
             f.write(f"# experiment: {exp_name}\n")
-        comment_parts = []
-        if exp_params:
-            comment_parts.append(exp_params)
-        if is_secure is not None:
-            comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
-        if comment_parts:
-            f.write(f"# params: {' | '.join(comment_parts)}\n")
+            # 仅在新文件（本实验第一次循环）写入参数摘要，避免每次循环重复
+            comment_parts = []
+            if exp_params:
+                comment_parts.append(exp_params)
+            if is_secure is not None:
+                comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
+            if comment_parts:
+                f.write(f"# params: {' | '.join(comment_parts)}\n")
+            # 额外的参数行（例如将 workload 的 load/run 拆成两行）
+            if extra_param_lines:
+                for line in extra_param_lines:
+                    if line:
+                        f.write(f"# params: {line}\n")
         if is_new:
             f.write("\t".join(header_columns) + "\n")
         f.write("\t".join(row_values) + "\n")
