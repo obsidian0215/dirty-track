@@ -77,17 +77,30 @@ def append_result(
         need_params = True
         try:
             with open(fname, "r", encoding="utf-8") as fr:
-                contents = fr.read()
-                # Look for a params line that contains both exp_params and secure flag
-                if exp_params:
-                    if f"# params: {exp_params}" in contents:
-                        # if secure provided, verify secure string present near it
-                        if is_secure is None or f"secure={'yes' if is_secure else 'no'}" in contents:
-                            need_params = False
+                params_lines = [
+                    line.strip()[len("# params:"):].strip()
+                    for line in fr
+                    if line.strip().startswith("# params:")
+                ]
+
+                # Normalize existing params into sets of tokens per line
+                existing_param_sets = []
+                for pl in params_lines:
+                    parts = [p.strip() for p in pl.split("|") if p.strip()]
+                    existing_param_sets.append(set(parts))
+
+                # If no exp_params provided, presence of any params line means we already have params
+                if not exp_params and existing_param_sets:
+                    need_params = False
                 else:
-                    # no exp_params passed; if any params line exists, assume present
-                    if "# params:" in contents:
-                        need_params = False
+                    # Check whether any existing params line contains both the exp_params token and the secure token
+                    target_secure = f"secure={'yes' if is_secure else 'no'}" if is_secure is not None else None
+                    for pset in existing_param_sets:
+                        has_exp = exp_params in pset if exp_params else True
+                        has_secure = (target_secure in pset) if target_secure else True
+                        if has_exp and has_secure:
+                            need_params = False
+                            break
         except Exception:
             need_params = True
 
