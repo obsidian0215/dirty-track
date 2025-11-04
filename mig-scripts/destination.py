@@ -149,6 +149,9 @@ class TransferManager:
         self.final_token: Optional[str] = None
         self.final_info: Optional[Dict[str, object]] = None
         self.final_event = threading.Event()
+        # keep a short-lived cache of recently completed non-final sessions
+        # maps token -> (result_dict, completion_time)
+        self._completed_sessions: Dict[str, tuple] = {}
 
     def reset(self) -> None:
         with self.lock:
@@ -158,6 +161,7 @@ class TransferManager:
             self.final_token = None
             self.final_info = None
             self.final_event.clear()
+            self._completed_sessions.clear()
 
     def _finalize_session(self, session: TransferSession) -> None:
         result: Dict[str, object] = {
@@ -174,6 +178,12 @@ class TransferManager:
             if self.final_token == session.token:
                 self.final_info = result
                 self.final_event.set()
+            else:
+                # store recently completed non-final session results for a short period
+                try:
+                    self._completed_sessions[session.token] = (result, time.time())
+                except Exception:
+                    pass
 
     def create_session(
         self,
@@ -197,6 +207,21 @@ class TransferManager:
         with self.lock:
             session = self.sessions.get(token)
             if not session:
+                # maybe the session already finished and was moved into the
+                # completed-sessions cache by _finalize_session; return that if
+                # it's recent enough
+                completed = self._completed_sessions.get(token)
+                if completed is not None:
+                    result, when = completed
+                    # TTL: 60 seconds
+                    if time.time() - when < 60.0:
+                        return result
+                    else:
+                        # remove stale entry
+                        try:
+                            self._completed_sessions.pop(token, None)
+                        except Exception:
+                            pass
                 if self.final_token == token and self.final_info is not None:
                     return self.final_info
                 return {"status": "ERROR", "message": "unknown transfer token"}
