@@ -35,6 +35,7 @@ def append_result(
     exp_params: Optional[str] = None,
     is_secure: Optional[bool] = None,
     extra_param_lines: Optional[list] = None,
+    first_in_run: bool = False,
 ):
     results_dir = _ensure_results_dir()
     fname = os.path.join(results_dir, f"{exp_name}.tsv")
@@ -73,34 +74,62 @@ def append_result(
             return
 
         # If file already exists, check whether an equivalent params block is present.
-        # If not, append a params block (main params + extra lines) once before the row.
+        # We'll construct the desired params block (main line + extra lines) and compare
+        # it against the last params block in the file. Only append if they differ.
+        # However, if this call is the first loop in the current script run (first_in_run=True),
+        # we explicitly write the params block once at the start of this run.
         need_params = True
         try:
             with open(fname, "r", encoding="utf-8") as fr:
-                params_lines = [
-                    line.strip()[len("# params:"):].strip()
-                    for line in fr
-                    if line.strip().startswith("# params:")
-                ]
+                lines = fr.readlines()
 
-                # Normalize existing params into sets of tokens per line
-                existing_param_sets = []
-                for pl in params_lines:
-                    parts = [p.strip() for p in pl.split("|") if p.strip()]
-                    existing_param_sets.append(set(parts))
+            # Build desired params block as list of strings (without the leading marker)
+            desired_block = []
+            comment_parts = []
+            if exp_params:
+                comment_parts.append(exp_params)
+            if is_secure is not None:
+                comment_parts.append(f"secure={'yes' if is_secure else 'no'}")
+            if comment_parts:
+                desired_block.append(" | ".join(comment_parts))
+            if extra_param_lines:
+                for line in extra_param_lines:
+                    if line:
+                        desired_block.append(line.strip())
 
-                # If no exp_params provided, presence of any params line means we already have params
-                if not exp_params and existing_param_sets:
+            # If file has no params at all, we need to write them (if we have any)
+            params_indices = [i for i, ln in enumerate(lines) if ln.strip().startswith("# params:")]
+            if not params_indices:
+                # If there's nothing desired to write, mark no need
+                need_params = bool(desired_block)
+            else:
+                # Find the start index of the last contiguous params block
+                last_idx = params_indices[-1]
+                start = last_idx
+                # walk backwards to find the beginning of that block
+                while start > 0 and lines[start - 1].strip().startswith("# params:"):
+                    start -= 1
+
+                existing_block = []
+                i = start
+                while i < len(lines) and lines[i].strip().startswith("# params:"):
+                    existing_block.append(lines[i].strip()[len("# params:"):].strip())
+                    i += 1
+
+                # Compare desired block to existing block exactly (order matters)
+                if desired_block and existing_block == desired_block:
+                    # identical to last written block
                     need_params = False
                 else:
-                    # Check whether any existing params line contains both the exp_params token and the secure token
-                    target_secure = f"secure={'yes' if is_secure else 'no'}" if is_secure is not None else None
-                    for pset in existing_param_sets:
-                        has_exp = exp_params in pset if exp_params else True
-                        has_secure = (target_secure in pset) if target_secure else True
-                        if has_exp and has_secure:
-                            need_params = False
-                            break
+                    # If no desired block (nothing to write), but file already has params, don't add
+                    if not desired_block:
+                        need_params = False
+                    else:
+                        need_params = True
+            # If caller requested this to be the first call in the current run, force write
+            if first_in_run:
+                # Only write when we have something to write
+                need_params = bool(desired_block)
         except Exception:
             need_params = True
 
