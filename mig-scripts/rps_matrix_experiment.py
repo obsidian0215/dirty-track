@@ -124,81 +124,81 @@ def wait_for_pid_exit(pid: int, timeout: int) -> None:
         time.sleep(0.5)
 
 
-    def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
-        """Lazy, safe loader for mig-scripts/source.py helpers.
+def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
+    """Lazy, safe loader for mig-scripts/source.py helpers.
 
-        Returns a tuple (device_file, device_fd, dirtymap_path). Any of the
-        returned values may be None on failure. This function sets module-level
-        globals (DEVICE_PATH, set_dirty_map_path, execute_dirty_track, etc.) when
-        the source module is available.
-        """
-        global DEVICE_PATH, set_dirty_map_path, ioctl_start_pid, ioctl_stop_pid, get_runc_container_pidtree, container_pids, container_may_dump_size, execute_dirty_track
+    Returns a tuple (device_file, device_fd, dirtymap_path). Any of the
+    returned values may be None on failure. This function sets module-level
+    globals (DEVICE_PATH, set_dirty_map_path, execute_dirty_track, etc.) when
+    the source module is available.
+    """
+    global DEVICE_PATH, set_dirty_map_path, ioctl_start_pid, ioctl_stop_pid, get_runc_container_pidtree, container_pids, container_may_dump_size, execute_dirty_track
+    device_file = None
+    device_fd = None
+    dirtymap_path = None
+    try:
+        import importlib.util
+
+        if repo_root is None:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        src_path = os.path.join(os.path.dirname(__file__), "source.py")
+        if os.path.exists(src_path):
+            spec = importlib.util.spec_from_file_location("mig_scripts_source", src_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                # temporarily silence stdout/stderr and reset argv to avoid parse-time output
+                old_argv = list(sys.argv)
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                try:
+                    devnull = open(os.devnull, "w")
+                    sys.stdout = devnull
+                    sys.stderr = devnull
+                    sys.argv = [sys.argv[0]]
+                    try:
+                        spec.loader.exec_module(module)
+                    except SystemExit:
+                        # some mig-scripts call parse_args() at import-time; ignore exit
+                        pass
+                    finally:
+                        devnull.close()
+                finally:
+                    sys.argv = old_argv
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+                # extract expected symbols if available
+                DEVICE_PATH = getattr(module, "DEVICE_PATH", None)
+                set_dirty_map_path = getattr(module, "set_dirty_map_path", None)
+                ioctl_start_pid = getattr(module, "ioctl_start_pid", None)
+                ioctl_stop_pid = getattr(module, "ioctl_stop_pid", None)
+                get_runc_container_pidtree = getattr(module, "get_runc_container_pidtree", None)
+                container_pids = getattr(module, "container_pids", None)
+                container_may_dump_size = getattr(module, "container_may_dump_size", None)
+                execute_dirty_track = getattr(module, "execute_dirty_track", None)
+
+        device_node = DEVICE_PATH if DEVICE_PATH else "/dev/dirty-track"
+        if not os.path.exists(device_node):
+            try_build_and_load_light_dt(repo_root)
+        if os.path.exists(device_node):
+            try:
+                device_file = open(device_node, "wb")
+                device_fd = device_file.fileno()
+                dirtymap_path = f"/runc/containers/{container}/migrate/dirty_map"
+                if get_runc_container_pidtree:
+                    get_runc_container_pidtree(container)
+                if set_dirty_map_path:
+                    set_dirty_map_path(device_fd, dirtymap_path)
+            except Exception:
+                # ignore init failures; keep best-effort semantics
+                device_file = None
+                device_fd = None
+                dirtymap_path = None
+    except Exception:
+        # silent on any loader error
         device_file = None
         device_fd = None
         dirtymap_path = None
-        try:
-            import importlib.util
-
-            if repo_root is None:
-                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            src_path = os.path.join(os.path.dirname(__file__), "source.py")
-            if os.path.exists(src_path):
-                spec = importlib.util.spec_from_file_location("mig_scripts_source", src_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    # temporarily silence stdout/stderr and reset argv to avoid parse-time output
-                    old_argv = list(sys.argv)
-                    old_stdout = sys.stdout
-                    old_stderr = sys.stderr
-                    try:
-                        devnull = open(os.devnull, "w")
-                        sys.stdout = devnull
-                        sys.stderr = devnull
-                        sys.argv = [sys.argv[0]]
-                        try:
-                            spec.loader.exec_module(module)
-                        except SystemExit:
-                            # some mig-scripts call parse_args() at import-time; ignore exit
-                            pass
-                        finally:
-                            devnull.close()
-                    finally:
-                        sys.argv = old_argv
-                        sys.stdout = old_stdout
-                        sys.stderr = old_stderr
-                    # extract expected symbols if available
-                    DEVICE_PATH = getattr(module, "DEVICE_PATH", None)
-                    set_dirty_map_path = getattr(module, "set_dirty_map_path", None)
-                    ioctl_start_pid = getattr(module, "ioctl_start_pid", None)
-                    ioctl_stop_pid = getattr(module, "ioctl_stop_pid", None)
-                    get_runc_container_pidtree = getattr(module, "get_runc_container_pidtree", None)
-                    container_pids = getattr(module, "container_pids", None)
-                    container_may_dump_size = getattr(module, "container_may_dump_size", None)
-                    execute_dirty_track = getattr(module, "execute_dirty_track", None)
-
-            device_node = DEVICE_PATH if DEVICE_PATH else "/dev/dirty-track"
-            if not os.path.exists(device_node):
-                try_build_and_load_light_dt(repo_root)
-            if os.path.exists(device_node):
-                try:
-                    device_file = open(device_node, "wb")
-                    device_fd = device_file.fileno()
-                    dirtymap_path = f"/runc/containers/{container}/migrate/dirty_map"
-                    if get_runc_container_pidtree:
-                        get_runc_container_pidtree(container)
-                    if set_dirty_map_path:
-                        set_dirty_map_path(device_fd, dirtymap_path)
-                except Exception:
-                    # ignore init failures; keep best-effort semantics
-                    device_file = None
-                    device_fd = None
-                    dirtymap_path = None
-        except Exception:
-            # silent on any loader error
-            device_file = None
-            device_fd = None
-            dirtymap_path = None
-        return device_file, device_fd, dirtymap_path
+    return device_file, device_fd, dirtymap_path
 
 
 def main():
@@ -352,9 +352,45 @@ def main():
                     if not name:
                         continue
                     bundle_dir = os.path.join("/runc/containers", name)
-                    # 1/2: reset bundle from .bak if available (best-effort)
-                    rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
-                    cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
+                        # ensure any previous runc container record is removed (best-effort)
+                        pre_kill_cmd = f"runc kill {shlex.quote(name)} || true"
+                        pre_delete_cmd = f"runc delete {shlex.quote(name)} || true"
+                        print(f"[backend] -> {pre_kill_cmd}")
+                        print(f"[backend] -> {pre_delete_cmd}")
+                        # Best-effort: try kill+delete and verify the container no longer
+                        # appears in runc list. Retry a few times because runc state may
+                        # be transient.
+                        if not dry_run:
+                            try:
+                                run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
+                            except Exception:
+                                pass
+                            try:
+                                run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
+                            except Exception:
+                                pass
+                            # also remove any leftover console socket to avoid recvtty conflicts
+                            try:
+                                console_sock = os.path.join(bundle_dir, "console.sock")
+                                run_cmd(f"rm -f {shlex.quote(console_sock)}", quiet=True, ignore_error=True)
+                            except Exception:
+                                pass
+                            # retry check: if container still shows in runc list, try a few more times
+                            for _ in range(3):
+                                try:
+                                    chk = run_cmd(f"runc list | grep -w {shlex.quote(name)}", quiet=True, ignore_error=True)
+                                    out = getattr(chk, "stdout", "") or ""
+                                    if not out.strip():
+                                        break
+                                    # attempt again
+                                    run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
+                                    run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
+                                    time.sleep(1)
+                                except Exception:
+                                    time.sleep(1)
+                        # 1/2: reset bundle from .bak if available (best-effort)
+                        rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
+                        cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
                     recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
                     console_sock = os.path.join(bundle_dir, "console.sock")
                     run_cmd_str = f"runc run --console-socket {shlex.quote(console_sock)} -d -b {shlex.quote(bundle_dir)} {shlex.quote(name)}"
