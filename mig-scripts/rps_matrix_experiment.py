@@ -29,30 +29,18 @@ from typing import Dict, List, Optional
 from cmd_utils import run_cmd, unmount_local_migration_tmpfs
 from result_writer import extract_stats_from_output
 
-# Try to import helpers from source.py (light-dt ioctl helpers)
-# Note: some mig-scripts modules parse CLI args at import-time (they call argparse.parse_args()).
-# Importing them can raise SystemExit when running this script. Catch BaseException to avoid
-# aborting on those cases and fall back to None values.
-try:
-    from source import (
-        DEVICE_PATH,
-        set_dirty_map_path,
-        ioctl_start_pid,
-        ioctl_stop_pid,
-        get_runc_container_pidtree,
-        container_pids,
-        container_may_dump_size,
-        execute_dirty_track,
-    )
-except BaseException:
-    DEVICE_PATH = None
-    set_dirty_map_path = None
-    ioctl_start_pid = None
-    ioctl_stop_pid = None
-    get_runc_container_pidtree = None
-    container_pids = None
-    container_may_dump_size = None
-    execute_dirty_track = None
+# Note: loading of migration / dirty-map helpers from `source.py` is done
+# lazily inside main() only when --dirtymap is requested. This avoids noisy
+# import-time side-effects from other mig-scripts modules that parse CLI args
+# at import time.
+DEVICE_PATH = None
+set_dirty_map_path = None
+ioctl_start_pid = None
+ioctl_stop_pid = None
+get_runc_container_pidtree = None
+container_pids = None
+container_may_dump_size = None
+execute_dirty_track = None
 
 
 def try_build_and_load_light_dt(repo_root: str) -> bool:
@@ -134,6 +122,83 @@ def wait_for_pid_exit(pid: int, timeout: int) -> None:
         if time.time() - start > timeout:
             return
         time.sleep(0.5)
+
+
+    def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
+        """Lazy, safe loader for mig-scripts/source.py helpers.
+
+        Returns a tuple (device_file, device_fd, dirtymap_path). Any of the
+        returned values may be None on failure. This function sets module-level
+        globals (DEVICE_PATH, set_dirty_map_path, execute_dirty_track, etc.) when
+        the source module is available.
+        """
+        global DEVICE_PATH, set_dirty_map_path, ioctl_start_pid, ioctl_stop_pid, get_runc_container_pidtree, container_pids, container_may_dump_size, execute_dirty_track
+        device_file = None
+        device_fd = None
+        dirtymap_path = None
+        try:
+            import importlib.util
+
+            if repo_root is None:
+                repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            src_path = os.path.join(os.path.dirname(__file__), "source.py")
+            if os.path.exists(src_path):
+                spec = importlib.util.spec_from_file_location("mig_scripts_source", src_path)
+                if spec and spec.loader:
+                    module = importlib.util.module_from_spec(spec)
+                    # temporarily silence stdout/stderr and reset argv to avoid parse-time output
+                    old_argv = list(sys.argv)
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    try:
+                        devnull = open(os.devnull, "w")
+                        sys.stdout = devnull
+                        sys.stderr = devnull
+                        sys.argv = [sys.argv[0]]
+                        try:
+                            spec.loader.exec_module(module)
+                        except SystemExit:
+                            # some mig-scripts call parse_args() at import-time; ignore exit
+                            pass
+                        finally:
+                            devnull.close()
+                    finally:
+                        sys.argv = old_argv
+                        sys.stdout = old_stdout
+                        sys.stderr = old_stderr
+                    # extract expected symbols if available
+                    DEVICE_PATH = getattr(module, "DEVICE_PATH", None)
+                    set_dirty_map_path = getattr(module, "set_dirty_map_path", None)
+                    ioctl_start_pid = getattr(module, "ioctl_start_pid", None)
+                    ioctl_stop_pid = getattr(module, "ioctl_stop_pid", None)
+                    get_runc_container_pidtree = getattr(module, "get_runc_container_pidtree", None)
+                    container_pids = getattr(module, "container_pids", None)
+                    container_may_dump_size = getattr(module, "container_may_dump_size", None)
+                    execute_dirty_track = getattr(module, "execute_dirty_track", None)
+
+            device_node = DEVICE_PATH if DEVICE_PATH else "/dev/dirty-track"
+            if not os.path.exists(device_node):
+                try_build_and_load_light_dt(repo_root)
+            if os.path.exists(device_node):
+                try:
+                    device_file = open(device_node, "wb")
+                    device_fd = device_file.fileno()
+                    dirtymap_path = f"/runc/containers/{container}/migrate/dirty_map"
+                    if get_runc_container_pidtree:
+                        get_runc_container_pidtree(container)
+                    if set_dirty_map_path:
+                        set_dirty_map_path(device_fd, dirtymap_path)
+                except Exception:
+                    # ignore init failures; keep best-effort semantics
+                    device_file = None
+                    device_fd = None
+                    dirtymap_path = None
+        except Exception:
+            # silent on any loader error
+            device_file = None
+            device_fd = None
+            dirtymap_path = None
+        return device_file, device_fd, dirtymap_path
 
 
 def main():
@@ -513,22 +578,9 @@ def main():
     device_fd = None
     dirtymap_path = None
 
+    # Lazy-load migration / dirty-map helpers only when requested (encapsulated)
     if args.dirtymap:
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        device_node = DEVICE_PATH if DEVICE_PATH else "/dev/dirty-track"
-        if not os.path.exists(device_node):
-            try_build_and_load_light_dt(repo_root)
-        if os.path.exists(device_node):
-            try:
-                device_file = open(device_node, "wb")
-                device_fd = device_file.fileno()
-                dirtymap_path = f"/runc/containers/{args.container}/migrate/dirty_map"
-                if get_runc_container_pidtree:
-                    get_runc_container_pidtree(args.container)
-                if set_dirty_map_path:
-                    set_dirty_map_path(device_fd, dirtymap_path)
-            except Exception as e:
-                print(f"dirtymap init failed: {e}")
+        device_file, device_fd, dirtymap_path = load_dirtymap_helpers(args.container)
 
     # register cleanup that will try to stop tracking and unmount
     def _cleanup():
@@ -548,6 +600,16 @@ def main():
             try:
                 unmount_local_migration_tmpfs(args.container, ignore_error=True, quiet=True)
             except Exception:
+                pass
+            # close device file if we opened one
+            try:
+                if device_file:
+                    try:
+                        device_file.close()
+                    except Exception:
+                        pass
+            except NameError:
+                # device_file may not be defined in some paths
                 pass
 
     atexit.register(_cleanup)
