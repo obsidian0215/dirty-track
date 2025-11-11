@@ -801,7 +801,15 @@ def main():
             bytes_val = int(val)
         return bytes_val
 
-    rps_values = [int(x) for x in args.rps_list.split(",") if x.strip()]
+    # Determine the rate dimension (either rps or framerate). Use a
+    # generic 'rate_values' list and a 'rate_name' label so the rest of the
+    # script can operate generically for both kinds of benches.
+    if args.framerate_list:
+        rate_name = "framerate"
+        rate_values = [int(x) for x in args.framerate_list.split(",") if x.strip()]
+    else:
+        rate_name = "rps"
+        rate_values = [int(x) for x in (args.rps_list or "").split(",") if x.strip()]
     # convert payload sizes to bytes (default unit KB)
     payloads = [parse_size_token(x) for x in args.payload_sizes.split(",") if x.strip()]
     patterns = [x for x in args.patterns.split(",") if x.strip()]
@@ -890,13 +898,13 @@ def main():
 
     atexit.register(_cleanup)
 
-    for rps in rps_values:
+    for rate in rate_values:
         for payload in payloads:
             for payload_mode in payload_modes:
                 for pattern in patterns:
                     for run_idx in range(1, args.runs + 1):
                         print(
-                            f"Run rps={rps} payload={payload} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}"
+                            f"Run {rate_name}={rate} payload={payload} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}"
                         )
                     if args.dry_run:
                         pid = None
@@ -908,16 +916,22 @@ def main():
                     # include payload_mode in logname so different modes produce separate logs
                     safe_mode = payload_mode if payload_mode else "default"
                     local_logname = os.path.join(
-                        args.log_dir, f"bench_{rps}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log"
+                        args.log_dir, f"bench_{rate}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log"
                     )
-                    bench_cmd = args.bench_template.format(
-                        rps=rps,
-                        duration=args.duration,
-                        threads=args.threads,
-                        payload=payload,
-                        pattern=pattern,
-                        payload_mode=payload_mode,
-                    )
+                    # Format bench template: pass either 'rps' or 'framerate'
+                    # as the parameter expected by the bench script.
+                    fmt_kwargs = {
+                        "duration": args.duration,
+                        "threads": args.threads,
+                        "payload": payload,
+                        "pattern": pattern,
+                        "payload_mode": payload_mode,
+                    }
+                    if rate_name == "rps":
+                        fmt_kwargs["rps"] = rate
+                    else:
+                        fmt_kwargs["framerate"] = rate
+                    bench_cmd = args.bench_template.format(**fmt_kwargs)
 
                     # Heuristic: if the bench script doesn't support certain flags
                     # (e.g. many benches do not accept --rps), attempt to statically
@@ -966,7 +980,7 @@ def main():
                             if "@" not in args.client_ip:
                                 client_target = f"root@{args.client_ip}"
                             # run on remote client via SSH, create a log on remote host
-                            remote_logname = f"/tmp/bench_{rps}_{payload}_{pattern}_{run_idx}_{ts}.log"
+                            remote_logname = f"/tmp/bench_{rate}_{payload}_{pattern}_{run_idx}_{ts}.log"
                             remote_cmd = f"nohup {bench_cmd} > {shlex.quote(remote_logname)} 2>&1 < /dev/null & echo $!"
                             try:
                                 res = run_cmd(f"ssh -n {client_target} {shlex.quote(remote_cmd)}", quiet=True)
@@ -1088,7 +1102,7 @@ def main():
                         bench_stats = ""
                     row = [
                         datetime.utcnow().isoformat() + "Z",
-                        str(rps),
+                        str(rate),
                         str(payload_mode),
                         str(payload),
                         str(avg_payload_val),
@@ -1134,16 +1148,11 @@ def main():
 
                     # build params string for this combination
                     param_items = []
-                    # include rps or framerate depending on what's in args
-                    if args.rps_list:
-                        param_items.append(f"rps={rps}")
-                    if args.framerate_list:
-                        # attempt to include a representative framerate if provided
-                        # (in single-run mode framerate_list may be comma-separated)
-                        frs = [x for x in args.framerate_list.split(",") if x.strip()]
-                        if frs:
-                            # choose first framerate as representative
-                            param_items.append(f"fr={frs[0]}")
+                    # include rate (rps or framerate) for the params string
+                    if rate_name == "rps":
+                        param_items.append(f"rps={rate}")
+                    else:
+                        param_items.append(f"fr={rate}")
                     param_items.append(f"payload={payload}")
                     if payload_mode:
                         param_items.append(f"mode={payload_mode}")
@@ -1218,7 +1227,7 @@ def main():
                                 # compose a summary CSV row
                                 summary_row = [
                                     datetime.utcnow().isoformat() + "Z",
-                                    str(rps),
+                                    str(rate),
                                     str(payload_mode),
                                     str(payload),
                                     "",  # avg_payload_bytes

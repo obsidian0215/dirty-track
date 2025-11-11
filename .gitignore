@@ -17,3 +17,5 @@ __pycache__/
 *.pyc
 *-report.txt
 mig-scripts/results/
+logs/
+results/
