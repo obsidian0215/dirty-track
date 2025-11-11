@@ -312,6 +312,9 @@ def main():
         # allow either rps_list or framerate_list to be provided for single-run mode
         if not args.rps_list and not args.framerate_list:
             missing.append("--rps-list or --framerate-list")
+        # disallow both being provided at the same time
+        if args.rps_list and args.framerate_list:
+            parser.error("--rps-list and --framerate-list are mutually exclusive; provide only one")
         if missing:
             parser.error(f"the following arguments are required when --tests-file is not used: {', '.join(missing)}")
 
@@ -389,6 +392,15 @@ def main():
                 merged["dry_run"] = True
             # replace entry with merged view for downstream logic
             entry = merged
+            # Enforce mutual exclusion at the tests-file entry level: an entry
+            # must not specify both rps_list and framerate_list. If both are
+            # present, skip the entry and report the issue so the test author
+            # can correct the JSON.
+            has_rps = entry.get("rps_list") is not None or entry.get("rps-list") is not None
+            has_fr = entry.get("framerate_list") is not None or entry.get("framerate-list") is not None
+            if has_rps and has_fr:
+                print(f"tests-file entry '{entry.get('name', 'unnamed')}' invalid: both rps_list and framerate_list present; they are mutually exclusive. Skipping.")
+                continue
             # If bench_template is a relative path (common in tests_list), try to
             # resolve it relative to the repo root and rewrite it to an absolute
             # path so child runs don't depend on the current working directory.
@@ -567,13 +579,20 @@ def main():
                     if v:
                         cmd.append(fk)
                 else:
+                    # normalize list/tuple values coming from JSON -> comma-separated
+                    if isinstance(v, (list, tuple)):
+                        v_str = ",".join(str(x) for x in v)
+                    else:
+                        v_str = str(v)
                     # use extend to avoid rebinding outer 'cmd' in nested scope
-                    cmd.extend([fk, str(v)])
+                    cmd.extend([fk, v_str])
 
             # required/typical fields
             add_flag("container")
             add_flag("bench_template", "--bench-template")
-            add_flag("rps_list", "--rps-list")
+            # Rate dimension flags are mutually exclusive; they are handled
+            # explicitly below to ensure only one of --rps-list or
+            # --framerate-list is added to the spawned child.
             add_flag("payload_sizes", "--payload-sizes")
             add_flag("payload_modes", "--payload-modes")
             add_flag("patterns")
@@ -601,6 +620,33 @@ def main():
             except Exception:
                 pass
             cmd += ["--output", out, "--log-dir", logd]
+
+            # Ensure the spawned child receives a rate dimension argument.
+            # Tests entries may specify either 'framerate_list' or 'rps_list'.
+            # Prefer framerate_list when present.
+            # Ensure the spawned child receives a rate dimension argument.
+            # Tests entries may specify either 'framerate_list' or 'rps_list' (or
+            # the hyphenated equivalents). Accept list values in JSON and
+            # normalize them to comma-separated strings for CLI passing.
+            fr_val = entry.get("framerate_list") if entry.get("framerate_list") is not None else entry.get("framerate-list")
+            rp_val = entry.get("rps_list") if entry.get("rps_list") is not None else entry.get("rps-list")
+            def _norm_list_val(v):
+                if v is None:
+                    return None
+                if isinstance(v, (list, tuple)):
+                    return ",".join(str(x) for x in v)
+                return str(v)
+
+            fr_list = _norm_list_val(fr_val)
+            rp_list = _norm_list_val(rp_val)
+            # Prefer framerate when present, else rps
+            if fr_list:
+                # avoid duplicate if already added via add_flag
+                if "--framerate-list" not in cmd:
+                    cmd += ["--framerate-list", fr_list]
+            elif rp_list:
+                if "--rps-list" not in cmd:
+                    cmd += ["--rps-list", rp_list]
 
             print("Spawning rps_matrix for test:", entry.get("name", "unnamed"))
             # Start backends via runc by container name (best-effort). We always
@@ -885,40 +931,12 @@ def main():
                         if ok_resolve:
                             supported = _get_bench_supported_flags(tried_path)
                         if supported:
-                            # filter tokens: keep flags that are in supported set
-                            parts = shlex.split(bench_cmd)
-                            new_parts = []
-                            i = 0
-                            removed = []
-                            while i < len(parts):
-                                tok = parts[i]
-                                if tok.startswith("--"):
-                                    # handle --flag=value and --flag value
-                                    name = tok.split("=")[0]
-                                    if name in supported:
-                                        new_parts.append(tok)
-                                        # if this token is in form --flag (no '='),
-                                        # then the next token is likely the value
-                                        if "=" not in tok and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
-                                            new_parts.append(parts[i + 1])
-                                            i += 2
-                                            continue
-                                        i += 1
-                                        continue
-                                    else:
-                                        # skip this flag and its value (if present)
-                                        removed.append(name)
-                                        if "=" not in tok and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
-                                            i += 2
-                                            continue
-                                        i += 1
-                                        continue
-                                else:
-                                    new_parts.append(tok)
-                                    i += 1
-                            if removed:
-                                print(f"[bench-adapt] removed unsupported flags for {tried_path}: {', '.join(sorted(set(removed)))}")
-                                bench_cmd = " ".join(shlex.quote(p) for p in new_parts)
+                            # We detected supported flags in the bench script. Do
+                            # not automatically remove any flags from the generated
+                            # command; assume the tests JSON / bench_template are
+                            # correct. Just log what flags are supported for info.
+                            if supported:
+                                print(f"[bench-adapt] {tried_path} supports flags: {', '.join(sorted(supported))}")
                     except Exception:
                         # best-effort: if anything goes wrong leave bench_cmd as-is
                         pass
