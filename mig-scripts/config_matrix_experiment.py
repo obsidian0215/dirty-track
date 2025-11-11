@@ -208,6 +208,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Do not start benches; simulate runs locally and write small dry-run logs")
     parser.add_argument("--tests-file", default="", help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one matrix run per entry and exit.")
     parser.add_argument("--framerate-list", default="", help="Optional comma-separated framerate list for video tests (fps). Used as alternative to --rps-list for some benches.")
+    parser.add_argument("--frame-width", type=int, default=None, help="Frame width in pixels (forwarded from templates or resolution expansion).")
+    parser.add_argument("--frame-height", type=int, default=None, help="Frame height in pixels (forwarded from templates or resolution expansion).")
+    parser.add_argument("--analysis-intensity", default="", help="Optional analysis intensity string forwarded to video benches.")
     parser.add_argument("--resolution-list", default="", help="Optional comma-separated list of resolutions WxH (e.g. 1920x1080,1280x720). When provided, resolution_list drives payload/size variation for video benches by passing frame_width/frame_height values per-run.")
     args = parser.parse_args()
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -895,7 +898,17 @@ def main():
                             fmt_kwargs["rps"] = rate
                         else:
                             fmt_kwargs["framerate"] = rate
-                        bench_cmd = args.bench_template.format(**fmt_kwargs)
+                        bench_template_used = args.bench_template
+                        # If we are driving by resolution and template still contains a
+                        # {payload} placeholder, remove common --payload-size occurrences
+                        # so formatting doesn't KeyError. Video benches will compute
+                        # payload from frame dimensions themselves.
+                        if "payload" not in fmt_kwargs and "{payload}" in bench_template_used:
+                            # remove variants like: --payload-size {payload}  or  --payload-size='{payload}'  or  --payload-size="{payload}"
+                            bench_template_used = re.sub(r"--payload-size\s*(?:=\s*)?(?:'\{payload\}'|\"\{payload\}\"|\{payload\})", "", bench_template_used)
+                            bench_template_used = bench_template_used.replace("{payload}", "")
+                            bench_template_used = re.sub(r"\s{2,}", " ", bench_template_used).strip()
+                        bench_cmd = bench_template_used.format(**fmt_kwargs)
     else:
         for rate in rate_values:
             for payload in payloads:
@@ -923,7 +936,12 @@ def main():
                             fmt_kwargs["rps"] = rate
                         else:
                             fmt_kwargs["framerate"] = rate
-                        bench_cmd = args.bench_template.format(**fmt_kwargs)
+                        bench_template_used = args.bench_template
+                        if "payload" not in fmt_kwargs and "{payload}" in bench_template_used:
+                            bench_template_used = re.sub(r"--payload-size\s*(?:=\s*)?(?:'\{payload\}'|\"\{payload\}\"|\{payload\})", "", bench_template_used)
+                            bench_template_used = bench_template_used.replace("{payload}", "")
+                            bench_template_used = re.sub(r"\s{2,}", " ", bench_template_used).strip()
+                        bench_cmd = bench_template_used.format(**fmt_kwargs)
 
                     try:
                         ok_resolve, tried_path = _bench_script_resolves(bench_cmd)
