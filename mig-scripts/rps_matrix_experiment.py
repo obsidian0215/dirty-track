@@ -241,6 +241,39 @@ def main():
         help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one rps_matrix run per entry and exit.",
     )
     args = parser.parse_args()
+    # repository root (useful for resolving relative bench script paths)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    def _bench_script_resolves(bench_cmd: str):
+        """Try to heuristically determine whether the bench command refers to a
+        local script that exists. Returns (True, resolved_path) if found else
+        (False, tried_path).
+        """
+        try:
+            parts = shlex.split(bench_cmd)
+        except Exception:
+            return False, bench_cmd
+        if not parts:
+            return False, bench_cmd
+        # If invocation is like: python3 path/to/script.py ...
+        if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+            script = parts[1]
+        else:
+            # otherwise assume first token is the script/executable
+            script = parts[0]
+        # try as absolute or relative to cwd or repo_root
+        cand = script
+        if os.path.isabs(cand) and os.path.exists(cand):
+            return True, cand
+        # check relative to current working dir
+        cwd_cand = os.path.join(os.getcwd(), cand)
+        if os.path.exists(cwd_cand):
+            return True, cwd_cand
+        # check relative to repo root
+        repo_cand = os.path.join(repo_root, cand)
+        if os.path.exists(repo_cand):
+            return True, repo_cand
+        return False, cand
 
     # If not using --tests-file, enforce required options for single-run mode
     if not args.tests_file:
@@ -326,6 +359,32 @@ def main():
                 merged["dry_run"] = True
             # replace entry with merged view for downstream logic
             entry = merged
+            # If bench_template is a relative path (common in tests_list), try to
+            # resolve it relative to the repo root and rewrite it to an absolute
+            # path so child runs don't depend on the current working directory.
+            try:
+                bt = entry.get("bench_template")
+                if bt:
+                    parts = shlex.split(bt)
+                    if parts:
+                        # identify script token
+                        if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+                            script_token_index = 1
+                        else:
+                            script_token_index = 0
+                        script = parts[script_token_index]
+                        # attempt resolution against repo_root
+                        repo_cand = os.path.join(repo_root, script)
+                        cwd_cand = os.path.join(os.getcwd(), script)
+                        if os.path.exists(repo_cand):
+                            parts[script_token_index] = repo_cand
+                            entry["bench_template"] = " ".join(shlex.quote(p) for p in parts)
+                        elif os.path.exists(cwd_cand):
+                            parts[script_token_index] = cwd_cand
+                            entry["bench_template"] = " ".join(shlex.quote(p) for p in parts)
+            except Exception:
+                # best-effort; ignore resolution failures
+                pass
             # Ensure 'container' is specified in each test entry. Tests-file entries must set the container name
             # (this follows mig-scripts convention where container is the runc bundle name/path key).
             if not entry.get("container"):
@@ -523,8 +582,12 @@ def main():
                 print(f"Started runc backend: {', '.join(started)}")
 
             print(" ", shlex.join(cmd))
+            # In tests-file orchestrator mode, respect dry-run flags (global or per-entry)
             try:
-                run_cmd(shlex.join(cmd), quiet=False)
+                if not (entry_dry or args.dry_run):
+                    run_cmd(shlex.join(cmd), quiet=False)
+                else:
+                    print(f"[tests-file dry-run] skipping spawn for {entry.get('name')}")
             except Exception as e:
                 print(f"Failed to run test {entry.get('name')}: {e}")
             finally:
@@ -730,6 +793,21 @@ def main():
                                 print(f"Failed to start remote bench on {client_target}: {e}")
                                 continue
                         else:
+                            # verify the bench script exists locally (heuristic)
+                            ok, tried = _bench_script_resolves(bench_cmd)
+                            if not ok:
+                                print(f"Bench script not found locally (tried: {tried}). Skipping run.\n  Tip: run this from the repo root or use an absolute path in --bench-template.")
+                                continue
+                            # if we resolved an absolute path different from the template, substitute it
+                            try:
+                                parts = shlex.split(bench_cmd)
+                                if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+                                    parts[1] = tried
+                                else:
+                                    parts[0] = tried
+                                bench_cmd = " ".join(shlex.quote(p) for p in parts)
+                            except Exception:
+                                pass
                             print(f"Starting local: {bench_cmd} -> log {local_logname}")
                             bench_pid = run_bench_background(bench_cmd, local_logname)
                             if bench_pid is None:
