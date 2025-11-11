@@ -240,6 +240,7 @@ def main():
         default="",
         help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one rps_matrix run per entry and exit.",
     )
+    parser.add_argument("--framerate-list", default="", help="Optional comma-separated framerate list for video tests (fps). Used as alternative to --rps-list for some benches.")
     args = parser.parse_args()
     # repository root (useful for resolving relative bench script paths)
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -307,8 +308,9 @@ def main():
             missing.append("--container")
         if not args.bench_template:
             missing.append("--bench-template")
-        if not args.rps_list:
-            missing.append("--rps-list")
+        # allow either rps_list or framerate_list to be provided for single-run mode
+        if not args.rps_list and not args.framerate_list:
+            missing.append("--rps-list or --framerate-list")
         if missing:
             parser.error(f"the following arguments are required when --tests-file is not used: {', '.join(missing)}")
 
@@ -330,6 +332,7 @@ def main():
         override_parser.add_argument("--container", dest="container")
         override_parser.add_argument("--bench-template", dest="bench_template")
         override_parser.add_argument("--rps-list", dest="rps_list")
+        override_parser.add_argument("--framerate-list", dest="framerate_list")
         override_parser.add_argument("--payload-sizes", dest="payload_sizes")
         override_parser.add_argument("--payload-modes", dest="payload_modes")
         override_parser.add_argument("--patterns", dest="patterns")
@@ -356,6 +359,7 @@ def main():
                 "container",
                 "bench_template",
                 "rps_list",
+                "framerate_list",
                 "payload_sizes",
                 "payload_modes",
                 "patterns",
@@ -415,6 +419,7 @@ def main():
             if not entry.get("container"):
                 print(f"tests-file entry missing 'container' field: {entry.get('name','unnamed')}")
                 continue
+            # (Do not force rps_list here; entries may provide framerate_list instead.)
             # If requested, start backends using runc by container name (no docker/image/ports required)
             def start_runc_backends(names, dry_run=False):
                 """Start runc backends by following the mig-scripts convention.
