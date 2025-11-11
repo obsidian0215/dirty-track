@@ -2,8 +2,8 @@
   {
     "name": "redis_sensoragg",
     "bench_template": "python3 experiment/migration/redis/bench_sensoragg.py --threads {threads} --payload-mode json --rps {rps} --duration {duration} --payload-size {payload}",
-    "rps_list": "100,500",
-    "payload_sizes": "512B,1KB,4KB",
+    "rps_list": "50,200,500",
+    "payload_sizes": "256B,1KB,4KB",
     "payload_modes": "json",
     "patterns": "random",
     "duration": 120,
@@ -16,22 +16,22 @@
   {
     "name": "influx_sensoragg",
     "bench_template": "python3 experiment/migration/influxdb/bench_sensoragg.py --threads {threads} --payload-mode json --rps {rps} --duration {duration} --payload-size {payload}",
-    "rps_list": "40,100,300",
-    "payload_sizes": "512B,2KB,8KB",
+    "rps_list": "40,160,400",
+    "payload_sizes": "512B,2KB,6KB",
     "payload_modes": "json",
     "patterns": "random,zeros",
     "duration": 90,
     "threads": 4,
     "runs": 3,
     "container": "influxdb",
-    "output": "results/influx_sensoragg_medium_matrix.csv",
-    "log_dir": "logs/influx_sensoragg_medium"
+    "output": "results/influx_sensoragg_matrix.csv",
+    "log_dir": "logs/influx_sensoragg"
   },
   {
     "name": "redis_cartelem",
     "bench_template": "python3 experiment/migration/redis/bench_cartelem.py --threads {threads} --payload-mode json --rps {rps} --duration {duration} --payload-size {payload}",
-    "rps_list": "180,500",
-    "payload_sizes": "4KB,8KB",
+    "rps_list": "60,180,450",
+    "payload_sizes": "256B,1KB,4KB",
     "payload_modes": "json",
     "patterns": "random",
     "duration": 120,
@@ -51,7 +51,7 @@
     "threads": 2,
     "runs": 3,
     "container": "influxdb",
-    "framerate_list": "45,60",
+    "framerate_list": "30,45,60",
     "output": "results/influxdb_video_matrix.csv",
     "log_dir": "logs/influxdb_video"
   },
@@ -70,9 +70,9 @@
     "log_dir": "logs/elasticsearch"
   },
   {
-    "name": "redis_video_large",
+    "name": "redis_video",
     "bench_template": "python3 experiment/migration/redis/bench_video_cache_realistic.py --threads {threads} --payload-mode binary --framerate {framerate} --duration {duration} --payload-size {payload}",
-    "payload_sizes": "16KB,32KB",
+    "payload_sizes": "16KB,64KB",
     "payload_modes": "binary,json",
     "patterns": "random,repeat",
     "duration": 120,
@@ -86,8 +86,8 @@
   {
     "name": "influx_cartelem",
     "bench_template": "python3 experiment/migration/influxdb/bench_cartelem.py --threads {threads} --payload-mode json --rps {rps} --duration {duration} --payload-size {payload} --vehicle-pattern normal_city",
-    "rps_list": "50,100,300",
-    "payload_sizes": "1KB,4KB",
+    "rps_list": "80,300,460",
+    "payload_sizes": "384B,1600B,4KB",
     "payload_modes": "json",
     "patterns": "random",
     "duration": 100,
