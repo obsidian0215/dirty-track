@@ -124,7 +124,7 @@ python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
 - `--bucket`: 数据桶名称 (默认: vehicle-data)
 
 ##### 数据规模扩展参数
-- `--payload-size-kb`: 目标负载大小(KB) (默认: 1)
+- `--payload-size`: 目标负载大小，带单位（例如 256B, 16KB, 1MB） (默认: 1KB)
 - `--size-distribution`: 数据大小分布 (uniform/normal/zipf) (默认: uniform)
 
 ##### 数据类型真实性参数
@@ -143,17 +143,17 @@ python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
 # 车队管理平台测试
 python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket fleet-health --threads 12 --duration 45 \
-    --vehicle-pattern highway --payload-size-kb 3
+    --vehicle-pattern highway --payload-size 3KB
 
 # 城市物流车辆监控测试
 python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket logistics-monitor --threads 8 --duration 30 \
-    --vehicle-pattern stop_go --payload-size-kb 2 --rps 200
+    --vehicle-pattern stop_go --payload-size 2KB --rps 200
 
 # 高速交通数据分析
 python3 bench_cartelem.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket traffic-analytics --threads 16 --duration 60 \
-    --vehicle-pattern highway --payload-size-kb 4 --read-pct 5
+    --vehicle-pattern highway --payload-size 4KB --read-pct 5
 ```
 
 ---
@@ -178,7 +178,7 @@ python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
 - `--bucket`: 数据桶名称 (默认: sensor-data)
 
 ##### 数据规模扩展参数
-- `--payload-size-kb`: 目标负载大小(KB) (默认: 1)
+- `--payload-size`: 目标负载大小，带单位（例如 256B, 16KB, 1MB） (默认: 1KB)
 - `--sensors-per-device`: 每个设备传感器数量 (默认: 5)
 
 ##### 数据类型真实性参数
@@ -220,7 +220,7 @@ python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
 # 大规模物联网数据采集测试
 python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket large-scale-iot --threads 32 --duration 45 \
-    --sensors-per-device 20 --payload-size-kb 5 --read-pct 5
+    --sensors-per-device 20 --payload-size 5KB --read-pct 5
 ```
 
 ---
@@ -245,7 +245,7 @@ python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token
 - `--bucket`: 数据桶名称 (默认: video-analytics)
 
 ##### 数据规模扩展参数
-- `--payload-size-kb`: 目标负载大小(KB) (默认: 2)
+- `--payload-size`: 目标负载大小，带单位（例如 256B, 16KB, 1MB） (默认: 2KB)
 
 ##### 数据类型真实性参数
 - `--camera-count`: 摄像头数量 (默认: 10)
@@ -271,7 +271,7 @@ python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token
 # 零售客流分析平台测试
 python3 bench_video_cache.py --influx-url http://localhost:8181 --token my-token \
     --org my-org --bucket retail-analytics --threads 8 --duration 60 \
-    --objects-per-frame 6 --payload-size-kb 3
+    --objects-per-frame 6 --payload-size 3KB
 ```
 
 ---
@@ -432,7 +432,7 @@ python3 ./experiment/migration/influxdb/bench_cartelem.py \
     --threads 12 \
     --duration 180 \
     --vehicle-pattern highway \
-    --payload-size-kb 2
+    --payload-size 2KB
 
 # 迁移完成后在目标节点验证
 python3 ./experiment/migration/influxdb/bench_cartelem.py \

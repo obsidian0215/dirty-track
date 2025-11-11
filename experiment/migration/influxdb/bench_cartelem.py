@@ -13,13 +13,13 @@ FEATURES:
    - 实时分析: Continuous location tracking and diagnostics
 
 USAGE:
-   python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 8 --duration 30 --vehicle-pattern highway --payload-size-kb 5
+    python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 8 --duration 30 --vehicle-pattern highway --payload-size 5KB
    python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 4 --duration 60 --size-distribution normal
-   python3 bench_cartelem.py --influx-url http://localhost:8181 --payload-size-kb 2 --connect-timeout 5
+    python3 bench_cartelem.py --influx-url http://localhost:8181 --payload-size 2KB --connect-timeout 5
 
 EXTENDED USAGE:
    --vehicle-pattern: normal_city/highway/stop_go (default: normal_city)
-   --payload-size-kb: Target payload size in KB (default: 1)
+    --payload-size: Target payload size with units (default: 1KB). Examples: 256B, 16KB, 1MB
    --size-distribution: uniform/normal/zipf (default: uniform)
 """
 
@@ -30,10 +30,13 @@ import random
 import threading
 import time
 import statistics
+import os
+import base64
 from typing import Dict, Any, Optional
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -78,8 +81,8 @@ class RateLimiter:
 class VehicleInfluxBench:
     """Vehicle Telematics InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "vehicle-data",
-                 # Data scale extension
-                 payload_size_kb: float = 1.0, size_distribution: str = "uniform",
+                 # Data scale extension (bytes)
+                 payload_size_bytes: int = 1024, size_distribution: str = "uniform",
                 # Data type realism
                 vehicle_pattern: str = "normal_city",
                 # 数据生命周期管理
@@ -93,8 +96,8 @@ class VehicleInfluxBench:
         self.bucket = bucket
         self._stop = threading.Event()
 
-        # Data scale extension config
-        self.payload_size_kb = payload_size_kb
+        # Data scale extension config (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
         self.size_distribution = size_distribution
 
         # Data type realism config
@@ -114,6 +117,11 @@ class VehicleInfluxBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # track payload sizes (bytes) for metrics
+        self.payload_sizes = []
+        # payload mode: 'json' or 'binary'
+        self.payload_mode = "json"
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
@@ -257,7 +265,7 @@ class VehicleInfluxBench:
             "fuel_level": state["fuel"], "engine_temp": state["engine_temp"],
             "latitude": state["lat"], "longitude": state["lon"]
         }))
-        base_target_bytes = int(self.payload_size_kb * 1024)  # 基本目标大小
+        base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小 (bytes)
 
         # Apply distribution function
         if self.size_distribution == "uniform":
@@ -309,6 +317,50 @@ class VehicleInfluxBench:
 
         if current_size > target_size_bytes:
             logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
+
+        # Estimate payload bytes by reconstructing a representative dict
+        try:
+            payload_est = {
+                "vehicle_id": vehicle_id,
+                "speed": current_speed,
+                "fuel_level": state["fuel"],
+                "engine_temp": state["engine_temp"],
+                "latitude": state["lat"],
+                "longitude": state["lon"]
+            }
+            # if sensors were added, estimate their size too
+            if any(p.measurement == "vehicle_sensor" for p in points):
+                # approximate sensors by serializing a list of simple dicts
+                sensors_approx = []
+                for p in points:
+                    if p.measurement == "vehicle_sensor":
+                        # use tags/fields that are present; field values may be in p._fields (private), but approximate
+                        sensors_approx.append({"sensor_point": 1})
+                payload_est["sensors"] = sensors_approx
+
+            est_bytes = len(json.dumps(payload_est))
+        except Exception:
+            est_bytes = 0
+
+        # If binary payload_mode is requested, attach a base64 blob to the main point
+        if getattr(self, "payload_mode", "json") == "binary":
+            target_bytes = int(self.payload_size_bytes)
+            raw = os.urandom(max(1, target_bytes))
+            b64 = base64.b64encode(raw).decode("ascii")
+            # inject raw blob into first point (main telemetry)
+            try:
+                points[0] = points[0].field("raw_blob", b64)
+                payload_bytes = len(raw)
+            except Exception:
+                payload_bytes = est_bytes
+        else:
+            payload_bytes = est_bytes
+
+        # record payload size for metrics
+        try:
+            self.payload_sizes.append(int(payload_bytes))
+        except Exception:
+            pass
 
         return points
 
@@ -409,8 +461,8 @@ class VehicleInfluxBench:
             t.start()
             tlist.append(t)
 
-        logger.info("Started %d threads for %ds (vehicle_pattern=%s, payload_kb=%d)",
-                   threads, duration, self.vehicle_pattern, self.payload_size_kb)
+        logger.info("Started %d threads for %ds (vehicle_pattern=%s, payload_bytes=%d)",
+                    threads, duration, self.vehicle_pattern, self.payload_size_bytes)
 
         for t in tlist:
             t.join()
@@ -462,6 +514,21 @@ class VehicleInfluxBench:
             logger.info("Latency ms - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
                        statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
 
+        # Emit structured metrics for downstream parsers
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Vehicle Telematics InfluxDB Benchmark")
@@ -473,7 +540,7 @@ def main():
     parser.add_argument("--bucket", default="vehicle-data", help="InfluxDB bucket")
 
     # Data scale extension
-    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="Target payload size in KB (support decimals)")
+    parser.add_argument("--payload-size", default="1KB", type=str, help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
     parser.add_argument("--size-distribution", default="uniform", type=str,
                        choices=["uniform", "normal", "zipf"], help="Distribution type for payload sizes")
 
@@ -488,19 +555,43 @@ def main():
     parser.add_argument("--retention-policy", default="1h", type=str,
                        help="Bucket retention policy (e.g., 1h, 24h, 7d)")
 
+    # Payload mode
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured points) or binary (embed base64 blob in main point)")
+
     # 消息速率控制
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
                        type=int, help="Maximum requests per second (default: no limit)")
 
     args = parser.parse_args()
 
+    # support new unit-aware --payload-size flag
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+    payload_size_bytes = int(payload_bytes)
+
     bench = VehicleInfluxBench(
         influx_url=args.influx_url,
         token=args.token,
         org=args.org,
         bucket=args.bucket,
-        # Data scale extension
-        payload_size_kb=args.payload_size_kb,
+    # Data scale extension (bytes)
+    payload_size_bytes=payload_size_bytes,
         size_distribution=args.size_distribution,
         # Data type realism
         vehicle_pattern=args.vehicle_pattern,
@@ -509,6 +600,7 @@ def main():
         # 消息速率控制
         max_requests_per_second=args.rps
     )
+    bench.payload_mode = args.payload_mode
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

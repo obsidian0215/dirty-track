@@ -12,6 +12,7 @@ port-forwarding/container_forwarding_guide.md
 port-forwarding/container_forward_manager.sh
 experiment/light-dt-ro/MEMORY-TEST-README.md
 mig-scripts/log/
+mig-scripts/logs/
 __pycache__/
 *.pyc
 *-report.txt

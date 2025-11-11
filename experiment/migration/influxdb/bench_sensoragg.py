@@ -15,14 +15,14 @@ FEATURES:
 USAGE:
     python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 8 --duration 30 --read-pct 10
     python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 4 --duration 60 --sensors-per-device 10 --sensor-types temperature,humidity,pressure
-    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --payload-size-kb 2
+    python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --payload-size 2KB
     python3 bench_sensoragg.py --influx-url http://localhost:8181 --token my-token --org my-org --bucket sensor-data --threads 4 --duration 30 --rps 100
 
 EXTENDED USAGE:
    --sensors-per-device: Number of sensors per device (default: 5)
    --sensor-types: Comma-separated sensor types (default: temperature,humidity,pressure,vibration)
    --environmental-noise: Environmental noise level (default: 0.05)
-   --payload-size-kb: Target payload size in KB (default: 1)
+    --payload-size: Target payload size with units (default: 1KB). Examples: 256B, 16KB, 1MB
 """
 
 import argparse
@@ -36,6 +36,7 @@ from typing import List, Optional, Dict, Any
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -82,7 +83,7 @@ class SensorInfluxBench:
     """Enhanced Sensor Aggregator InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "sensor-data",
                  # Data scale extension
-                 payload_size_kb: float = 1.0, sensors_per_device: int = 5,
+                 payload_size_bytes: int = 1024, sensors_per_device: int = 5,
                  # Data type realism
                  sensor_types: Optional[List[str]] = None,
                  environmental_noise: float = 0.05,
@@ -97,8 +98,8 @@ class SensorInfluxBench:
         self.bucket = bucket
         self._stop = threading.Event()
 
-        # Data scale extension config
-        self.payload_size_kb = payload_size_kb
+        # Data scale extension config (bytes)
+        self.payload_size_bytes = payload_size_bytes
         self.sensors_per_device = sensors_per_device
 
         # Data type realism config
@@ -119,6 +120,10 @@ class SensorInfluxBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # payload sizing and mode
+        self.payload_sizes: List[int] = []
+        self.payload_mode = "json"
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
@@ -268,7 +273,7 @@ class SensorInfluxBench:
             "sensor_id": primary_sensor_id, "value": value,
             "battery_level": state["battery_level"], "readings_count": state["readings_count"]
         }))
-        target_size_bytes = int(self.payload_size_kb * 1024)  # 转换到字节，整数
+        target_size_bytes = int(self.payload_size_bytes)  # 已经是字节
         random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
         random_stop_bytes = int(target_size_bytes * random_multiplier)
 
@@ -317,6 +322,13 @@ class SensorInfluxBench:
 
         if current_size > target_size_bytes:
             logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
+
+        # record an approximate payload estimate for the last generated points
+        try:
+            est = len(json.dumps({"points": len(points)}))
+            self._last_payload_estimate = int(est)
+        except Exception:
+            self._last_payload_estimate = 0
 
         return points
 
@@ -417,6 +429,14 @@ class SensorInfluxBench:
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
+                    # record estimated payload size if available
+                    try:
+                        p = int(getattr(self, '_last_payload_estimate', 0))
+                        self.payload_sizes.append(p)
+                        if len(self.payload_sizes) > 1000:
+                            self.payload_sizes.pop(0)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug("Operation failed: %s", e)
                 with self.lock:
@@ -518,6 +538,21 @@ class SensorInfluxBench:
             logger.info("Latency ms - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
                        statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
 
+        # Emit structured metrics for orchestrator parsing
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Sensor Aggregator InfluxDB Benchmark")
@@ -529,7 +564,7 @@ def main():
     parser.add_argument("--bucket", default="sensor-data", help="InfluxDB bucket")
 
     # Data scale extension
-    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="Target payload size in KB (support decimals)")
+    parser.add_argument("--payload-size", default="1KB", type=str, help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
     parser.add_argument("--sensors-per-device", default=5, type=int, help="Sensors per device")
 
     # Data type realism
@@ -545,6 +580,9 @@ def main():
     parser.add_argument("--retention-policy", default="1h", type=str,
                        help="Bucket retention policy (e.g., 1h, 24h, 7d)")
 
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob)")
+
     # 消息速率控制
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
                         type=int, help="Maximum requests per second (default: no limit)")
@@ -554,13 +592,32 @@ def main():
     # Parse sensor types
     sensor_types = [st.strip() for st in args.sensor_types.split(",")]
 
+    # support new unit-aware --payload-size string flag (supports units: B/KB/MB)
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+
     bench = SensorInfluxBench(
         influx_url=args.influx_url,
         token=args.token,
         org=args.org,
         bucket=args.bucket,
-        # Data scale extension
-        payload_size_kb=args.payload_size_kb,
+    # Data scale extension (bytes)
+    payload_size_bytes=payload_bytes,
         sensors_per_device=args.sensors_per_device,
         # Data type realism
         sensor_types=sensor_types,
@@ -570,6 +627,8 @@ def main():
         # 消息速率控制
         max_requests_per_second=args.rps
     )
+
+    bench.payload_mode = args.payload_mode
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

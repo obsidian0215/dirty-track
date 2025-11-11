@@ -13,12 +13,12 @@ FEATURES:
    - 推理模拟: Multiple inference models (YOLO, SSD, etc.)
 
 USAGE:
-   python3 bench_video_cache.py --influx-url http://localhost:8181 --threads 8 --duration 30 --inference-model yolov5_medium --payload-size-kb 5
+    python3 bench_video_cache.py --influx-url http://localhost:8181 --threads 8 --duration 30 --inference-model yolov5_medium --payload-size 5KB
    python3 bench_video_cache.py --influx-url http://localhost:8181 --threads 4 --duration 60 --camera-count 15 --objects-per-frame 5
    python3 bench_video_cache.py --influx-url http://localhost:8181 --write-pct 85 --read-pct 15
 
 EXTENDED USAGE:
-   --payload-size-kb: Target payload size in KB (default: 2)
+    --payload-size: Target payload size (supports units, e.g., 256B, 16KB) (default: 2KB)
    --objects-per-frame: Objects per frame (default: 3)
    --camera-count: Number of cameras (default: 10)
    --inference-model: AI inference model type (yolov5_small/medium/ssd_mobile)
@@ -35,6 +35,7 @@ from typing import List, Dict, Any
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -47,7 +48,7 @@ class VideoInfluxBench:
     """Complete Video Inference InfluxDB Benchmark"""
     def __init__(self, influx_url: str, token: str, org: str, bucket: str = "video-data",
                  # Data scale extension
-                 payload_size_kb: int = 2, objects_per_frame: int = 3,
+                 payload_size_bytes: int = 2048, objects_per_frame: int = 3,
                  # Data type realism
                  camera_count: int = 10, inference_model: str = "yolov5_medium"):
 
@@ -57,8 +58,8 @@ class VideoInfluxBench:
         self.bucket = bucket
         self._stop = threading.Event()
 
-        # Data scale extension config
-        self.payload_size_kb = payload_size_kb
+        # Data scale extension config (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
         self.objects_per_frame = objects_per_frame
 
         # Data type realism config
@@ -77,6 +78,10 @@ class VideoInfluxBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # payload sizing and mode
+        self.payload_sizes: List[int] = []
+        self.payload_mode = "json"
 
         # Initialize components
         self.client = InfluxDBClient(url=influx_url, token=token, org=org)
@@ -212,7 +217,7 @@ class VideoInfluxBench:
             "frame_id": frame_id, "objects": len(objects),
             "inference_time": inference_time
         }))
-        target_size_bytes = self.payload_size_kb * 1024
+        target_size_bytes = int(self.payload_size_bytes)
 
         if current_size < target_size_bytes:
             # Add detailed analysis results
@@ -270,7 +275,27 @@ class VideoInfluxBench:
 
                     additional_analysis[analysis_type] = True
 
+        # Estimate payload bytes for orchestration metrics (approximate)
+        try:
+            payload_est = {
+                "frame_id": frame_id,
+                "objects": len(objects),
+            }
+            if 'additional_analysis' in locals() and additional_analysis:
+                payload_est["analysis_keys"] = len(additional_analysis)
+            est_bytes = len(json.dumps(payload_est))
+        except Exception:
+            est_bytes = 0
+
+        # store last estimate for worker to record
+        try:
+            self._last_payload_estimate = int(est_bytes)
+        except Exception:
+            self._last_payload_estimate = 0
+
         return points
+
+    # NOTE: payload_sizes will be recorded by callers after write when possible
 
     def _execute_frame_query(self):
         """Execute frame-based query for recent detections"""
@@ -332,6 +357,15 @@ class VideoInfluxBench:
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
+
+                    # record estimated payload size if available
+                    try:
+                        p = int(getattr(self, '_last_payload_estimate', 0))
+                        self.payload_sizes.append(p)
+                        if len(self.payload_sizes) > 1000:
+                            self.payload_sizes.pop(0)
+                    except Exception:
+                        pass
 
                     # Optional immediate read verification
                     if random.randint(1, 100) <= read_pct:
@@ -402,8 +436,9 @@ class VideoInfluxBench:
             t.start()
             tlist.append(t)
 
-        logger.info("Started %d threads for %ds (model=%s, cameras=%d, payload_kb=%d)",
-                   threads, duration, self.inference_model, self.camera_count, self.payload_size_kb)
+        # Report payload size in bytes
+        logger.info("Started %d threads for %ds (model=%s, cameras=%d, payload_bytes=%d)",
+                    threads, duration, self.inference_model, self.camera_count, self.payload_size_bytes)
 
         for t in tlist:
             t.join()
@@ -431,6 +466,21 @@ class VideoInfluxBench:
         logger.info("Configuration: %d objects/frame, %d cameras, %s model",
                    self.objects_per_frame, self.camera_count, self.inference_model)
 
+        # Emit structured metrics for orchestrator parsing
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Complete Video Inference InfluxDB Benchmark",
@@ -443,7 +493,7 @@ def main():
     parser.add_argument("--bucket", default="video-data", help="InfluxDB bucket")
 
     # Data scale extension
-    parser.add_argument("--payload-size-kb", default=2, type=int, help="Target payload size in KB")
+    parser.add_argument("--payload-size", default="2KB", type=str, help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
     parser.add_argument("--objects-per-frame", default=3, type=int, help="Objects per frame")
 
     # Data type realism
@@ -456,8 +506,28 @@ def main():
     parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
     parser.add_argument("--write-pct", default=80, type=int, help="Write operation percentage")
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob)")
 
     args = parser.parse_args()
+    # unit-aware --payload-size support
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
 
     bench = VideoInfluxBench(
         influx_url=args.influx_url,
@@ -465,12 +535,14 @@ def main():
         org=args.org,
         bucket=args.bucket,
         # Data scale extension
-        payload_size_kb=args.payload_size_kb,
+        payload_size_bytes=payload_bytes,
         objects_per_frame=args.objects_per_frame,
         # Data type realism
         camera_count=args.camera_count,
         inference_model=args.inference_model
     )
+
+    bench.payload_mode = args.payload_mode
 
     bench.run(threads=args.threads, duration=args.duration,
              write_pct=args.write_pct, read_pct=args.read_pct)

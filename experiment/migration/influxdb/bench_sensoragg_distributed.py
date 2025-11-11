@@ -33,6 +33,7 @@ from typing import List, Optional, Dict, Any, Set
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -50,8 +51,8 @@ class SensorNetworkBench:
                  # 数据传播配置
                  communication_intervals: int = 30,
                  data_propagation_depth: int = 2,
-                 # 数据规模扩展
-                 payload_size_kb: float = 1.0):
+                 # 数据规模扩展 (bytes)
+                 payload_size_bytes: int = 1024):
         self.influx_url = influx_url
         self.token = token
         self.org = org
@@ -64,14 +65,18 @@ class SensorNetworkBench:
         self.success = 0
         self.fail = 0
 
+        # payload sizing and mode
+        self.payload_sizes: List[int] = []
+        self.payload_mode = "json"
+
         # 网络结构配置
         self.network_topology = network_topology
         self.sensor_density = sensor_density
         self.communication_intervals = communication_intervals
         self.data_propagation_depth = data_propagation_depth
 
-        # 数据规模
-        self.payload_size_kb = payload_size_kb
+        # 数据规模 (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
 
         # 网络状态
         self.network_nodes: Dict[str, Dict[str, Any]] = {}
@@ -342,6 +347,12 @@ class SensorNetworkBench:
         # 网络事件数据（低频）
         points.extend(self._generate_network_event())
 
+        # approximate payload estimate
+        try:
+            self._last_payload_estimate = int(len(json.dumps({"points": len(points)})))
+        except Exception:
+            self._last_payload_estimate = 0
+
         return points
 
     def _execute_network_query(self):
@@ -422,6 +433,14 @@ class SensorNetworkBench:
                                 self.fail = 0
                             self.latencies_ms.append(lat)
                             self.success += 1
+                            # record estimated payload size if available
+                            try:
+                                p = int(getattr(self, '_last_payload_estimate', 0))
+                                self.payload_sizes.append(p)
+                                if len(self.payload_sizes) > 1000:
+                                    self.payload_sizes.pop(0)
+                            except Exception:
+                                pass
             except Exception as e:
                 logger.debug("Operation failed: %s", e)
                 with self.lock if hasattr(self, 'lock') else threading.Lock():
@@ -487,6 +506,21 @@ class SensorNetworkBench:
             logger.info("延迟(ms) - 平均=%.3f p50=%.3f p90=%.3f p99=%.3f 最大=%.3f",
                        statistics.mean(lat), p50, p90, p99, lat[-1])
 
+        # Emit structured METRIC output for orchestrator parsing
+        try:
+            if getattr(self, 'payload_sizes', None):
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Sensor Network InfluxDB Benchmark")
@@ -503,7 +537,7 @@ def main():
     parser.add_argument("--sensor-density", default=5, type=int, help="传感网络密度因子")
 
     # 数据规模和通讯配置
-    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="目标负载大小(KB)")
+    parser.add_argument("--payload-size", default="1KB", help="目标负载大小，支持单位后缀（B, KB, MB）。示例: 512B, 16KB, 1MB")
     parser.add_argument("--communication-intervals", default=20, type=int, help="通讯间隔(秒)")
     parser.add_argument("--data-propagation-depth", default=2, type=int, help="数据传播深度")
 
@@ -512,7 +546,41 @@ def main():
     parser.add_argument("--duration", default=120, type=int, help="测试持续时间(秒)")
     parser.add_argument("--read-pct", default=10, type=int, help="读取操作比例(%)")
 
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob)")
+
     args = parser.parse_args()
+
+    def parse_size_token(tok: str) -> int:
+        """Parse a size token like '512B', '1KB', '2MB' into bytes (int).
+
+        Accepts integer or float values and unit suffixes (B, KB, MB).
+        Returns bytes as int. Raises ValueError on bad format.
+        """
+        m = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([kKmMgG]?[bB])?\s*$", tok)
+        if not m:
+            raise ValueError(f"invalid size token: {tok!r}")
+        val = float(m.group(1))
+        unit = m.group(2) or "B"
+        unit = unit.upper()
+        if unit == "B":
+            mul = 1
+        elif unit in ("KB", "KIB"):
+            mul = 1024
+        elif unit in ("MB", "MIB"):
+            mul = 1024 * 1024
+        elif unit in ("GB", "GIB"):
+            mul = 1024 * 1024 * 1024
+        else:
+            raise ValueError(f"unsupported unit: {unit}")
+        return int(val * mul)
+
+    # parse canonical --payload-size into bytes
+    try:
+        bytes_val = parse_size_token(args.payload_size)
+        payload_size_bytes = int(bytes_val)
+    except ValueError as e:
+        parser.error(str(e))
 
     bench = SensorNetworkBench(
         influx_url=args.influx_url,
@@ -523,10 +591,12 @@ def main():
         network_topology=args.network_topology,
         sensor_density=args.sensor_density,
         # 数据规模配置
-        payload_size_kb=args.payload_size_kb,
+        payload_size_bytes=payload_size_bytes,
         communication_intervals=args.communication_intervals,
         data_propagation_depth=args.data_propagation_depth
     )
+
+    bench.payload_mode = args.payload_mode
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

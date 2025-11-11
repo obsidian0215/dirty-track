@@ -10,7 +10,7 @@ Full-featured video cache benchmark tool, includes:
 - Periodic monitoring: Real-time TPS and latency statistics
 
 EXTENDED USAGE:
-  --payload-size-kb: Target payload size (default 1KB)
+    --payload-size: Target payload size (supports units, e.g., 256B, 16KB, default 1KB)
   --objects-per-frame: Number of objects per frame (default 3)
   --camera-count: Camera count in simulation (default 10)
   --inference-model: AI inference model type (yolov5_small/medium/ssd_mobile)
@@ -28,6 +28,9 @@ import statistics
 import sys
 from typing import List, Optional, Dict, Any
 import redis
+import os
+import base64
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -40,11 +43,11 @@ class VideoCacheEnhancedBench:
     """Video cache benchmark test"""
 
     def __init__(self, redis_host: str = "127.0.0.1", redis_port: int = 6379,
-                 cache_ttl: int = 60, persist_hash: str = "video_inference_persist",
-                 # Data scaling expansion
-                 payload_size_kb: int = 2, objects_per_frame: int = 3,
-                 # Data authenticity configuration
-                 camera_count: int = 10, inference_model: str = "yolov5_medium",
+              cache_ttl: int = 60, persist_hash: str = "video_inference_persist",
+              # Data scaling expansion (bytes)
+              payload_size_bytes: int = 2048, objects_per_frame: int = 3,
+              # Data authenticity configuration
+              camera_count: int = 10, inference_model: str = "yolov5_medium",
                  # Connection timeout configuration
                  connect_timeout: int = 5, socket_timeout: int = 5,
                  pool_timeout: int = 10, pool_size: Optional[int] = None):
@@ -55,8 +58,8 @@ class VideoCacheEnhancedBench:
         self.cache_ttl = cache_ttl
         self.persist_hash = persist_hash
 
-        # Data scaling expansion configuration
-        self.payload_size_kb = payload_size_kb
+        # Data scaling expansion configuration (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
         self.objects_per_frame = objects_per_frame
 
         # Data authenticity configuration
@@ -88,6 +91,9 @@ class VideoCacheEnhancedBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+        # payload sizing and mode
+        self.payload_sizes: List[int] = []
+        self.payload_mode = "json"
 
     def _init_connection_pool(self):
         """Initialize Redis connection pool"""
@@ -217,7 +223,7 @@ class VideoCacheEnhancedBench:
 
         # Data scaling expansion - Add additional video analysis data
         current_size = len(json.dumps(result))
-        target_size_bytes = self.payload_size_kb * 1024
+        target_size_bytes = int(self.payload_size_bytes)
 
         if current_size < target_size_bytes:
             # Add granular analysis results
@@ -317,24 +323,54 @@ class VideoCacheEnhancedBench:
                     if random.randint(1, 100) <= fallback_rate:
                         # Fallback to persistent storage
                         try:
-                            r.hset(self.persist_hash, key, payload)
+                            if getattr(self, "payload_mode", "json") == "json":
+                                r.hset(self.persist_hash, key, payload)
+                                payload_size = len(payload.encode("utf-8"))
+                            else:
+                                target_bytes = int(self.payload_size_bytes)
+                                raw = os.urandom(max(1, target_bytes))
+                                b64 = base64.b64encode(raw).decode("ascii")
+                                r.hset(self.persist_hash, key, b64)
+                                payload_size = len(raw)
+
                             lat = (time.perf_counter() - start) * 1000.0
                             with self.lock:
                                 self.latencies_ms.append(lat)
                                 self.success += 1
                                 op_count += 1
+                            try:
+                                self.payload_sizes.append(int(payload_size))
+                                if len(self.payload_sizes) > 1000:
+                                    self.payload_sizes.pop(0)
+                            except Exception:
+                                pass
                             logger.debug(f"HSET operation success: {self.success} operations")
                         except Exception as e:
                             logger.warning(f"HSET operation failed: {e}")
                     else:
                         # Normal cache write
                         try:
-                            r.set(key, payload, ex=self.cache_ttl)
+                            if getattr(self, "payload_mode", "json") == "json":
+                                r.set(key, payload, ex=self.cache_ttl)
+                                payload_size = len(payload.encode("utf-8"))
+                            else:
+                                target_bytes = int(self.payload_size_bytes)
+                                raw = os.urandom(max(1, target_bytes))
+                                b64 = base64.b64encode(raw).decode("ascii")
+                                r.set(key, b64, ex=self.cache_ttl)
+                                payload_size = len(raw)
+
                             lat = (time.perf_counter() - start) * 1000.0
                             with self.lock:
                                 self.latencies_ms.append(lat)
                                 self.success += 1
                                 op_count += 1
+                            try:
+                                self.payload_sizes.append(int(payload_size))
+                                if len(self.payload_sizes) > 1000:
+                                    self.payload_sizes.pop(0)
+                            except Exception:
+                                pass
                             logger.debug(f"SET operation success: {self.success} operations")
                         except Exception as e:
                             logger.warning(f"SET operation failed: {e}")
@@ -403,8 +439,9 @@ class VideoCacheEnhancedBench:
                 t.start()
                 tlist.append(t)
 
-            logger.info("Started %d threads for %ds (model=%s, cameras=%d, payload_kb=%d)",
-                       threads, duration, self.inference_model, self.camera_count, self.payload_size_kb)
+            # Report payload size in bytes for accuracy
+            logger.info("Started %d threads for %ds (model=%s, cameras=%d, payload_bytes=%d)",
+                       threads, duration, self.inference_model, self.camera_count, self.payload_size_bytes)
 
             # Wait for threads to finish
             logger.info("Waiting for worker threads to complete...")
@@ -442,6 +479,20 @@ class VideoCacheEnhancedBench:
 
         logger.info("Configuration: %d objects/frame, %d cameras, %s model",
                    self.objects_per_frame, self.camera_count, self.inference_model)
+        # Emit structured metrics for orchestration parsing
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Video Cache Redis Benchmark",
@@ -451,8 +502,8 @@ def main():
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
     # Data scaling expansion
-    parser.add_argument("--payload-size-kb", default=1, type=int,
-                       help="Target payload size in KB (default: 1)")
+    parser.add_argument("--payload-size", default="1KB", type=str,
+                       help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
     parser.add_argument("--objects-per-frame", default=3, type=int,
                        help="Number of objects per frame (default: 3)")
 
@@ -486,6 +537,8 @@ def main():
                        help="Fallback to persistence percentage")
     parser.add_argument("--do-get-pct", default=0, type=int,
                        help="Immediate get after set percentage")
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob)")
 
     args = parser.parse_args()
 
@@ -493,13 +546,32 @@ def main():
     if args.pool_size is None:
         args.pool_size = 4 * 4  # Default 16
 
+    # support new unit-aware --payload-size string flag (supports units: B/KB/MB)
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+
     bench = VideoCacheEnhancedBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         cache_ttl=args.ttl,
         persist_hash=args.persist_hash,
         # Data scaling expansion
-        payload_size_kb=args.payload_size_kb,
+        payload_size_bytes=payload_bytes,
         objects_per_frame=args.objects_per_frame,
         # Data authenticity
         camera_count=args.camera_count,
@@ -510,6 +582,7 @@ def main():
         pool_timeout=args.pool_timeout,
         pool_size=args.pool_size
     )
+    bench.payload_mode = args.payload_mode
 
     bench.run(threads=args.threads, duration=args.duration,
              write_pct=args.write_pct, fallback_rate=args.fallback_rate,

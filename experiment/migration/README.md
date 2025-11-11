@@ -203,7 +203,7 @@ python3 ./experiment/migration/redis/bench_cartelem.py \
   --threads 8 \
   --duration 30 \
   --vehicle-pattern highway \
-  --payload-size-kb 2 \
+  --payload-size 2KB \
   --connect-timeout 5 \
   --stream vehicle:telemetry
 
@@ -213,7 +213,7 @@ python3 ./experiment/migration/redis/bench_cartelem.py \
   --threads 16 \
   --duration 60 \
   --vehicle-pattern highway \
-  --payload-size-kb 4 \
+  --payload-size 4KB \
   --rps 1000 \
   --size-distribution normal
 ```
@@ -229,7 +229,7 @@ python3 ./experiment/migration/influxdb/bench_cartelem.py \
   --threads 4 \
   --duration 60 \
   --vehicle-pattern normal_city \
-  --payload-size-kb 1 \
+  --payload-size 1KB \
   --rps 100 \
   --read-pct 10 \
   --size-distribution uniform
@@ -243,13 +243,13 @@ python3 ./experiment/migration/influxdb/bench_cartelem.py \
   --threads 8 \
   --duration 90 \
   --vehicle-pattern highway \
-  --payload-size-kb 3 \
+  --payload-size 3KB \
   --rps 500
 ```
 
 参数说明：
 - `--vehicle-pattern`: 驾驶模式 [normal_city/highway/stop_go]
-- `--payload-size-kb`: 目标负载大小(KB)，支持小数
+- `--payload-size`: 目标负载大小，带单位（例如 256B, 16KB, 1MB），默认单位为 KB
 - `--size-distribution`: 数据大小分布模式 [uniform/normal/zipf]
 - `--rps`/ `--max-requests-per-second`: 每秒最大请求数限制
 - `--threads`: 并发工作线程数
@@ -277,7 +277,7 @@ python3 ./experiment/migration/redis/bench_sensoragg.py \
   --read-pct 15 \
   --sensors-per-device 20 \
   --sensor-types temperature,vibration,humidity,pressure \
-  --payload-size-kb 2 \
+  --payload-size 2KB \
   --environmental-noise 0.1
 ```
 
@@ -310,7 +310,7 @@ python3 ./experiment/migration/redis/bench_video_cache.py \
   --write-pct 75 \
   --ttl 180 \
   --camera-count 50 \
-  --payload-size-kb 4 \
+  --payload-size 4KB \
   --rps 2000
 ```
 
@@ -358,7 +358,7 @@ python3 ./experiment/migration/elasticsearch/benchmark.py \
 
 ### 数据规模扩展
 所有bench_*.py脚本都支持：
-- **Payload Size Control**: 通过`--payload-size-kb`指定目标负载大小(KB)
+- **Payload Size Control**: 通过`--payload-size`指定目标负载大小（带单位，例如 16KB 或 1MB）
 - **Size Distribution**: 支持uniform/normal/zipf分布模式，模拟真实数据模式
 - **Sensor/Attribute Scaling**: 可配置每设备传感器数量，数据结构扩展
 

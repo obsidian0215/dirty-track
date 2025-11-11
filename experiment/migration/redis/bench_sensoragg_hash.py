@@ -14,12 +14,12 @@ FEATURES:
 
 USAGE:
    python3 bench_sensoragg_hash.py --redis-host 127.0.0.1 --threads 8 --duration 30 --read-pct 10
-   python3 bench_sensoragg_hash.py --redis-host 127.0.0.1 --threads 4 --duration 60 --payload-size-kb 2 --connect-timeout 3
+    python3 bench_sensoragg_hash.py --redis-host 127.0.0.1 --threads 4 --duration 60 --payload-size 2KB --connect-timeout 3
 
 EXTENDED USAGE:
    --sensor-hash-prefix: Hash键前缀 (default: sensor:)
    --time-idx-list: 时间索引List键名 (default: sensor_time_idx)
-   --payload-size-kb: 负载大小目标 (default: 1)
+    --payload-size: 负载大小目标，带单位（default: 1KB），示例: 256B, 16KB, 1MB
 """
 
 import argparse
@@ -31,6 +31,7 @@ import time
 import statistics
 from typing import List, Optional, Dict, Any
 import redis
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -78,8 +79,8 @@ class SensorHashBench:
                  # 新数据结构配置
                  sensor_hash_prefix: str = "sensor:",
                  time_index_list: str = "sensor_time_idx",
-                 # 数据规模扩展
-                 payload_size_kb: float = 1.0,
+                 # 数据规模扩展 (bytes)
+                 payload_size_bytes: int = 1024,
                  # 数据类型真实性配置
                  sensor_types: Optional[List[str]] = None,
                  environmental_noise: float = 0.05,
@@ -100,8 +101,8 @@ class SensorHashBench:
 
         self._stop = threading.Event()
 
-        # 数据规模扩展配置
-        self.payload_size_kb = payload_size_kb
+        # 数据规模扩展配置 (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
 
         # 数据类型真实性配置
         self.sensor_types = sensor_types or ["temperature", "humidity", "pressure", "vibration"]
@@ -189,7 +190,7 @@ class SensorHashBench:
 
         # 通过添加虚拟字段扩展数据大小
         current_size = len(json.dumps(sensor_data))
-        target_size = int(self.payload_size_kb * 1024)
+        target_size = int(self.payload_size_bytes)
 
         while current_size < target_size:
             key = f"extra_field_{len(sensor_data)}"
@@ -362,7 +363,8 @@ def main():
     parser.add_argument("--time-idx-list", default="sensor_time_idx", help="时间索引List键名")
 
     # 数据规模扩展
-    parser.add_argument("--payload-size-kb", default=1.0, type=float, help="目标负载大小(KB)")
+    parser.add_argument("--payload-size", default="1KB", type=str,
+                        help="目标负载大小，带单位（例如 256B, 16KB, 1MB）。示例: 512B, 16KB, 1MB")
 
     # 数据类型真实性
     parser.add_argument("--sensor-types", default="temperature,humidity,pressure,vibration",
@@ -390,13 +392,32 @@ def main():
     # 参数解析
     sensor_types = [st.strip() for st in args.sensor_types.split(",")]
     pool_size = args.pool_size or (args.threads * 10)
+    # unit-aware payload parsing: support new --payload-size (bytes/KB/MB)
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+    payload_size_bytes = int(payload_bytes)
 
     bench = SensorHashBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         sensor_hash_prefix=args.sensor_hash_prefix,
         time_index_list=args.time_idx_list,
-        payload_size_kb=args.payload_size_kb,
+        payload_size_bytes=payload_size_bytes,
         sensor_types=sensor_types,
         connect_timeout=args.connect_timeout,
         socket_timeout=args.socket_timeout,

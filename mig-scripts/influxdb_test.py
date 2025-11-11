@@ -58,7 +58,7 @@ scene_configs = {
             # '--org': 'org',
             # '--bucket': 'sensor-data',
             # '--threads': '4',
-            "--payload-size-kb": "2",
+            "--payload-size": "2KB",
             "--sensors-per-device": "10",
             "--read-pct": "0",
             "--duration": "120",
@@ -66,13 +66,13 @@ scene_configs = {
     },
     "vehicle": {
         "bench": "experiment/migration/influxdb/bench_cartelem.py",
-        "base_args": {
+            "base_args": {
             "--influx-url": "http://192.168.2.100:8181",
             # '--token': 'token',
             # '--org': 'org',
             # '--bucket': 'vehicle-data',
             # '--threads': '4',
-            "--payload-size-kb": "2",
+            "--payload-size": "2KB",
             # '--size-distribution':'normal',
             # '--vehicle-pattern': 'highway',
             "--duration": "120",
@@ -403,15 +403,15 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
     configure_network()
     print("Network configuration applied between bench load and run.")
 
-    # --- run 阶段：覆盖 payload-size-kb / sensors-per-device ---
+    # --- run 阶段：覆盖 payload-size / sensors-per-device ---
     run_args = extra_args.copy()
     if scene == "sensor":
-        run_args["--payload-size-kb"] = "4"  # ★ 你要的新值
-        run_args["--sensors-per-device"] = "15"  # ★ 你要的新值\
+        run_args["--payload-size"] = "4KB"
+        run_args["--sensors-per-device"] = "15"
 
     if scene == "vehicle":
-        run_args["--payload-size-kb"] = "4"  # ★ 你要的新值
-        run_args["--size-distribution"] = "normal"  #
+        run_args["--payload-size"] = "4KB"
+        run_args["--size-distribution"] = "normal"
         run_args["--vehicle-pattern"] = "highway"
 
     # run
@@ -505,7 +505,7 @@ def main():
     parser.add_argument("--bucket", help="InfluxDB bucket (默认根据场景设置)")
     parser.add_argument("--threads", type=int, help="线程数")
     parser.add_argument("--duration", type=int, help="测试时长(s)")
-    parser.add_argument("--payload-size-kb", type=int, help="负载大小(KB)")
+    parser.add_argument("--payload-size", default=None, help="目标负载大小，支持单位后缀（B, KB, MB），示例: 512B, 16KB, 1MB。")
     parser.add_argument("--read-pct", type=int, help="读操作百分比")
     # Scene特有参数
     parser.add_argument("--objects-per-frame", type=int, help="每帧对象数 (video场景)")
@@ -538,6 +538,8 @@ def main():
     print(f"[sec] mode={'on' if SEC_MODE else 'off'} using DEST_SCRIPT={DEST_SCRIPT}, SOURCE_SCRIPT={SOURCE_SCRIPT}")
 
     # 设置场景特有bucket
+
+    # Note: --payload-size is a unit-aware string (e.g. 16KB). Scene defaults supply a value when omitted.
     if not args.bucket:
         if args.scene == "video":
             args.bucket = "data"
@@ -579,8 +581,8 @@ def main():
                         extra_args["--threads"] = str(args.threads)
                     if args.duration:
                         extra_args["--duration"] = str(args.duration)
-                    if args.payload_size_kb:
-                        extra_args["--payload-size-kb"] = str(args.payload_size_kb)
+                    if args.payload_size:
+                        extra_args["--payload-size"] = str(args.payload_size)
                     if args.objects_per_frame:
                         extra_args["--objects-per-frame"] = str(args.objects_per_frame)
                 elif args.scene == "sensor":
@@ -588,8 +590,8 @@ def main():
                         extra_args["--threads"] = str(args.threads)
                     if args.duration:
                         extra_args["--duration"] = str(args.duration)
-                    if args.payload_size_kb:
-                        extra_args["--payload-size-kb"] = str(args.payload_size_kb)
+                    if args.payload_size:
+                        extra_args["--payload-size"] = str(args.payload_size)
                     if args.read_pct:
                         extra_args["--read-pct"] = str(args.read_pct)
                     if args.sensors_per_device:
@@ -599,8 +601,8 @@ def main():
                         extra_args["--threads"] = str(args.threads)
                     if args.duration:
                         extra_args["--duration"] = str(args.duration)
-                    if args.payload_size_kb:
-                        extra_args["--payload-size-kb"] = str(args.payload_size_kb)
+                    if args.payload_size:
+                        extra_args["--payload-size"] = str(args.payload_size)
                     if args.read_pct:
                         extra_args["--read-pct"] = str(args.read_pct)
                     if args.vehicle_pattern:

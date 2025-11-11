@@ -12,13 +12,13 @@ FEATURES:
   - 连接超时配置: 连接池管理、超时重试、连接健康检查
 
 USAGE:
-  python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 30 --vehicle-pattern highway --payload-size-kb 5 --connect-timeout 2
+    python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 30 --vehicle-pattern highway --payload-size 5KB --connect-timeout 2
   python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 4 --duration 60 --size-distribution normal --pool-size 50
   python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 4 --duration 30 --rps 100  # 限制为100 RPS
 
 EXTENDED USAGE:
   --vehicle-pattern: normal_city/highway/stop_go (default: normal_city)
-  --payload-size-kb: Target payload size in KB (default: 1)
+    --payload-size: Target payload size with units (default: 1KB). Examples: 256B, 16KB, 1MB
   --size-distribution: uniform/normal/zipf (default: uniform)
   --connect-timeout: Connection timeout seconds (default: 5)
   --socket-timeout: Socket timeout seconds (default: 5)
@@ -34,7 +34,10 @@ import threading
 import time
 import statistics
 from typing import List, Optional
+import os
+import base64
 import redis
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -79,7 +82,7 @@ class CarTelematicsBench:
     """车联网写入 Redis Stream 的负载发生器"""
     def __init__(self, redis_host: str, redis_port: int, stream_name: str = "vehicle:telemetry",
                  # 数据规模扩展
-                 payload_size_kb: float = 1.0, size_distribution: str = "uniform",
+                 payload_size_bytes: int = 1024, size_distribution: str = "uniform",
                 # 数据类型真实性
                 vehicle_pattern: str = "normal_city",
                 # 连接超时配置
@@ -95,8 +98,8 @@ class CarTelematicsBench:
         self.stream_name = stream_name
         self._stop = threading.Event()
 
-        # 数据规模扩展配置
-        self.payload_size_kb = payload_size_kb
+        # 数据规模扩展配置 (bytes)
+        self.payload_size_bytes = payload_size_bytes
         self.size_distribution = size_distribution  # uniform, normal, zipf
 
         # 数据类型真实性配置
@@ -133,6 +136,10 @@ class CarTelematicsBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        # ensure payload_sizes exists and payload_mode default
+        self.payload_sizes = getattr(self, "payload_sizes", [])
+        self.payload_mode = "json"
 
         # 初始化连接池
         self.connection_pool = None
@@ -262,7 +269,7 @@ class CarTelematicsBench:
 
         # 数据规模扩展 (应用指定分布)
         current_size = len(json.dumps(payload))
-        base_target_bytes = int(self.payload_size_kb * 1024)  # 基本目标大小
+        base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小
 
         # 应用分布函数
         if self.size_distribution == "uniform":
@@ -320,25 +327,35 @@ class CarTelematicsBench:
             payload = self._make_payload(vehicle_id)
             vehicle_id = payload["vehicle_id"]  # 更新车辆ID以保持连续性
 
-            # 动态跟踪payload大小用于自适应TTL计算
-            if self.target_db_size_mb:
-                payload_size = len(json.dumps(payload))
-                self.payload_sizes.append(payload_size)
-                # 保持最近100个payload大小用于准确计算
-                if len(self.payload_sizes) > 100:
-                    self.payload_sizes.pop(0)
-                # 更新平均payload大小
-                if self.payload_sizes:
-                    self.avg_payload_size = sum(self.payload_sizes) / len(self.payload_sizes)
+            # prepare data according to payload_mode
+            if getattr(self, "payload_mode", "json") == "json":
+                data_str = json.dumps(payload)
+                payload_size = len(data_str.encode("utf-8"))
+            else:
+                target_bytes = int(self.payload_size_bytes)
+                raw = os.urandom(max(1, target_bytes))
+                data_str = base64.b64encode(raw).decode("ascii")
+                payload_size = len(raw)
 
             op_start_time = time.perf_counter()
             try:
-                r.xadd(self.stream_name, {"data": json.dumps(payload)})
+                r.xadd(self.stream_name, {"data": data_str})
                 lat = (time.perf_counter() - op_start_time) * 1000.0
                 with self.lock:
                     self.latencies_ms.append(lat)
                     self.success += 1
                     self.request_count += 1
+
+                    # record payload size for metrics
+                    try:
+                        self.payload_sizes.append(int(payload_size))
+                        if len(self.payload_sizes) > 1000:
+                            self.payload_sizes.pop(0)
+                        # update avg if adaptive
+                        if self.target_db_size_mb:
+                            self.avg_payload_size = sum(self.payload_sizes) / len(self.payload_sizes)
+                    except Exception:
+                        pass
 
                     # 设置Stream TTL，确保数据会在设定时间后过期
                     if self.target_db_size_mb:
@@ -424,7 +441,7 @@ class CarTelematicsBench:
             tlist.append(t)
 
         logger.info("Started %d threads for %ds (vehicle_pattern=%s, payload_kb=%d)",
-                   threads, duration, self.vehicle_pattern, self.payload_size_kb)
+                   threads, duration, self.vehicle_pattern, self.payload_size_bytes)
         for t in tlist:
             t.join()
         logger.info("Workers finished")
@@ -484,6 +501,21 @@ class CarTelematicsBench:
             logger.info("Latency ms - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
                         statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
 
+        # Emit structured metrics for downstream parsers
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Car Telematics Redis Benchmark")
 
@@ -492,8 +524,10 @@ def main():
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
     # 数据规模扩展
-    parser.add_argument("--payload-size-kb", default=1.0, type=float,
-                       help="Target payload size in KB (support decimals)")
+    parser.add_argument("--payload-size", default="1KB", type=str,
+                       help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (random bytes, base64-encoded)")
     parser.add_argument("--size-distribution", default="uniform", type=str,
                        choices=["uniform", "normal", "zipf"],
                        help="Distribution type for payload sizes")
@@ -541,12 +575,31 @@ def main():
     if pool_size is None:
         pool_size = args.threads * 10
 
+    # unit-aware payload size parsing: parse --payload-size tokens with units (B/KB/MB)
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical unit-aware --payload-size (string) into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+
     bench = CarTelematicsBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         stream_name=args.stream,
-        # 数据规模扩展
-        payload_size_kb=args.payload_size_kb,
+        # 数据规模扩展 (bytes)
+        payload_size_bytes=payload_bytes,
         size_distribution=args.size_distribution,
         # 数据类型真实性
         vehicle_pattern=args.vehicle_pattern,
@@ -562,6 +615,7 @@ def main():
         ttl=args.ttl,
         stream_maxlen=args.stream_maxlen
     )
+    bench.payload_mode = args.payload_mode
     bench.run(threads=args.threads, duration=args.duration)
 
 if __name__ == "__main__":

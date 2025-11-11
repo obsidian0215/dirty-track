@@ -21,11 +21,11 @@ BANDWIDTH = "25mbit"
 scene_configs = {
     "video": {
         "bench": "experiment/migration/redis/bench_video_cache.py",
-        "base_args": {
+            "base_args": {
             "--redis-host": "192.168.2.100",
             "--redis-port": "6379",
             "--duration": "120",  #
-            "--payload-size-kb": "1",
+            "--payload-size": "1KB",
             # '--threads': '4',
             # '--duration': '10',
             # '--write-pct': '80',
@@ -34,10 +34,10 @@ scene_configs = {
     },
     "sensor": {
         "bench": "experiment/migration/redis/bench_sensoragg.py",
-        "base_args": {
+            "base_args": {
             "--redis-host": "192.168.37.150",
             "--redis-port": "6379",
-            "--payload-size-kb": "2",
+            "--payload-size": "2KB",
             "--sensors-per-device": "10",
             "--read-pct": "0",
             "--duration": "90",  # 90s
@@ -46,14 +46,14 @@ scene_configs = {
     },
     "vehicle": {
         "bench": "experiment/migration/redis/bench_cartelem.py",
-        "base_args": {
+            "base_args": {
             "--redis-host": "192.168.37.150",
             "--redis-port": "6379",
             # '--token': 'token',
             # '--org': 'org',
             # '--bucket': 'vehicle-data',
             # '--threads': '4',
-            "--payload-size-kb": "2",
+            "--payload-size": "2KB",
             # '--size-distribution':'normal',
             # '--vehicle-pattern': 'highway',
             "--duration": "90",
@@ -386,15 +386,15 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
     configure_network()
     print("Network configuration applied between bench load and run.")
 
-    # --- run 阶段：覆盖 payload-size-kb / sensors-per-device ---
+    # --- run 阶段：覆盖 payload-size / sensors-per-device ---
     run_args = extra_args.copy()
     if scene == "sensor":
-        run_args["--payload-size-kb"] = "4"
+        run_args["--payload-size"] = "4KB"
         run_args["--sensors-per-device"] = "15"
         run_args["--duration"] = "240"
         # run_args['--rps'] = '100'
     if scene == "vehicle":
-        run_args["--payload-size-kb"] = "4"
+        run_args["--payload-size"] = "4KB"
         run_args["--size-distribution"] = "normal"
         run_args["--vehicle-pattern"] = "highway"
 
@@ -482,7 +482,7 @@ def main():
     parser.add_argument("--duration", type=int, help="测试时长(s)")
     parser.add_argument("--write-pct", type=int, help="写操作百分比 (video场景)")
     parser.add_argument("--ttl", type=int, help="TTL (video场景)")
-    parser.add_argument("--payload-size-kb", type=int, help="负载大小(KB)")
+    parser.add_argument("--payload-size", default=None, help="目标负载大小，支持单位后缀（B, KB, MB），示例: 512B, 16KB, 1MB。")
     parser.add_argument("--sensors-per-device", type=int, help="每设备传感器数")
     parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
     parser.add_argument("--runs", type=int, default=5, help="每个实验类型的运行次数")
@@ -551,7 +551,7 @@ def main():
                 #     extra_args['--write-pct'] = args.write_pct
                 #     extra_args['--ttl'] = args.ttl
                 # elif args.scene == 'sensor':
-                #     extra_args['--payload-size-kb'] = args.payload_size_kb
+                #     extra_args['--payload-size'] = args.payload_size
                 #     extra_args['--sensors-per-device'] = args.sensors_per_device
 
                 # 执行迁移（包含bench测试）

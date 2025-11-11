@@ -16,6 +16,7 @@ Notes:
 - Dirty-map collection per-run is best-effort and uses helpers from mig-scripts/source.py when available.
 """
 import argparse
+import sys
 import atexit
 import json
 import os
@@ -29,6 +30,9 @@ from cmd_utils import run_cmd, unmount_local_migration_tmpfs
 from result_writer import extract_stats_from_output
 
 # Try to import helpers from source.py (light-dt ioctl helpers)
+# Note: some mig-scripts modules parse CLI args at import-time (they call argparse.parse_args()).
+# Importing them can raise SystemExit when running this script. Catch BaseException to avoid
+# aborting on those cases and fall back to None values.
 try:
     from source import (
         DEVICE_PATH,
@@ -40,7 +44,7 @@ try:
         container_may_dump_size,
         execute_dirty_track,
     )
-except Exception:
+except BaseException:
     DEVICE_PATH = None
     set_dirty_map_path = None
     ioctl_start_pid = None
@@ -134,10 +138,15 @@ def wait_for_pid_exit(pid: int, timeout: int) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Run RPS x payload x pattern experiments")
-    parser.add_argument("--container", required=True)
-    parser.add_argument("--bench-template", required=True)
-    parser.add_argument("--rps-list", required=True)
-    parser.add_argument("--payload-sizes", default="64,512,4096")
+    parser.add_argument("--container", required=False)
+    parser.add_argument("--bench-template", required=False)
+    parser.add_argument("--rps-list", required=False)
+    parser.add_argument("--payload-sizes", default="64,512,4096", help="Comma-separated payload sizes. Default unit is bytes when no suffix given. Suffixes accepted: B, KB, MB (case-insensitive). Examples: 256B, 16KB, 1MB, 64")
+    parser.add_argument(
+        "--payload-modes",
+        default="",
+        help="Comma-separated payload modes to test (e.g. json,binary). If provided, will substitute {payload_mode} in the bench-template.",
+    )
     parser.add_argument("--patterns", default="random,zeros,repeat")
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--threads", type=int, default=1)
@@ -161,17 +170,305 @@ def main():
         action="store_true",
         help="Do not start benches; simulate runs locally and write small dry-run logs",
     )
+    parser.add_argument(
+        "--tests-file",
+        default="",
+        help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one rps_matrix run per entry and exit.",
+    )
     args = parser.parse_args()
 
+    # If not using --tests-file, enforce required options for single-run mode
+    if not args.tests_file:
+        missing = []
+        if not args.container:
+            missing.append("--container")
+        if not args.bench_template:
+            missing.append("--bench-template")
+        if not args.rps_list:
+            missing.append("--rps-list")
+        if missing:
+            parser.error(f"the following arguments are required when --tests-file is not used: {', '.join(missing)}")
+
+    # If tests-file provided, interpret each entry and spawn this script per-entry.
+    if args.tests_file:
+        try:
+            # allow files that may have a UTF-8 BOM
+            with open(args.tests_file, "r", encoding="utf-8-sig") as tf:
+                tests = json.load(tf)
+        except Exception as e:
+            print(f"Failed to load tests file {args.tests_file}: {e}")
+            return
+
+        # Build an overrides namespace from the current CLI so explicit CLI
+        # arguments override values present in the JSON tests file.
+        # We create a lightweight parser with the same option names but
+        # default=None so we can detect which options were provided by the user.
+        override_parser = argparse.ArgumentParser(add_help=False)
+        override_parser.add_argument("--container", dest="container")
+        override_parser.add_argument("--bench-template", dest="bench_template")
+        override_parser.add_argument("--rps-list", dest="rps_list")
+        override_parser.add_argument("--payload-sizes", dest="payload_sizes")
+        override_parser.add_argument("--payload-modes", dest="payload_modes")
+        override_parser.add_argument("--patterns", dest="patterns")
+        override_parser.add_argument("--duration", dest="duration", type=int)
+        override_parser.add_argument("--threads", dest="threads", type=int)
+        override_parser.add_argument("--runs", dest="runs", type=int)
+        override_parser.add_argument("--output", dest="output")
+        override_parser.add_argument("--log-dir", dest="log_dir")
+        override_parser.add_argument("--client-ip", dest="client_ip")
+        # parse_known_args so we ignore unrelated args; this reads from sys.argv
+        override_args, _ = override_parser.parse_known_args()
+        # detect boolean flags presence on the CLI
+        argv = sys.argv[1:]
+        dirtymap_present = "--dirtymap" in argv
+        remote_client_present = "--remote-client" in argv
+        fetch_remote_log_present = "--fetch-remote-log" in argv
+        dry_run_present = "--dry-run" in argv
+
+        for entry in tests:
+            # create a mutable copy and apply CLI overrides when present
+            merged = dict(entry)
+            # simple mapping of override attribute -> entry key
+            to_copy = [
+                "container",
+                "bench_template",
+                "rps_list",
+                "payload_sizes",
+                "payload_modes",
+                "patterns",
+                "duration",
+                "threads",
+                "runs",
+                "output",
+                "log_dir",
+                "client_ip",
+            ]
+            for name in to_copy:
+                val = getattr(override_args, name, None)
+                if val is not None:
+                    # normalize dest name for JSON keys that use hyphens
+                    json_key = name
+                    # bench_template and log_dir use same keys in JSON
+                    merged[json_key] = val
+            # override booleans if flag present on CLI
+            if dirtymap_present:
+                merged["dirtymap"] = True
+            if remote_client_present:
+                merged["remote_client"] = True
+            if fetch_remote_log_present:
+                merged["fetch_remote_log"] = True
+            if dry_run_present:
+                merged["dry_run"] = True
+            # replace entry with merged view for downstream logic
+            entry = merged
+            # Ensure 'container' is specified in each test entry. Tests-file entries must set the container name
+            # (this follows mig-scripts convention where container is the runc bundle name/path key).
+            if not entry.get("container"):
+                print(f"tests-file entry missing 'container' field: {entry.get('name','unnamed')}")
+                continue
+            # If requested, start backends using runc by container name (no docker/image/ports required)
+            def start_runc_backends(names, dry_run=False):
+                """Start runc backends by container name.
+
+                Behavior:
+                - For each name, look for a bundle at /runc/containers/<name> (convention from repo).
+                - If a bundle with config.json exists, attempt `runc create --bundle <bundle> <name>` then `runc start <name>`.
+                - If create fails because container already exists, fallback to `runc start <name>`.
+                - If bundle is missing, attempt `runc start <name>` anyway (best-effort).
+                - In dry_run mode, only print the commands.
+                """
+                started = []
+                if not names:
+                    return started
+                for name in names:
+                    name = name.strip()
+                    if not name:
+                        continue
+                    bundle_dir = os.path.join("/runc/containers", name)
+                    bundle_config = os.path.join(bundle_dir, "config.json")
+                    # prefer create+start when bundle exists
+                    if os.path.exists(bundle_config):
+                        create_cmd = f"runc create --bundle {shlex.quote(bundle_dir)} {shlex.quote(name)}"
+                        start_cmd = f"runc start {shlex.quote(name)}"
+                        print(f"[backend] -> {create_cmd}")
+                        print(f"[backend] -> {start_cmd}")
+                        if not dry_run:
+                            try:
+                                run_cmd(create_cmd, quiet=False)
+                            except Exception as e:
+                                # if create failed, try to start in case it already exists
+                                print(f"runc create failed for {name}, attempting start: {e}")
+                            try:
+                                run_cmd(start_cmd, quiet=False)
+                                started.append(name)
+                            except Exception as e:
+                                print(f"Failed to start runc container {name}: {e}")
+                        else:
+                            started.append(name)
+                    else:
+                        # No bundle found; try simple start (container may have been pre-created)
+                        start_cmd = f"runc start {shlex.quote(name)}"
+                        print(f"[backend] -> {start_cmd}  (no bundle at {bundle_dir})")
+                        if not dry_run:
+                            try:
+                                run_cmd(start_cmd, quiet=False)
+                                started.append(name)
+                            except Exception as e:
+                                print(f"Failed to start runc container {name} (no bundle): {e}")
+                        else:
+                            started.append(name)
+                return started
+
+            def stop_runc_backends(names, dry_run=False):
+                if not names:
+                    return
+                for name in names:
+                    name = name.strip()
+                    if not name:
+                        continue
+                    # Best-effort: attempt to kill then delete
+                    kill_cmd = f"runc kill {shlex.quote(name)} || true"
+                    delete_cmd = f"runc delete {shlex.quote(name)} || true"
+                    print(f"[backend] -> {kill_cmd}")
+                    print(f"[backend] -> {delete_cmd}")
+                    if not dry_run:
+                        try:
+                            run_cmd(kill_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        try:
+                            run_cmd(delete_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+
+            # Build command to call this script for the entry
+            cmd = [sys.executable, os.path.abspath(__file__)]
+            # map supported fields from entry to CLI args
+            def add_flag(k, flag=None):
+                v = entry.get(k)
+                if v is None:
+                    return
+                fk = flag or f"--{k.replace('_', '-') }"
+                if isinstance(v, bool):
+                    if v:
+                        cmd.append(fk)
+                else:
+                    # use extend to avoid rebinding outer 'cmd' in nested scope
+                    cmd.extend([fk, str(v)])
+
+            # required/typical fields
+            add_flag("container")
+            add_flag("bench_template", "--bench-template")
+            add_flag("rps_list", "--rps-list")
+            add_flag("payload_sizes", "--payload-sizes")
+            add_flag("payload_modes", "--payload-modes")
+            add_flag("patterns")
+            add_flag("duration")
+            add_flag("threads")
+            add_flag("runs")
+            # optional switches
+            if entry.get("dirtymap"):
+                cmd.append("--dirtymap")
+            if entry.get("remote_client"):
+                cmd.append("--remote-client")
+                if entry.get("client_ip"):
+                    cmd += ["--client-ip", entry.get("client_ip")]
+            if entry.get("fetch_remote_log"):
+                cmd.append("--fetch-remote-log")
+            if entry.get("dry_run"):
+                cmd.append("--dry-run")
+
+            # output/logdir defaults are created under results/logs
+            out = entry.get("output") or os.path.join("results", f"{entry.get('name','test')}_matrix.csv")
+            logd = entry.get("log_dir") or os.path.join("logs", entry.get("name", "test"))
+            cmd += ["--output", out, "--log-dir", logd]
+
+            print("Spawning rps_matrix for test:", entry.get("name", "unnamed"))
+            # Start backends via runc by container name (best-effort). We always
+            # attempt to start the container for the test's `container` field.
+            # Treat per-entry dry_run or global --dry-run as flags to avoid real actions.
+            container_name = entry.get("container")
+            entry_dry = bool(entry.get("dry_run"))
+            started = start_runc_backends([container_name], dry_run=entry_dry or args.dry_run)
+            if started:
+                print(f"Started runc backend: {', '.join(started)}")
+
+            print(" ", shlex.join(cmd))
+            try:
+                run_cmd(shlex.join(cmd), quiet=False)
+            except Exception as e:
+                print(f"Failed to run test {entry.get('name')}: {e}")
+            finally:
+                # Always attempt cleanup of the container we tried to start. The
+                # stop helper is best-effort and tolerates missing/failed states.
+                stop_runc_backends([container_name], dry_run=bool(entry.get("dry_run")) or args.dry_run)
+        return
+
+    def parse_size_token(tok: str) -> int:
+        """Parse a size token that may have unit suffix. Default unit is bytes when no suffix.
+
+        Returns size in bytes as int.
+        Accepts integers or floats with optional suffix: b, kb/k, mb/m (case-insensitive).
+        Examples:
+            256B -> 256
+            16KB -> 16384
+            1.5MB -> 1572864
+            64 -> 64 (default bytes)
+        """
+        if not tok:
+            raise ValueError("empty size token")
+        s = tok.strip()
+        s_low = s.lower()
+        # detect suffix
+        unit = None
+        num = s_low
+        if s_low.endswith("kb"):
+            unit = "kb"
+            num = s_low[: -2]
+        elif s_low.endswith("k") and not s_low.endswith("kb"):
+            unit = "kb"
+            num = s_low[: -1]
+        elif s_low.endswith("mb"):
+            unit = "mb"
+            num = s_low[: -2]
+        elif s_low.endswith("m") and not s_low.endswith("mb"):
+            unit = "mb"
+            num = s_low[: -1]
+        elif s_low.endswith("b") and not s_low.endswith("kb") and not s_low.endswith("mb"):
+            unit = "b"
+            num = s_low[: -1]
+        else:
+            # no suffix -> default to bytes
+            unit = "b"
+            num = s_low
+        try:
+            val = float(num)
+        except Exception:
+            raise ValueError(f"invalid size token: {tok}")
+        if unit == "b":
+            bytes_val = int(val)
+        elif unit == "kb":
+            bytes_val = int(val * 1024)
+        elif unit == "mb":
+            bytes_val = int(val * 1024 * 1024)
+        else:
+            bytes_val = int(val)
+        return bytes_val
+
     rps_values = [int(x) for x in args.rps_list.split(",") if x.strip()]
-    payloads = [int(x) for x in args.payload_sizes.split(",") if x.strip()]
+    # convert payload sizes to bytes (default unit KB)
+    payloads = [parse_size_token(x) for x in args.payload_sizes.split(",") if x.strip()]
     patterns = [x for x in args.patterns.split(",") if x.strip()]
+    payload_modes = [x for x in args.payload_modes.split(",") if x.strip()] if args.payload_modes else [""]
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     header = [
         "ts_utc",
         "rps",
+        "payload_mode",
         "payload_bytes",
+        "avg_payload_bytes",
+        "median_payload_bytes",
         "pattern",
         "run",
         "container",
@@ -234,9 +531,12 @@ def main():
 
     for rps in rps_values:
         for payload in payloads:
-            for pattern in patterns:
-                for run_idx in range(1, args.runs + 1):
-                    print(f"Run rps={rps} payload={payload} pattern={pattern} run={run_idx}")
+            for payload_mode in payload_modes:
+                for pattern in patterns:
+                    for run_idx in range(1, args.runs + 1):
+                        print(
+                            f"Run rps={rps} payload={payload} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}"
+                        )
                     if args.dry_run:
                         pid = None
                     else:
@@ -244,9 +544,18 @@ def main():
                     before = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
 
                     ts = int(time.time())
-                    local_logname = os.path.join(args.log_dir, f"bench_{rps}_{payload}_{pattern}_{run_idx}_{ts}.log")
+                    # include payload_mode in logname so different modes produce separate logs
+                    safe_mode = payload_mode if payload_mode else "default"
+                    local_logname = os.path.join(
+                        args.log_dir, f"bench_{rps}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log"
+                    )
                     bench_cmd = args.bench_template.format(
-                        rps=rps, duration=args.duration, threads=args.threads, payload=payload, pattern=pattern
+                        rps=rps,
+                        duration=args.duration,
+                        threads=args.threads,
+                        payload=payload,
+                        pattern=pattern,
+                        payload_mode=payload_mode,
                     )
 
                     bench_pid = None
@@ -260,6 +569,9 @@ def main():
                             with open(local_logname, "w", encoding="utf-8") as df:
                                 df.write("DRY-RUN\n")
                                 df.write(bench_cmd + "\n")
+                                # also emit a minimal METRIC_VALUES line so parsing shows payload_mode/size
+                                df.write("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec\n")
+                                df.write(f"METRIC_VALUES\t{payload}\t{payload}\t0\t0\n")
                         except Exception:
                             pass
                     else:
@@ -329,6 +641,8 @@ def main():
                     after = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
 
                     bench_stats = ""
+                    avg_payload_val = ""
+                    median_payload_val = ""
                     # If remote run, optionally fetch the remote log; otherwise try to read it via ssh cat
                     target_log = local_logname
                     content = None
@@ -360,17 +674,27 @@ def main():
 
                     if content:
                         header, values = extract_stats_from_output(content)
-                        if values:
+                        if header and values:
+                            # header and values are tab-separated strings
+                            h_fields = header.split("\t")
+                            v_fields = values.split("\t")
+                            # map header to values
+                            hv = dict(zip(h_fields, v_fields))
+                            avg_payload_val = hv.get("avg_payload_bytes", "")
+                            median_payload_val = hv.get("median_payload_bytes", "")
+                            # keep bench_stats as before for compatibility
                             bench_stats = values.replace("\t", "|")
                         else:
                             bench_stats = content.strip().splitlines()[-1] if content.strip() else ""
                     else:
                         bench_stats = ""
-
                     row = [
                         datetime.utcnow().isoformat() + "Z",
                         str(rps),
+                        str(payload_mode),
                         str(payload),
+                        str(avg_payload_val),
+                        str(median_payload_val),
                         str(pattern),
                         str(run_idx),
                         args.container,

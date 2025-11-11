@@ -74,7 +74,7 @@ python3 bench_sensoragg.py --rps 200
 ```bash
 # 城市驾驶模式测试
 python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 30 \
-    --vehicle-pattern normal_city --payload-size-kb 5
+    --vehicle-pattern normal_city --payload-size 5KB
 ```
 
 ### 2. bench_sensoragg.py - 传感器聚合基准测试
@@ -115,10 +115,10 @@ python3 bench_video_cache.py --redis-host 127.0.0.1 --threads 16 --duration 30 \
 | 参数 | 说明 | 默认值 | 示例 |
 |------|------|--------|------|
 | `--redis-host` | Redis服务器地址 | 127.0.0.1 | --redis-host 192.168.1.100 |
-| `--redis-port` | Redis服务器端口 | 6379 | `----redis-port 6380` |
+| `--redis-port` | Redis服务器端口 | 6379 | `--redis-port 6380` |
 | `--threads` | 工作线程数 | 4 | `--threads 16` |
 | `--duration` | 测试时长(秒) | 10 | `--duration 300` |
-| `--payload-size-kb` | 目标负载大小(KB) | 1 | `--payload-size-kb 5` |
+| `--payload-size` | 目标负载大小 (支持单位B/KB/MB, 如 "5KB") | 1KB | `--payload-size 5KB` |
 | `--size-distribution` | 数据大小分布 | uniform | `--size-distribution normal` |
 | `--rps`/`--max-requests-per-second` | 请求速率限制(每秒) | 无限制 | `--rps 1000` |
 | `--target-db-size-mb` | 目标数据库大小(MB) | 自适应 | `--target-db-size-mb 100` |
@@ -163,7 +163,7 @@ python3 ./experiment/migration/redis/bench_cartelem.py \
 ```bash
 # 精确控制每秒请求数
 python3 bench_cartelem.py --redis-host 127.0.0.1 --threads 8 --duration 60 \
-    --rps 500 --payload-size-kb 2
+    --rps 500 --payload-size 2KB
 ```
 
 #### 自适应数据库大小控制
@@ -189,7 +189,7 @@ python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 180 \
 ```bash
 # 扩展到大规模数据负载
 python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 16 --duration 300 \
-    --sensors-per-device 50 --payload-size-kb 10 --read-pct 20
+    --sensors-per-device 50 --payload-size 10KB --read-pct 20
 ```
 
 ## 🎯 性能输出格式

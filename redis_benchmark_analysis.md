@@ -207,7 +207,7 @@ python3 bench_video_cache.py --redis-host 127.0.0.1 --redis-port 6379 --threads 
 - `--speed-range-min/max`: 车速动态范围
 
 #### 数据规模与复杂度
-- `--payload-size-kb`: 每条消息负载大小 (KB，可模拟传感器数据量)
+- `--payload-size`: 每条消息负载大小，带单位（例如 16KB，可模拟传感器数据量）
 - `--vehicle-count`: 模拟车辆总数 (影响ID分布)
 - `--batch-size`: XADD批处理大小 (默认1)
 - `--compression`: 数据压缩选项 (`none`, `gzip`, `lz4`)

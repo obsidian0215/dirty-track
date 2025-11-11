@@ -15,14 +15,14 @@ FEATURES:
 USAGE:
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 8 --duration 30 --read-pct 10
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 60 --sensors-per-device 10 --sensor-types temperature,humidity,pressure
-  python3 bench_sensoragg.py --redis-host 127.0.0.1 --payload-size-kb 2 --connect-timeout 3 --pool-size 100
+    python3 bench_sensoragg.py --redis-host 127.0.0.1 --payload-size 2KB --connect-timeout 3 --pool-size 100
   python3 bench_sensoragg.py --redis-host 127.0.0.1 --threads 4 --duration 30 --rps 100  # 限制为100 RPS
 
 EXTENDED USAGE:
   --sensors-per-device: 每个设备的传感器数量 (default: 5)
   --sensor-types: 传感器类型列表 (default: temperature,humidity,pressure,vibration)
   --environmental-noise: 环境噪音级别 (default: 0.05)
-  --payload-size-kb: 负载大小目标 (default: 1)
+    --payload-size: 负载大小目标，带单位（default: 1KB），示例: 256B, 16KB, 1MB
   --connect-timeout: 连接超时秒数 (default: 5)
   --socket-timeout: socket读取超时 (default: 5)
   --pool-timeout: 连接池等待超时 (default: 10)
@@ -35,8 +35,11 @@ import random
 import threading
 import time
 import statistics
+import os
+import base64
 from typing import List, Optional, Dict, Any
 import redis
+import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -81,7 +84,7 @@ class SensorAggBench:
     """增强版传感器聚合基准测试，支持真实传感器模拟、数据规模扩展和连接管理"""
     def __init__(self, redis_host: str, redis_port: int, set_key: str = "sensors:ts",
                 # 数据规模扩展
-                payload_size_kb: float = 1.0, sensors_per_device: int = 5,
+                payload_size_bytes: int = 1024, sensors_per_device: int = 5,
                # 数据类型真实性配置
                sensor_types: Optional[List[str]] = None,
                environmental_noise: float = 0.05,
@@ -98,8 +101,8 @@ class SensorAggBench:
         self.target_db_size_mb = target_db_size_mb
         self._stop = threading.Event()
 
-        # 数据规模扩展配置
-        self.payload_size_kb = payload_size_kb
+        # 数据规模扩展配置 (bytes)
+        self.payload_size_bytes = payload_size_bytes
         self.sensors_per_device = sensors_per_device  # 每个设备支持的传感器数量
 
         # 数据类型真实性配置
@@ -122,7 +125,6 @@ class SensorAggBench:
             self.set_ttl = ttl  # 初始TTL值为参数指定的值
             self.clean_interval = 200  # 每200个请求调整一次TTL
             # 自适应TTL参数 - 优化实现
-            self.payload_sizes = []  # 动态跟踪payload大小
             self.avg_payload_size = 512  # 初始估算值，会动态更新
             self.current_ttl = ttl  # 初始TTL值为参数指定的值
             self.last_ttl_adjust = time.time()
@@ -141,10 +143,15 @@ class SensorAggBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+        # 动态跟踪每次写入的payload大小（以字节计）
+        self.payload_sizes = []
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
         self._rate_limiter = RateLimiter(max_requests_per_second)
+
+        # payload mode: 'json' or 'binary' (binary stored as base64 string)
+        self.payload_mode = "json"
 
         self.request_count = 0
 
@@ -279,7 +286,7 @@ class SensorAggBench:
 
         # 数据规模扩展 - 添加额外传感器读数达到目标大小（添加随机性: 80%-120%）
         current_size = len(json.dumps(sensor_data))
-        target_size_bytes = int(self.payload_size_kb * 1024)  # 转换到字节，整数
+        target_size_bytes = int(self.payload_size_bytes)  # 已经是字节
         random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
         random_stop_bytes = int(target_size_bytes * random_multiplier)
 
@@ -342,12 +349,33 @@ class SensorAggBench:
                         self.success += 1
                 else:
                     rcd = self._make_reading()
-                    r.zadd(self.set_key, {json.dumps(rcd): float(rcd["timestamp"])})
+                    # generate payload according to mode
+                    if getattr(self, "payload_mode", "json") == "json":
+                        member = json.dumps(rcd)
+                        payload_bytes = len(member.encode("utf-8"))
+                    else:
+                        # binary: generate random bytes approximating payload_size_bytes
+                        target_bytes = int(self.payload_size_bytes)
+                        raw = os.urandom(max(1, target_bytes))
+                        # store as base64 string so redis client (decode_responses=True) can handle it
+                        member = base64.b64encode(raw).decode("ascii")
+                        payload_bytes = len(raw)
+
+                    try:
+                        r.zadd(self.set_key, {member: float(rcd["timestamp"])})
+                    except Exception:
+                        # fallback to string member if zadd fails for bytes
+                        r.zadd(self.set_key, {json.dumps(rcd): float(rcd["timestamp"])})
+
                     lat = (time.perf_counter() - start) * 1000.0
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
                         self.request_count += 1
+                        # record payload size for metrics
+                        if not hasattr(self, "payload_sizes"):
+                            self.payload_sizes = []
+                        self.payload_sizes.append(payload_bytes)
 
                     # 设置Sorted Set TTL，确保数据会在设定时间后过期
                     if self.target_db_size_mb:
@@ -480,6 +508,21 @@ class SensorAggBench:
             def pct(p): return lat[int(len(lat)*p/100)]
             logger.info("Latency ms - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
                         statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
+        # Emit structured metrics for downstream parsers
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        # METRIC lines are parsed by mig-scripts/result_writer.extract_stats_from_output
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Sensor Aggregator Redis Benchmark")
@@ -489,8 +532,10 @@ def main():
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
     # 数据规模扩展
-    parser.add_argument("--payload-size-kb", default=1.0, type=float,
-                       help="Target payload size in KB (support decimals)")
+    parser.add_argument("--payload-size", default="1KB", type=str,
+                       help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                       help="Payload mode: 'json' (default) or 'binary' (random bytes, stored base64)")
     parser.add_argument("--sensors-per-device", default=5, type=int,
                        help="Number of sensors per device")
 
@@ -539,12 +584,32 @@ def main():
     if pool_size is None:
         pool_size = args.threads * 10
 
+    # payload_size: parse unit-aware --payload-size flag (supports units: B, KB, MB)
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical unit-aware --payload-size (string) into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+    payload_size_bytes = int(payload_bytes)
+
     bench = SensorAggBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         set_key=args.set_key,
-        # 数据规模扩展
-        payload_size_kb=args.payload_size_kb,
+    # 数据规模扩展 (bytes)
+    payload_size_bytes=payload_size_bytes,
         sensors_per_device=args.sensors_per_device,
         # 数据类型真实性
         sensor_types=sensor_types,
@@ -560,6 +625,7 @@ def main():
         target_db_size_mb=args.target_db_size_mb,
         ttl=args.ttl
     )
+    bench.payload_mode = args.payload_mode
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 
 if __name__ == "__main__":
