@@ -352,45 +352,45 @@ def main():
                     if not name:
                         continue
                     bundle_dir = os.path.join("/runc/containers", name)
-                        # ensure any previous runc container record is removed (best-effort)
-                        pre_kill_cmd = f"runc kill {shlex.quote(name)} || true"
-                        pre_delete_cmd = f"runc delete {shlex.quote(name)} || true"
-                        print(f"[backend] -> {pre_kill_cmd}")
-                        print(f"[backend] -> {pre_delete_cmd}")
-                        # Best-effort: try kill+delete and verify the container no longer
-                        # appears in runc list. Retry a few times because runc state may
-                        # be transient.
-                        if not dry_run:
+                    # ensure any previous runc container record is removed (best-effort)
+                    pre_kill_cmd = f"runc kill {shlex.quote(name)} || true"
+                    pre_delete_cmd = f"runc delete {shlex.quote(name)} || true"
+                    print(f"[backend] -> {pre_kill_cmd}")
+                    print(f"[backend] -> {pre_delete_cmd}")
+                    # Best-effort: try kill+delete and verify the container no longer
+                    # appears in runc list. Retry a few times because runc state may
+                    # be transient.
+                    if not dry_run:
+                        try:
+                            run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        try:
+                            run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        # also remove any leftover console socket to avoid recvtty conflicts
+                        try:
+                            console_sock = os.path.join(bundle_dir, "console.sock")
+                            run_cmd(f"rm -f {shlex.quote(console_sock)}", quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        # retry check: if container still shows in runc list, try a few more times
+                        for _ in range(3):
                             try:
+                                chk = run_cmd(f"runc list | grep -w {shlex.quote(name)}", quiet=True, ignore_error=True)
+                                out = getattr(chk, "stdout", "") or ""
+                                if not out.strip():
+                                    break
+                                # attempt again
                                 run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
-                            except Exception:
-                                pass
-                            try:
                                 run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
+                                time.sleep(1)
                             except Exception:
-                                pass
-                            # also remove any leftover console socket to avoid recvtty conflicts
-                            try:
-                                console_sock = os.path.join(bundle_dir, "console.sock")
-                                run_cmd(f"rm -f {shlex.quote(console_sock)}", quiet=True, ignore_error=True)
-                            except Exception:
-                                pass
-                            # retry check: if container still shows in runc list, try a few more times
-                            for _ in range(3):
-                                try:
-                                    chk = run_cmd(f"runc list | grep -w {shlex.quote(name)}", quiet=True, ignore_error=True)
-                                    out = getattr(chk, "stdout", "") or ""
-                                    if not out.strip():
-                                        break
-                                    # attempt again
-                                    run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
-                                    run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
-                                    time.sleep(1)
-                                except Exception:
-                                    time.sleep(1)
-                        # 1/2: reset bundle from .bak if available (best-effort)
-                        rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
-                        cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
+                                time.sleep(1)
+                    # 1/2: reset bundle from .bak if available (best-effort)
+                    rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
+                    cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
                     recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
                     console_sock = os.path.join(bundle_dir, "console.sock")
                     run_cmd_str = f"runc run --console-socket {shlex.quote(console_sock)} -d -b {shlex.quote(bundle_dir)} {shlex.quote(name)}"
@@ -505,6 +505,11 @@ def main():
             # output/logdir defaults are created under results/logs
             out = entry.get("output") or os.path.join("results", f"{entry.get('name','test')}_matrix.csv")
             logd = entry.get("log_dir") or os.path.join("logs", entry.get("name", "test"))
+            # ensure the per-entry log directory exists before spawning child
+            try:
+                os.makedirs(logd, exist_ok=True)
+            except Exception:
+                pass
             cmd += ["--output", out, "--log-dir", logd]
 
             print("Spawning rps_matrix for test:", entry.get("name", "unnamed"))
@@ -586,6 +591,13 @@ def main():
     payload_modes = [x for x in args.payload_modes.split(",") if x.strip()] if args.payload_modes else [""]
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    # ensure log directory exists so bench processes can write logs
+    try:
+        os.makedirs(args.log_dir, exist_ok=True)
+    except Exception:
+        # best-effort: if log_dir cannot be created, bench background
+        # redirection will likely fail; we leave handling to later error messages
+        pass
     header = [
         "ts_utc",
         "rps",
