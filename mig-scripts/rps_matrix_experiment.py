@@ -275,6 +275,31 @@ def main():
             return True, repo_cand
         return False, cand
 
+    def _get_bench_supported_flags(script_path: str):
+        """Return a set of supported long-form flags (e.g. '--rps') found in the
+        bench script by a lightweight static scan for parser.add_argument calls.
+        This is heuristic but works for the common pattern used in our bench scripts.
+        """
+        flags = set()
+        try:
+            import re as _re
+            with open(script_path, "r", encoding="utf-8", errors="ignore") as sf:
+                src = sf.read()
+            # find occurrences of add_argument(...)
+            for m in _re.finditer(r"add_argument\(([^)]*)\)", src):
+                args_text = m.group(1)
+                # extract tokens that look like --long-option
+                for token in _re.findall(r"\'--[A-Za-z0-9\-]+'|\"--[A-Za-z0-9\-]+\"|--[A-Za-z0-9\-]+", args_text):
+                    # normalize token to form --flag
+                    t = token.strip('"\'')
+                    if t.startswith("--"):
+                        # strip any trailing punctuation
+                        flags.add(t.split()[0])
+        except Exception:
+            # best-effort: ignore parse failures and return empty set
+            return set()
+        return flags
+
     # If not using --tests-file, enforce required options for single-run mode
     if not args.tests_file:
         missing = []
@@ -753,6 +778,56 @@ def main():
                         pattern=pattern,
                         payload_mode=payload_mode,
                     )
+
+                    # Heuristic: if the bench script doesn't support certain flags
+                    # (e.g. many benches do not accept --rps), attempt to statically
+                    # detect supported flags from the script and remove unsupported
+                    # flags from the generated command. This avoids failing the
+                    # bench with 'unrecognized arguments'. We do this best-effort
+                    # and only for local runs.
+                    try:
+                        ok_resolve, tried_path = _bench_script_resolves(bench_cmd)
+                        supported = set()
+                        if ok_resolve:
+                            supported = _get_bench_supported_flags(tried_path)
+                        if supported:
+                            # filter tokens: keep flags that are in supported set
+                            parts = shlex.split(bench_cmd)
+                            new_parts = []
+                            i = 0
+                            removed = []
+                            while i < len(parts):
+                                tok = parts[i]
+                                if tok.startswith("--"):
+                                    # handle --flag=value and --flag value
+                                    name = tok.split("=")[0]
+                                    if name in supported:
+                                        new_parts.append(tok)
+                                        # if this token is in form --flag (no '='),
+                                        # then the next token is likely the value
+                                        if "=" not in tok and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                                            new_parts.append(parts[i + 1])
+                                            i += 2
+                                            continue
+                                        i += 1
+                                        continue
+                                    else:
+                                        # skip this flag and its value (if present)
+                                        removed.append(name)
+                                        if "=" not in tok and i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+                                            i += 2
+                                            continue
+                                        i += 1
+                                        continue
+                                else:
+                                    new_parts.append(tok)
+                                    i += 1
+                            if removed:
+                                print(f"[bench-adapt] removed unsupported flags for {tried_path}: {', '.join(sorted(set(removed)))}")
+                                bench_cmd = " ".join(shlex.quote(p) for p in new_parts)
+                    except Exception:
+                        # best-effort: if anything goes wrong leave bench_cmd as-is
+                        pass
 
                     bench_pid = None
                     remote_logname = local_logname
