@@ -20,6 +20,7 @@ import sys
 import atexit
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -621,6 +622,83 @@ def main():
             except Exception as e:
                 print(f"Failed to run test {entry.get('name')}: {e}")
             finally:
+                # For tests that are metrics-oriented (naming convention: endswith '_metric'
+                # or explicitly named 'rps_metric'), attempt a best-effort runc checkpoint
+                # of the running container into results/<testname>_dump and then invoke the
+                # decode_criu_memimages.py script to analyze the created image directory.
+                test_name = entry.get("name", "unnamed")
+                is_metric_test = False
+                if isinstance(test_name, str):
+                    if test_name == "rps_metric" or test_name.endswith("_metric"):
+                        is_metric_test = True
+
+                if is_metric_test:
+                    # Build a compact params string from common fields to include in the
+                    # dump directory name: rps_list/framerate_list, payload_sizes, threads, duration
+                    param_keys = ["rps_list", "framerate_list", "payload_sizes", "threads", "duration"]
+                    parts = []
+                    for k in param_keys:
+                        v = entry.get(k)
+                        if v is None:
+                            continue
+                        s = str(v)
+                        # make concise: replace commas with '+' and spaces with '_'
+                        s = s.replace(",", "+")
+                        s = s.replace(" ", "_")
+                        parts.append(f"{k}={s}")
+                    paramstr = "__".join(parts) if parts else "default"
+                    # sanitize to filesystem-safe name
+                    paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
+                    # sanitize container and test_name
+                    safe_container = re.sub(r"[^A-Za-z0-9._-]+", "_", str(container_name))
+                    safe_test = re.sub(r"[^A-Za-z0-9._-]+", "_", str(test_name))
+                    dump_dirname = f"{safe_container}_{safe_test}_{paramstr}_dump"
+                    dump_base = os.path.join("results", dump_dirname)
+                    # dry-run: just print the commands we would run
+                    if entry_dry or args.dry_run:
+                        print(f"[tests-file dry-run] would create dump dir: {dump_base}")
+                        chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(container_name))}"
+                        print(f"[tests-file dry-run] would run checkpoint (cwd={dump_base}): {chk_cmd}")
+                        decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+                        decode_cmd = f"{sys.executable} {shlex.quote(decode_script)} analyze {os.path.join(dump_base, 'image')} --output {os.path.join(dump_base, 'analysis.json')}"
+                        print(f"[tests-file dry-run] would run decode: {decode_cmd}")
+                    else:
+                        try:
+                            os.makedirs(dump_base, exist_ok=True)
+                        except Exception:
+                            pass
+                        old_cwd = os.getcwd()
+                        try:
+                            # Run checkpoint from inside the dump directory so the
+                            # CRIU image files are created under dump_base/image
+                            os.chdir(dump_base)
+                            chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(container_name))}"
+                            print(f"[checkpoint] -> {chk_cmd}")
+                            try:
+                                run_cmd(chk_cmd, quiet=False, ignore_error=True)
+                            except Exception as e:
+                                print(f"runc checkpoint failed for {container_name}: {e}")
+
+                            # Attempt to decode the created image directory using the
+                            # decode_criu_memimages.py helper and write output into the
+                            # same dump directory (analysis.json)
+                            decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+                            image_path = os.path.join(dump_base, "image")
+                            out_path = os.path.join(dump_base, "analysis.json")
+                            decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(image_path)} --output {shlex.quote(out_path)}"
+                            print(f"[decode] -> {decode_cmd}")
+                            try:
+                                run_cmd(decode_cmd, quiet=False, ignore_error=True)
+                            except Exception as e:
+                                print(f"decode_criu_memimages failed for {image_path}: {e}")
+                        except Exception as e:
+                            print(f"checkpoint/decode orchestration failed for {test_name}: {e}")
+                        finally:
+                            try:
+                                os.chdir(old_cwd)
+                            except Exception:
+                                pass
+
                 # Always attempt cleanup of the container we tried to start. The
                 # stop helper is best-effort and tolerates missing/failed states.
                 stop_runc_backends([container_name], dry_run=bool(entry.get("dry_run")) or args.dry_run)
@@ -710,6 +788,17 @@ def main():
         "vmsize_after_kb",
         "dirtymap_bytes",
         "bench_stats",
+    ]
+    # Append checkpoint/decode summary columns (may be empty for per-run rows)
+    header += [
+        "dump_total_tracked_pages",
+        "dump_total_writes",
+        "dump_hot_pages",
+        "dump_analysis_path",
+        "dump_vmrss_before_kb",
+        "dump_vmsize_before_kb",
+        "dump_vmrss_after_kb",
+        "dump_vmsize_after_kb",
     ]
     if not os.path.exists(args.output):
         with open(args.output, "w", encoding="utf-8") as f:
@@ -999,11 +1088,165 @@ def main():
                         str(dirty_bytes),
                         shlex.quote(bench_stats),
                     ]
+                    # placeholders for dump summary columns (filled in per-combo summary row)
+                    row += ["", "", "", "", "", "", "", ""]
                     with open(args.output, "a", encoding="utf-8") as f:
                         f.write(",".join(row) + "\n")
 
                     print(f"Finished run, wrote row to {args.output}")
                     time.sleep(3)
+
+                    # end of single run loop; continue to next run_idx
+                # After completing all 'runs' for this parameter combination,
+                # perform a single checkpoint+decode to capture the container
+                # memory image for this parameter set (exclude runs dimension).
+                try:
+                    # derive bench short name for load name
+                    bench_short = "bench"
+                    try:
+                        parts = shlex.split(args.bench_template)
+                        if parts:
+                            if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+                                script_token = parts[1]
+                            else:
+                                script_token = parts[0]
+                            bench_short = os.path.splitext(os.path.basename(script_token))[0]
+                    except Exception:
+                        pass
+
+                    # build params string for this combination
+                    param_items = []
+                    # include rps or framerate depending on what's in args
+                    if args.rps_list:
+                        param_items.append(f"rps={rps}")
+                    if args.framerate_list:
+                        # attempt to include a representative framerate if provided
+                        # (in single-run mode framerate_list may be comma-separated)
+                        frs = [x for x in args.framerate_list.split(",") if x.strip()]
+                        if frs:
+                            # choose first framerate as representative
+                            param_items.append(f"fr={frs[0]}")
+                    param_items.append(f"payload={payload}")
+                    if payload_mode:
+                        param_items.append(f"mode={payload_mode}")
+                    if pattern:
+                        param_items.append(f"pattern={pattern}")
+                    param_items.append(f"threads={args.threads}")
+                    param_items.append(f"dur={args.duration}")
+                    paramstr = "__".join(param_items) if param_items else "default"
+                    paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
+
+                    safe_container = re.sub(r"[^A-Za-z0-9._-]+", "_", str(args.container or "container"))
+                    dump_dirname = f"{safe_container}_{bench_short}_{paramstr}_dump"
+                    dump_base = os.path.join("results", dump_dirname)
+
+                    # dry-run: only print
+                    if args.dry_run:
+                        print(f"[dry-run] would create per-combo dump dir: {dump_base}")
+                        chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(args.container))}"
+                        print(f"[dry-run] would run per-combo checkpoint (cwd={dump_base}): {chk_cmd}")
+                        decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+                        decode_cmd = f"{sys.executable} {shlex.quote(decode_script)} analyze {os.path.join(dump_base, 'image')} --output {os.path.join(dump_base, 'analysis.json')}"
+                        print(f"[dry-run] would run per-combo decode: {decode_cmd}")
+                    else:
+                        try:
+                            os.makedirs(dump_base, exist_ok=True)
+                        except Exception:
+                            pass
+                        old_cwd = os.getcwd()
+                        try:
+                            os.chdir(dump_base)
+                            # sample memory before checkpoint
+                            try:
+                                cpid = get_container_pid(args.container)
+                            except Exception:
+                                cpid = None
+                            before_ck = sample_mem(cpid) if cpid else {"vmrss_kb": None, "vmsize_kb": None}
+                            chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(args.container))}"
+                            print(f"[per-combo checkpoint] -> {chk_cmd}")
+                            try:
+                                run_cmd(chk_cmd, quiet=False, ignore_error=True)
+                            except Exception as e:
+                                print(f"runc checkpoint failed for {args.container} (per-combo): {e}")
+                            # sample memory after checkpoint
+                            try:
+                                after_pid = get_container_pid(args.container)
+                            except Exception:
+                                after_pid = cpid
+                            after_ck = sample_mem(after_pid) if after_pid else {"vmrss_kb": None, "vmsize_kb": None}
+
+                            decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+                            image_path = os.path.join(dump_base, "image")
+                            out_path = os.path.join(dump_base, "analysis.json")
+                            decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(image_path)} --output {shlex.quote(out_path)}"
+                            print(f"[per-combo decode] -> {decode_cmd}")
+                            try:
+                                run_cmd(decode_cmd, quiet=False, ignore_error=True)
+                            except Exception as e:
+                                print(f"decode_criu_memimages failed for {image_path} (per-combo): {e}")
+                            # attempt to read analysis.json and append a summary row to the main CSV
+                            try:
+                                analysis = None
+                                if os.path.exists(out_path):
+                                    with open(out_path, "r", encoding="utf-8") as af:
+                                        try:
+                                            analysis = json.load(af)
+                                        except Exception:
+                                            analysis = None
+                                total_tracked = analysis.get("total_tracked_pages") if analysis else None
+                                total_writes = analysis.get("total_writes") if analysis else None
+                                hot_pages = len(analysis.get("hot_pages", [])) if analysis else None
+                                analysis_ref = out_path if os.path.exists(out_path) else ""
+                                # compose a summary CSV row
+                                summary_row = [
+                                    datetime.utcnow().isoformat() + "Z",
+                                    str(rps),
+                                    str(payload_mode),
+                                    str(payload),
+                                    "",  # avg_payload_bytes
+                                    "",  # median_payload_bytes
+                                    str(pattern),
+                                    "combo",
+                                    args.container,
+                                    str(cpid) if cpid else "",
+                                    str(before_ck.get("vmrss_kb") or ""),
+                                    str(before_ck.get("vmsize_kb") or ""),
+                                    "",  # vmrss_mid_kb
+                                    "",  # vmsize_mid_kb
+                                    str(after_ck.get("vmrss_kb") or ""),
+                                    str(after_ck.get("vmsize_kb") or ""),
+                                    "",  # dirtymap_bytes
+                                    shlex.quote("dump_summary"),
+                                ]
+                                # append dump summary columns
+                                summary_row += [
+                                    str(total_tracked) if total_tracked is not None else "",
+                                    str(total_writes) if total_writes is not None else "",
+                                    str(hot_pages) if hot_pages is not None else "",
+                                    analysis_ref,
+                                    str(before_ck.get("vmrss_kb") or ""),
+                                    str(before_ck.get("vmsize_kb") or ""),
+                                    str(after_ck.get("vmrss_kb") or ""),
+                                    str(after_ck.get("vmsize_kb") or ""),
+                                ]
+                                try:
+                                    with open(args.output, "a", encoding="utf-8") as of:
+                                        of.write(",".join(summary_row) + "\n")
+                                    print(f"Wrote per-combo dump summary to {args.output}")
+                                except Exception as e:
+                                    print(f"Failed to write per-combo summary to {args.output}: {e}")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"per-combo checkpoint/decode orchestration failed: {e}")
+                        finally:
+                            try:
+                                os.chdir(old_cwd)
+                            except Exception:
+                                pass
+                except Exception:
+                    # best-effort: never fail the whole experiment because checkpoint failed
+                    pass
 
 
 if __name__ == "__main__":
