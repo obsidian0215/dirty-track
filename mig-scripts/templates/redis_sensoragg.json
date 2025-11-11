@@ -1,0 +1,14 @@
+{
+  "name": "redis_sensoragg",
+  "bench_template": "python3 experiment/migration/redis/bench_sensoragg.py --threads {threads} --payload-mode {payload_mode} --rps {rate} --duration {duration} --payload-size {payload}",
+  "rps_list": "50,200,500",
+  "payload_sizes": "256B,1KB,4KB",
+  "payload_modes": "json",
+  "patterns": "random",
+  "duration": 120,
+  "threads": 4,
+  "runs": 3,
+  "container": "redis",
+  "output": "results/redis_sensoragg_matrix.csv",
+  "log_dir": "logs/redis_sensoragg"
+}

@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Run a full matrix of RPS x payload x data-pattern tests, collect container memory, DB info and dirty-map per run.
-This script is more feature-rich than rps_experiment.py and attempts to build/load light-dt if needed.
+Run a full matrix of parameterized experiments (rate, payload, pattern, etc.)
 
-Usage (example):
-    python3 mig-scripts/rps_matrix_experiment.py
-        --container myctr
-        --bench-template "python3 experiment/migration/redis/bench_sensoragg.py --rps {rps} --duration {duration} --threads {threads} --payload-size {payload} --pattern {pattern}"
-        --rps-list 10,50
-        --payload-sizes 64,512,4096 --patterns random,zeros --duration 30 --threads 4 --runs 3 --output results/rps_matrix.csv --dirtymap
+This script generalizes the previous 'rps' focused tool into a generic
+configuration matrix runner. It spawns benchmark processes, optionally
+captures dirty-map/kernel snapshots, and can checkpoint+decode containers
+for metric tests.
+
+Usage example:
+    python3 mig-scripts/config_matrix_experiment.py \
+        --container myctr \
+        --bench-template "python3 experiment/migration/redis/bench_sensoragg.py --threads {threads} --payload-mode json --rps {rate} --duration {duration} --payload-size {payload}" \
+        --rps-list 10,50 --payload-sizes 64,512,4096 --patterns random,zeros --duration 30 --threads 4 --runs 3 --output results/matrix.csv --dirtymap
 
 Notes:
-- bench-template must include {rps} and {duration}. If you want payload/pattern substitution, include {payload} and {pattern}.
-- For dirty-map support the script will try to build/load the kernel module from repo/light-dt (requires make & sudo).
-- Dirty-map collection per-run is best-effort and uses helpers from mig-scripts/source.py when available.
+- bench-template must include placeholders for the parameters you intend to vary.
+- Use {rate} in your template if you want to be agnostic to whether rate means rps or framerate.
 """
 import argparse
 import sys
@@ -30,10 +32,6 @@ from typing import Dict, List, Optional
 from cmd_utils import run_cmd, unmount_local_migration_tmpfs
 from result_writer import extract_stats_from_output
 
-# Note: loading of migration / dirty-map helpers from `source.py` is done
-# lazily inside main() only when --dirtymap is requested. This avoids noisy
-# import-time side-effects from other mig-scripts modules that parse CLI args
-# at import time.
 DEVICE_PATH = None
 set_dirty_map_path = None
 ioctl_start_pid = None
@@ -126,13 +124,6 @@ def wait_for_pid_exit(pid: int, timeout: int) -> None:
 
 
 def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
-    """Lazy, safe loader for mig-scripts/source.py helpers.
-
-    Returns a tuple (device_file, device_fd, dirtymap_path). Any of the
-    returned values may be None on failure. This function sets module-level
-    globals (DEVICE_PATH, set_dirty_map_path, execute_dirty_track, etc.) when
-    the source module is available.
-    """
     global DEVICE_PATH, set_dirty_map_path, ioctl_start_pid, ioctl_stop_pid, get_runc_container_pidtree, container_pids, container_may_dump_size, execute_dirty_track
     device_file = None
     device_fd = None
@@ -147,7 +138,6 @@ def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
             spec = importlib.util.spec_from_file_location("mig_scripts_source", src_path)
             if spec and spec.loader:
                 module = importlib.util.module_from_spec(spec)
-                # temporarily silence stdout/stderr and reset argv to avoid parse-time output
                 old_argv = list(sys.argv)
                 old_stdout = sys.stdout
                 old_stderr = sys.stderr
@@ -159,7 +149,6 @@ def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
                     try:
                         spec.loader.exec_module(module)
                     except SystemExit:
-                        # some mig-scripts call parse_args() at import-time; ignore exit
                         pass
                     finally:
                         devnull.close()
@@ -167,7 +156,6 @@ def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
                     sys.argv = old_argv
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
-                # extract expected symbols if available
                 DEVICE_PATH = getattr(module, "DEVICE_PATH", None)
                 set_dirty_map_path = getattr(module, "set_dirty_map_path", None)
                 ioctl_start_pid = getattr(module, "ioctl_start_pid", None)
@@ -190,12 +178,10 @@ def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
                 if set_dirty_map_path:
                     set_dirty_map_path(device_fd, dirtymap_path)
             except Exception:
-                # ignore init failures; keep best-effort semantics
                 device_file = None
                 device_fd = None
                 dirtymap_path = None
     except Exception:
-        # silent on any loader error
         device_file = None
         device_fd = None
         dirtymap_path = None
@@ -203,135 +189,88 @@ def load_dirtymap_helpers(container: str, repo_root: Optional[str] = None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run RPS x payload x pattern experiments")
+    parser = argparse.ArgumentParser(description="Run a generic configuration matrix of experiments")
     parser.add_argument("--container", required=False)
     parser.add_argument("--bench-template", required=False)
     parser.add_argument("--rps-list", required=False)
-    parser.add_argument("--payload-sizes", default="64,512,4096", help="Comma-separated payload sizes. Default unit is bytes when no suffix given. Suffixes accepted: B, KB, MB (case-insensitive). Examples: 256B, 16KB, 1MB, 64")
-    parser.add_argument(
-        "--payload-modes",
-        default="",
-        help="Comma-separated payload modes to test (e.g. json,binary). If provided, will substitute {payload_mode} in the bench-template.",
-    )
+    parser.add_argument("--payload-sizes", default="64,512,4096", help="Comma-separated payload sizes. Default unit is bytes when no suffix given. Suffixes accepted: B, KB, MB (case-insensitive).")
+    parser.add_argument("--payload-modes", default="", help="Comma-separated payload modes to test (e.g. json,binary).")
     parser.add_argument("--patterns", default="random,zeros,repeat")
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
-    parser.add_argument("--output", default="results/rps_matrix.csv")
+    parser.add_argument("--output", default="results/matrix.csv")
     parser.add_argument("--log-dir", default="/tmp")
     parser.add_argument("--dirtymap", action="store_true")
     parser.add_argument("--client-ip", default="", help="IP of remote client where bench should run")
-    parser.add_argument(
-        "--remote-client",
-        action="store_true",
-        help="If set, run bench on --client-ip via SSH instead of locally",
-    )
-    parser.add_argument(
-        "--fetch-remote-log",
-        action="store_true",
-        help="When running on --remote-client, scp the remote log back to local --log-dir for parsing",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Do not start benches; simulate runs locally and write small dry-run logs",
-    )
-    parser.add_argument(
-        "--tests-file",
-        default="",
-        help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one rps_matrix run per entry and exit.",
-    )
+    parser.add_argument("--remote-client", action="store_true", help="If set, run bench on --client-ip via SSH instead of locally")
+    parser.add_argument("--fetch-remote-log", action="store_true", help="When running on --remote-client, scp the remote log back to local --log-dir for parsing")
+    parser.add_argument("--dry-run", action="store_true", help="Do not start benches; simulate runs locally and write small dry-run logs")
+    parser.add_argument("--tests-file", default="", help="Optional JSON file containing a list of test specifications. If provided, this script will spawn one matrix run per entry and exit.")
     parser.add_argument("--framerate-list", default="", help="Optional comma-separated framerate list for video tests (fps). Used as alternative to --rps-list for some benches.")
+    parser.add_argument("--resolution-list", default="", help="Optional comma-separated list of resolutions WxH (e.g. 1920x1080,1280x720). When provided, resolution_list drives payload/size variation for video benches by passing frame_width/frame_height values per-run.")
     args = parser.parse_args()
-    # repository root (useful for resolving relative bench script paths)
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
     def _bench_script_resolves(bench_cmd: str):
-        """Try to heuristically determine whether the bench command refers to a
-        local script that exists. Returns (True, resolved_path) if found else
-        (False, tried_path).
-        """
         try:
             parts = shlex.split(bench_cmd)
         except Exception:
             return False, bench_cmd
         if not parts:
             return False, bench_cmd
-        # If invocation is like: python3 path/to/script.py ...
         if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
             script = parts[1]
         else:
-            # otherwise assume first token is the script/executable
             script = parts[0]
-        # try as absolute or relative to cwd or repo_root
         cand = script
         if os.path.isabs(cand) and os.path.exists(cand):
             return True, cand
-        # check relative to current working dir
         cwd_cand = os.path.join(os.getcwd(), cand)
         if os.path.exists(cwd_cand):
             return True, cwd_cand
-        # check relative to repo root
         repo_cand = os.path.join(repo_root, cand)
         if os.path.exists(repo_cand):
             return True, repo_cand
         return False, cand
 
     def _get_bench_supported_flags(script_path: str):
-        """Return a set of supported long-form flags (e.g. '--rps') found in the
-        bench script by a lightweight static scan for parser.add_argument calls.
-        This is heuristic but works for the common pattern used in our bench scripts.
-        """
         flags = set()
         try:
             import re as _re
             with open(script_path, "r", encoding="utf-8", errors="ignore") as sf:
                 src = sf.read()
-            # find occurrences of add_argument(...)
             for m in _re.finditer(r"add_argument\(([^)]*)\)", src):
                 args_text = m.group(1)
-                # extract tokens that look like --long-option
                 for token in _re.findall(r"\'--[A-Za-z0-9\-]+'|\"--[A-Za-z0-9\-]+\"|--[A-Za-z0-9\-]+", args_text):
-                    # normalize token to form --flag
                     t = token.strip('"\'')
                     if t.startswith("--"):
-                        # strip any trailing punctuation
                         flags.add(t.split()[0])
         except Exception:
-            # best-effort: ignore parse failures and return empty set
             return set()
         return flags
 
-    # If not using --tests-file, enforce required options for single-run mode
     if not args.tests_file:
         missing = []
         if not args.container:
             missing.append("--container")
         if not args.bench_template:
             missing.append("--bench-template")
-        # allow either rps_list or framerate_list to be provided for single-run mode
         if not args.rps_list and not args.framerate_list:
             missing.append("--rps-list or --framerate-list")
-        # disallow both being provided at the same time
         if args.rps_list and args.framerate_list:
             parser.error("--rps-list and --framerate-list are mutually exclusive; provide only one")
         if missing:
             parser.error(f"the following arguments are required when --tests-file is not used: {', '.join(missing)}")
 
-    # If tests-file provided, interpret each entry and spawn this script per-entry.
     if args.tests_file:
         try:
-            # allow files that may have a UTF-8 BOM
             with open(args.tests_file, "r", encoding="utf-8-sig") as tf:
                 tests = json.load(tf)
         except Exception as e:
             print(f"Failed to load tests file {args.tests_file}: {e}")
             return
 
-        # Build an overrides namespace from the current CLI so explicit CLI
-        # arguments override values present in the JSON tests file.
-        # We create a lightweight parser with the same option names but
-        # default=None so we can detect which options were provided by the user.
         override_parser = argparse.ArgumentParser(add_help=False)
         override_parser.add_argument("--container", dest="container")
         override_parser.add_argument("--bench-template", dest="bench_template")
@@ -346,9 +285,7 @@ def main():
         override_parser.add_argument("--output", dest="output")
         override_parser.add_argument("--log-dir", dest="log_dir")
         override_parser.add_argument("--client-ip", dest="client_ip")
-        # parse_known_args so we ignore unrelated args; this reads from sys.argv
         override_args, _ = override_parser.parse_known_args()
-        # detect boolean flags presence on the CLI
         argv = sys.argv[1:]
         dirtymap_present = "--dirtymap" in argv
         remote_client_present = "--remote-client" in argv
@@ -356,9 +293,7 @@ def main():
         dry_run_present = "--dry-run" in argv
 
         for entry in tests:
-            # create a mutable copy and apply CLI overrides when present
             merged = dict(entry)
-            # simple mapping of override attribute -> entry key
             to_copy = [
                 "container",
                 "bench_template",
@@ -377,11 +312,7 @@ def main():
             for name in to_copy:
                 val = getattr(override_args, name, None)
                 if val is not None:
-                    # normalize dest name for JSON keys that use hyphens
-                    json_key = name
-                    # bench_template and log_dir use same keys in JSON
-                    merged[json_key] = val
-            # override booleans if flag present on CLI
+                    merged[name] = val
             if dirtymap_present:
                 merged["dirtymap"] = True
             if remote_client_present:
@@ -390,32 +321,23 @@ def main():
                 merged["fetch_remote_log"] = True
             if dry_run_present:
                 merged["dry_run"] = True
-            # replace entry with merged view for downstream logic
             entry = merged
-            # Enforce mutual exclusion at the tests-file entry level: an entry
-            # must not specify both rps_list and framerate_list. If both are
-            # present, skip the entry and report the issue so the test author
-            # can correct the JSON.
             has_rps = entry.get("rps_list") is not None or entry.get("rps-list") is not None
             has_fr = entry.get("framerate_list") is not None or entry.get("framerate-list") is not None
             if has_rps and has_fr:
                 print(f"tests-file entry '{entry.get('name', 'unnamed')}' invalid: both rps_list and framerate_list present; they are mutually exclusive. Skipping.")
                 continue
-            # If bench_template is a relative path (common in tests_list), try to
-            # resolve it relative to the repo root and rewrite it to an absolute
-            # path so child runs don't depend on the current working directory.
+
             try:
                 bt = entry.get("bench_template")
                 if bt:
                     parts = shlex.split(bt)
                     if parts:
-                        # identify script token
                         if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
                             script_token_index = 1
                         else:
                             script_token_index = 0
                         script = parts[script_token_index]
-                        # attempt resolution against repo_root
                         repo_cand = os.path.join(repo_root, script)
                         cwd_cand = os.path.join(os.getcwd(), script)
                         if os.path.exists(repo_cand):
@@ -425,27 +347,13 @@ def main():
                             parts[script_token_index] = cwd_cand
                             entry["bench_template"] = " ".join(shlex.quote(p) for p in parts)
             except Exception:
-                # best-effort; ignore resolution failures
                 pass
-            # Ensure 'container' is specified in each test entry. Tests-file entries must set the container name
-            # (this follows mig-scripts convention where container is the runc bundle name/path key).
+
             if not entry.get("container"):
                 print(f"tests-file entry missing 'container' field: {entry.get('name','unnamed')}")
                 continue
-            # (Do not force rps_list here; entries may provide framerate_list instead.)
-            # If requested, start backends using runc by container name (no docker/image/ports required)
+
             def start_runc_backends(names, dry_run=False):
-                """Start runc backends by following the mig-scripts convention.
-
-                Exact sequence (per mig-scripts/redis_test.py and influxdb_test.py):
-                1) rm -rf /runc/containers/<name>
-                2) cp -r /runc/containers/<name>.bak /runc/containers/<name>
-                3) nohup recvtty -m <mode> /runc/containers/<name>/console.sock & echo $! > /tmp/recvtty_<name>.pid
-                4) runc run --console-socket /runc/containers/<name>/console.sock -d -b /runc/containers/<name> <name>
-
-                This function implements that sequence. In dry_run mode it prints the commands
-                instead of executing them.
-                """
                 started = []
                 if not names:
                     return started
@@ -454,14 +362,10 @@ def main():
                     if not name:
                         continue
                     bundle_dir = os.path.join("/runc/containers", name)
-                    # ensure any previous runc container record is removed (best-effort)
                     pre_kill_cmd = f"runc kill {shlex.quote(name)} || true"
                     pre_delete_cmd = f"runc delete {shlex.quote(name)} || true"
                     print(f"[backend] -> {pre_kill_cmd}")
                     print(f"[backend] -> {pre_delete_cmd}")
-                    # Best-effort: try kill+delete and verify the container no longer
-                    # appears in runc list. Retry a few times because runc state may
-                    # be transient.
                     if not dry_run:
                         try:
                             run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
@@ -471,26 +375,22 @@ def main():
                             run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
                         except Exception:
                             pass
-                        # also remove any leftover console socket to avoid recvtty conflicts
                         try:
                             console_sock = os.path.join(bundle_dir, "console.sock")
                             run_cmd(f"rm -f {shlex.quote(console_sock)}", quiet=True, ignore_error=True)
                         except Exception:
                             pass
-                        # retry check: if container still shows in runc list, try a few more times
                         for _ in range(3):
                             try:
                                 chk = run_cmd(f"runc list | grep -w {shlex.quote(name)}", quiet=True, ignore_error=True)
                                 out = getattr(chk, "stdout", "") or ""
                                 if not out.strip():
                                     break
-                                # attempt again
                                 run_cmd(pre_kill_cmd, quiet=True, ignore_error=True)
                                 run_cmd(pre_delete_cmd, quiet=True, ignore_error=True)
                                 time.sleep(1)
                             except Exception:
                                 time.sleep(1)
-                    # 1/2: reset bundle from .bak if available (best-effort)
                     rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
                     cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
                     recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
@@ -510,13 +410,11 @@ def main():
                             run_cmd(cp_cmd, quiet=True, ignore_error=True)
                         except Exception:
                             pass
-                        # Start recvtty to create the console socket; do not fail hard if it errors
                         try:
                             recvtty_cmd = f"nohup recvtty -m null {shlex.quote(console_sock)} > /dev/null 2>&1 & echo $! > {shlex.quote(recvtty_pidfile)}"
                             run_cmd(recvtty_cmd, quiet=True, ignore_error=True)
                         except Exception:
                             pass
-                        # Finally run the container using the console socket
                         try:
                             run_cmd(run_cmd_str, quiet=False)
                             started.append(name)
@@ -527,11 +425,6 @@ def main():
                 return started
 
             def stop_runc_backends(names, dry_run=False):
-                """Stop runc backends using the mig-scripts cleanup pattern.
-
-                Attempts to kill the recvtty pidfile (if present), unmount tmpfs and
-                then runc kill/delete. All operations are best-effort and tolerate errors.
-                """
                 if not names:
                     return
                 for name in names:
@@ -540,7 +433,6 @@ def main():
                         continue
                     recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
                     kill_recvtty = f"kill -9 $(cat {shlex.quote(recvtty_pidfile)}) 2>/dev/null || true"
-                    # unmount any local tmpfs under /runc/containers/<name>/migrate
                     umount_note = f"# unmount tmpfs for {name} (best-effort)"
                     kill_cmd = f"runc kill {shlex.quote(name)} || true"
                     delete_cmd = f"runc delete {shlex.quote(name)} || true"
@@ -554,7 +446,6 @@ def main():
                         except Exception:
                             pass
                         try:
-                            # unmount helper will quietly ignore failures
                             unmount_local_migration_tmpfs(name, ignore_error=True, quiet=True)
                         except Exception:
                             pass
@@ -567,9 +458,7 @@ def main():
                         except Exception:
                             pass
 
-            # Build command to call this script for the entry
             cmd = [sys.executable, os.path.abspath(__file__)]
-            # map supported fields from entry to CLI args
             def add_flag(k, flag=None):
                 v = entry.get(k)
                 if v is None:
@@ -579,27 +468,24 @@ def main():
                     if v:
                         cmd.append(fk)
                 else:
-                    # normalize list/tuple values coming from JSON -> comma-separated
                     if isinstance(v, (list, tuple)):
                         v_str = ",".join(str(x) for x in v)
                     else:
                         v_str = str(v)
-                    # use extend to avoid rebinding outer 'cmd' in nested scope
                     cmd.extend([fk, v_str])
 
-            # required/typical fields
             add_flag("container")
             add_flag("bench_template", "--bench-template")
-            # Rate dimension flags are mutually exclusive; they are handled
-            # explicitly below to ensure only one of --rps-list or
-            # --framerate-list is added to the spawned child.
-            add_flag("payload_sizes", "--payload-sizes")
+            # Do not pass --payload-sizes to video benches that use framerate/frame dimensions
+            bt_lower = (entry.get("bench_template") or "").lower()
+            is_video_bench = "video_cache_realistic" in bt_lower or "bench_video" in bt_lower or entry.get("framerate_list") is not None or entry.get("framerate-list") is not None
+            if not is_video_bench:
+                add_flag("payload_sizes", "--payload-sizes")
             add_flag("payload_modes", "--payload-modes")
             add_flag("patterns")
             add_flag("duration")
             add_flag("threads")
             add_flag("runs")
-            # optional switches
             if entry.get("dirtymap"):
                 cmd.append("--dirtymap")
             if entry.get("remote_client"):
@@ -611,23 +497,61 @@ def main():
             if entry.get("dry_run"):
                 cmd.append("--dry-run")
 
-            # output/logdir defaults are created under results/logs
             out = entry.get("output") or os.path.join("results", f"{entry.get('name','test')}_matrix.csv")
             logd = entry.get("log_dir") or os.path.join("logs", entry.get("name", "test"))
-            # ensure the per-entry log directory exists before spawning child
             try:
                 os.makedirs(logd, exist_ok=True)
             except Exception:
                 pass
             cmd += ["--output", out, "--log-dir", logd]
 
-            # Ensure the spawned child receives a rate dimension argument.
-            # Tests entries may specify either 'framerate_list' or 'rps_list'.
-            # Prefer framerate_list when present.
-            # Ensure the spawned child receives a rate dimension argument.
-            # Tests entries may specify either 'framerate_list' or 'rps_list' (or
-            # the hyphenated equivalents). Accept list values in JSON and
-            # normalize them to comma-separated strings for CLI passing.
+            # Forward any experiment-specific parameters from the template entry
+            # (e.g. frame_width, frame_height, analysis_intensity) so bench
+            # templates receive the exact parameters they expect.
+            meta_keys = {
+                "name",
+                "container",
+                "bench_template",
+                "rps_list",
+                "rps-list",
+                "framerate_list",
+                "framerate-list",
+                "payload_sizes",
+                "payload_modes",
+                "patterns",
+                "duration",
+                "threads",
+                "runs",
+                "output",
+                "log_dir",
+                "client_ip",
+                "dirtymap",
+                "remote_client",
+                "fetch_remote_log",
+                "dry_run",
+            }
+            for k, v in entry.items():
+                if k in meta_keys:
+                    continue
+                # Skip None/empty
+                if v is None:
+                    continue
+                # already added via add_flag
+                flag = f"--{k.replace('_', '-')}"
+                if flag in cmd:
+                    continue
+                # booleans
+                if isinstance(v, bool):
+                    if v:
+                        cmd.append(flag)
+                    continue
+                # lists/tuples -> comma string
+                if isinstance(v, (list, tuple)):
+                    v_str = ",".join(str(x) for x in v)
+                else:
+                    v_str = str(v)
+                cmd.extend([flag, v_str])
+
             fr_val = entry.get("framerate_list") if entry.get("framerate_list") is not None else entry.get("framerate-list")
             rp_val = entry.get("rps_list") if entry.get("rps_list") is not None else entry.get("rps-list")
             def _norm_list_val(v):
@@ -639,19 +563,14 @@ def main():
 
             fr_list = _norm_list_val(fr_val)
             rp_list = _norm_list_val(rp_val)
-            # Prefer framerate when present, else rps
             if fr_list:
-                # avoid duplicate if already added via add_flag
                 if "--framerate-list" not in cmd:
                     cmd += ["--framerate-list", fr_list]
             elif rp_list:
                 if "--rps-list" not in cmd:
                     cmd += ["--rps-list", rp_list]
 
-            print("Spawning rps_matrix for test:", entry.get("name", "unnamed"))
-            # Start backends via runc by container name (best-effort). We always
-            # attempt to start the container for the test's `container` field.
-            # Treat per-entry dry_run or global --dry-run as flags to avoid real actions.
+            print("Spawning matrix for test:", entry.get("name", "unnamed"))
             container_name = entry.get("container")
             entry_dry = bool(entry.get("dry_run"))
             started = start_runc_backends([container_name], dry_run=entry_dry or args.dry_run)
@@ -659,7 +578,6 @@ def main():
                 print(f"Started runc backend: {', '.join(started)}")
 
             print(" ", shlex.join(cmd))
-            # In tests-file orchestrator mode, respect dry-run flags (global or per-entry)
             try:
                 if not (entry_dry or args.dry_run):
                     run_cmd(shlex.join(cmd), quiet=False)
@@ -668,10 +586,6 @@ def main():
             except Exception as e:
                 print(f"Failed to run test {entry.get('name')}: {e}")
             finally:
-                # For tests that are metrics-oriented (naming convention: endswith '_metric'
-                # or explicitly named 'rps_metric'), attempt a best-effort runc checkpoint
-                # of the running container into results/<testname>_dump and then invoke the
-                # decode_criu_memimages.py script to analyze the created image directory.
                 test_name = entry.get("name", "unnamed")
                 is_metric_test = False
                 if isinstance(test_name, str):
@@ -679,8 +593,6 @@ def main():
                         is_metric_test = True
 
                 if is_metric_test:
-                    # Build a compact params string from common fields to include in the
-                    # dump directory name: rps_list/framerate_list, payload_sizes, threads, duration
                     param_keys = ["rps_list", "framerate_list", "payload_sizes", "threads", "duration"]
                     parts = []
                     for k in param_keys:
@@ -688,19 +600,15 @@ def main():
                         if v is None:
                             continue
                         s = str(v)
-                        # make concise: replace commas with '+' and spaces with '_'
                         s = s.replace(",", "+")
                         s = s.replace(" ", "_")
                         parts.append(f"{k}={s}")
                     paramstr = "__".join(parts) if parts else "default"
-                    # sanitize to filesystem-safe name
                     paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
-                    # sanitize container and test_name
                     safe_container = re.sub(r"[^A-Za-z0-9._-]+", "_", str(container_name))
                     safe_test = re.sub(r"[^A-Za-z0-9._-]+", "_", str(test_name))
                     dump_dirname = f"{safe_container}_{safe_test}_{paramstr}_dump"
                     dump_base = os.path.join("results", dump_dirname)
-                    # dry-run: just print the commands we would run
                     if entry_dry or args.dry_run:
                         print(f"[tests-file dry-run] would create dump dir: {dump_base}")
                         chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(container_name))}"
@@ -715,8 +623,6 @@ def main():
                             pass
                         old_cwd = os.getcwd()
                         try:
-                            # Run checkpoint from inside the dump directory so the
-                            # CRIU image files are created under dump_base/image
                             os.chdir(dump_base)
                             chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(container_name))}"
                             print(f"[checkpoint] -> {chk_cmd}")
@@ -724,19 +630,74 @@ def main():
                                 run_cmd(chk_cmd, quiet=False, ignore_error=True)
                             except Exception as e:
                                 print(f"runc checkpoint failed for {container_name}: {e}")
-
-                            # Attempt to decode the created image directory using the
-                            # decode_criu_memimages.py helper and write output into the
-                            # same dump directory (analysis.json)
-                            decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
-                            image_path = os.path.join(dump_base, "image")
-                            out_path = os.path.join(dump_base, "analysis.json")
-                            decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(image_path)} --output {shlex.quote(out_path)}"
-                            print(f"[decode] -> {decode_cmd}")
                             try:
-                                run_cmd(decode_cmd, quiet=False, ignore_error=True)
+                                chk_res = run_cmd(chk_cmd, quiet=False, ignore_error=True)
                             except Exception as e:
-                                print(f"decode_criu_memimages failed for {image_path}: {e}")
+                                chk_res = None
+                                print(f"runc checkpoint raised exception for {container_name}: {e}")
+
+                            def wait_for_image_dir(image_dir: str, timeout: int = 60, poll: float = 1.0) -> bool:
+                                start = time.time()
+                                while True:
+                                    if os.path.isdir(image_dir):
+                                        try:
+                                            files = os.listdir(image_dir)
+                                        except Exception:
+                                            files = []
+                                        if files:
+                                            for fn in files:
+                                                if fn.startswith("pagemap-") or fn.startswith("pages-") or fn.startswith("mm-"):
+                                                    return True
+                                            return True
+                                    wl = os.path.join(dump_base, "d_log")
+                                    if os.path.isdir(wl):
+                                        try:
+                                            for name in os.listdir(wl):
+                                                p = os.path.join(wl, name)
+                                                try:
+                                                    with open(p, "r", encoding="utf-8", errors="ignore") as df:
+                                                        txt = df.read()
+                                                        if "Dumping finished" in txt or "Successfully wrote" in txt or "locked pages" in txt:
+                                                            return True
+                                                except Exception:
+                                                    continue
+                                        except Exception:
+                                            pass
+                                    if time.time() - start > timeout:
+                                        return False
+                                    time.sleep(poll)
+
+                            image_path = os.path.join(dump_base, "image")
+                            ok = wait_for_image_dir(image_path, timeout=60)
+                            if not ok:
+                                print(f"Image not found: {image_path}")
+                                dlog_dir = os.path.join(dump_base, "d_log")
+                                if os.path.isdir(dlog_dir):
+                                    try:
+                                        for fname in sorted(os.listdir(dlog_dir))[-3:]:
+                                            p = os.path.join(dlog_dir, fname)
+                                            print(f"--- d_log/{fname} (tail) ---")
+                                            try:
+                                                with open(p, "r", encoding="utf-8", errors="ignore") as df:
+                                                    lines = df.read().splitlines()
+                                                    for l in lines[-20:]:
+                                                        print(l)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                else:
+                                    print(f"No work-path logs at {dlog_dir}")
+
+                            else:
+                                decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+                                out_path = os.path.join(dump_base, "analysis.json")
+                                decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(image_path)} --output {shlex.quote(out_path)}"
+                                print(f"[per-combo decode] -> {decode_cmd}")
+                                try:
+                                    run_cmd(decode_cmd, quiet=False, ignore_error=True)
+                                except Exception as e:
+                                    print(f"decode_criu_memimages failed for {image_path}: {e}")
                         except Exception as e:
                             print(f"checkpoint/decode orchestration failed for {test_name}: {e}")
                         finally:
@@ -745,27 +706,14 @@ def main():
                             except Exception:
                                 pass
 
-                # Always attempt cleanup of the container we tried to start. The
-                # stop helper is best-effort and tolerates missing/failed states.
                 stop_runc_backends([container_name], dry_run=bool(entry.get("dry_run")) or args.dry_run)
         return
 
     def parse_size_token(tok: str) -> int:
-        """Parse a size token that may have unit suffix. Default unit is bytes when no suffix.
-
-        Returns size in bytes as int.
-        Accepts integers or floats with optional suffix: b, kb/k, mb/m (case-insensitive).
-        Examples:
-            256B -> 256
-            16KB -> 16384
-            1.5MB -> 1572864
-            64 -> 64 (default bytes)
-        """
         if not tok:
             raise ValueError("empty size token")
         s = tok.strip()
         s_low = s.lower()
-        # detect suffix
         unit = None
         num = s_low
         if s_low.endswith("kb"):
@@ -784,7 +732,6 @@ def main():
             unit = "b"
             num = s_low[: -1]
         else:
-            # no suffix -> default to bytes
             unit = "b"
             num = s_low
         try:
@@ -801,31 +748,57 @@ def main():
             bytes_val = int(val)
         return bytes_val
 
-    # Determine the rate dimension (either rps or framerate). Use a
-    # generic 'rate_values' list and a 'rate_name' label so the rest of the
-    # script can operate generically for both kinds of benches.
+    def parse_resolution_token(tok: str):
+        """Parse a resolution token like '1920x1080' and return (width:int, height:int).
+
+        Raises ValueError on invalid formats.
+        """
+        if not tok:
+            raise ValueError("empty resolution token")
+        s = tok.strip()
+        if "x" not in s and "X" not in s:
+            raise ValueError(f"invalid resolution token: {tok}")
+        parts = re.split(r"[xX]", s)
+        if len(parts) != 2:
+            raise ValueError(f"invalid resolution token: {tok}")
+        try:
+            w = int(parts[0])
+            h = int(parts[1])
+        except Exception:
+            raise ValueError(f"invalid resolution token: {tok}")
+        return w, h
+
     if args.framerate_list:
         rate_name = "framerate"
         rate_values = [int(x) for x in args.framerate_list.split(",") if x.strip()]
     else:
         rate_name = "rps"
         rate_values = [int(x) for x in (args.rps_list or "").split(",") if x.strip()]
-    # convert payload sizes to bytes (default unit KB)
     payloads = [parse_size_token(x) for x in args.payload_sizes.split(",") if x.strip()]
     patterns = [x for x in args.patterns.split(",") if x.strip()]
     payload_modes = [x for x in args.payload_modes.split(",") if x.strip()] if args.payload_modes else [""]
 
+    # resolution_list: optional comma-separated list of WxH tokens. When
+    # provided, these resolutions will be used to vary frame size per-run
+    # (video benches should compute payload based on frame dimensions).
+    resolution_list = [x for x in args.resolution_list.split(",") if x.strip()] if getattr(args, "resolution_list", None) else []
+    resolution_tuples = []
+    if resolution_list:
+        for tok in resolution_list:
+            try:
+                resolution_tuples.append(parse_resolution_token(tok))
+            except Exception as e:
+                print(f"warning: invalid resolution token '{tok}': {e}")
+
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    # ensure log directory exists so bench processes can write logs
     try:
         os.makedirs(args.log_dir, exist_ok=True)
     except Exception:
-        # best-effort: if log_dir cannot be created, bench background
-        # redirection will likely fail; we leave handling to later error messages
         pass
     header = [
         "ts_utc",
-        "rps",
+        "rate_name",
+        "rate_value",
         "payload_mode",
         "payload_bytes",
         "avg_payload_bytes",
@@ -843,7 +816,6 @@ def main():
         "dirtymap_bytes",
         "bench_stats",
     ]
-    # Append checkpoint/decode summary columns (may be empty for per-run rows)
     header += [
         "dump_total_tracked_pages",
         "dump_total_writes",
@@ -861,12 +833,9 @@ def main():
     device_file = None
     device_fd = None
     dirtymap_path = None
-
-    # Lazy-load migration / dirty-map helpers only when requested (encapsulated)
     if args.dirtymap:
         device_file, device_fd, dirtymap_path = load_dirtymap_helpers(args.container)
 
-    # register cleanup that will try to stop tracking and unmount
     def _cleanup():
         try:
             if device_fd and execute_dirty_track:
@@ -885,7 +854,6 @@ def main():
                 unmount_local_migration_tmpfs(args.container, ignore_error=True, quiet=True)
             except Exception:
                 pass
-            # close device file if we opened one
             try:
                 if device_file:
                     try:
@@ -893,66 +861,100 @@ def main():
                     except Exception:
                         pass
             except NameError:
-                # device_file may not be defined in some paths
                 pass
 
     atexit.register(_cleanup)
 
-    for rate in rate_values:
-        for payload in payloads:
-            for payload_mode in payload_modes:
-                for pattern in patterns:
-                    for run_idx in range(1, args.runs + 1):
-                        print(
-                            f"Run {rate_name}={rate} payload={payload} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}"
-                        )
-                    if args.dry_run:
-                        pid = None
-                    else:
-                        pid = get_container_pid(args.container)
-                    before = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
+    # If resolution_tuples is provided, use resolutions to vary frame sizes
+    # (video benches should compute payload based on resolution+framerate).
+    if resolution_tuples:
+        for rate in rate_values:
+            for (fw, fh) in resolution_tuples:
+                for payload_mode in payload_modes:
+                    for pattern in patterns:
+                        for run_idx in range(1, args.runs + 1):
+                            print(f"Run {rate_name}={rate} resolution={fw}x{fh} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}")
+                        if args.dry_run:
+                            pid = None
+                        else:
+                            pid = get_container_pid(args.container)
+                        before = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
 
-                    ts = int(time.time())
-                    # include payload_mode in logname so different modes produce separate logs
-                    safe_mode = payload_mode if payload_mode else "default"
-                    local_logname = os.path.join(
-                        args.log_dir, f"bench_{rate}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log"
-                    )
-                    # Format bench template: pass either 'rps' or 'framerate'
-                    # as the parameter expected by the bench script.
-                    fmt_kwargs = {
-                        "duration": args.duration,
-                        "threads": args.threads,
-                        "payload": payload,
-                        "pattern": pattern,
-                        "payload_mode": payload_mode,
-                    }
-                    if rate_name == "rps":
-                        fmt_kwargs["rps"] = rate
-                    else:
-                        fmt_kwargs["framerate"] = rate
-                    bench_cmd = args.bench_template.format(**fmt_kwargs)
+                        ts = int(time.time())
+                        safe_mode = payload_mode if payload_mode else "default"
+                        local_logname = os.path.join(args.log_dir, f"bench_{rate}_{fw}x{fh}_{safe_mode}_{pattern}_{run_idx}_{ts}.log")
+                        fmt_kwargs = {
+                            "duration": args.duration,
+                            "threads": args.threads,
+                            "pattern": pattern,
+                            "payload_mode": payload_mode,
+                            "frame_width": fw,
+                            "frame_height": fh,
+                        }
+                        if rate_name == "rps":
+                            fmt_kwargs["rps"] = rate
+                        else:
+                            fmt_kwargs["framerate"] = rate
+                        bench_cmd = args.bench_template.format(**fmt_kwargs)
+    else:
+        for rate in rate_values:
+            for payload in payloads:
+                for payload_mode in payload_modes:
+                    for pattern in patterns:
+                        for run_idx in range(1, args.runs + 1):
+                            print(f"Run {rate_name}={rate} payload={payload} payload_mode={payload_mode or 'default'} pattern={pattern} run={run_idx}")
+                        if args.dry_run:
+                            pid = None
+                        else:
+                            pid = get_container_pid(args.container)
+                        before = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
 
-                    # Heuristic: if the bench script doesn't support certain flags
-                    # (e.g. many benches do not accept --rps), attempt to statically
-                    # detect supported flags from the script and remove unsupported
-                    # flags from the generated command. This avoids failing the
-                    # bench with 'unrecognized arguments'. We do this best-effort
-                    # and only for local runs.
+                        ts = int(time.time())
+                        safe_mode = payload_mode if payload_mode else "default"
+                        local_logname = os.path.join(args.log_dir, f"bench_{rate}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log")
+                        fmt_kwargs = {
+                            "duration": args.duration,
+                            "threads": args.threads,
+                            "payload": payload,
+                            "pattern": pattern,
+                            "payload_mode": payload_mode,
+                        }
+                        if rate_name == "rps":
+                            fmt_kwargs["rps"] = rate
+                        else:
+                            fmt_kwargs["framerate"] = rate
+                        bench_cmd = args.bench_template.format(**fmt_kwargs)
+
                     try:
                         ok_resolve, tried_path = _bench_script_resolves(bench_cmd)
                         supported = set()
                         if ok_resolve:
                             supported = _get_bench_supported_flags(tried_path)
                         if supported:
-                            # We detected supported flags in the bench script. Do
-                            # not automatically remove any flags from the generated
-                            # command; assume the tests JSON / bench_template are
-                            # correct. Just log what flags are supported for info.
-                            if supported:
-                                print(f"[bench-adapt] {tried_path} supports flags: {', '.join(sorted(supported))}")
+                            print(f"[bench-adapt] {tried_path} supports flags: {', '.join(sorted(supported))}")
+                            video_flags = {"--framerate", "--frame-width", "--frame-height"}
+                            if (supported & video_flags) and "--payload-size" not in supported:
+                                try:
+                                    parts = shlex.split(bench_cmd)
+                                except Exception:
+                                    parts = []
+                                if parts:
+                                    new_parts = []
+                                    skip_next = False
+                                    for tok in parts:
+                                        if skip_next:
+                                            skip_next = False
+                                            continue
+                                        if tok.startswith("--payload-size"):
+                                            if "=" in tok:
+                                                continue
+                                            else:
+                                                skip_next = True
+                                                continue
+                                        new_parts.append(tok)
+                                    if new_parts:
+                                        bench_cmd = " ".join(shlex.quote(p) for p in new_parts)
                     except Exception:
-                        # best-effort: if anything goes wrong leave bench_cmd as-is
                         pass
 
                     bench_pid = None
@@ -960,13 +962,11 @@ def main():
                     client_target = args.client_ip
 
                     if args.dry_run:
-                        # simulate run: write a tiny local log and do not start any process
                         print(f"DRY-RUN: would run: {bench_cmd} -> {local_logname}")
                         try:
                             with open(local_logname, "w", encoding="utf-8") as df:
                                 df.write("DRY-RUN\n")
                                 df.write(bench_cmd + "\n")
-                                # also emit a minimal METRIC_VALUES line so parsing shows payload_mode/size
                                 df.write("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec\n")
                                 df.write(f"METRIC_VALUES\t{payload}\t{payload}\t0\t0\n")
                         except Exception:
@@ -976,10 +976,8 @@ def main():
                             if not args.client_ip:
                                 print("--remote-client set but --client-ip is empty; skipping run")
                                 continue
-                            # default remote user to root when none is provided
                             if "@" not in args.client_ip:
                                 client_target = f"root@{args.client_ip}"
-                            # run on remote client via SSH, create a log on remote host
                             remote_logname = f"/tmp/bench_{rate}_{payload}_{pattern}_{run_idx}_{ts}.log"
                             remote_cmd = f"nohup {bench_cmd} > {shlex.quote(remote_logname)} 2>&1 < /dev/null & echo $!"
                             try:
@@ -994,12 +992,10 @@ def main():
                                 print(f"Failed to start remote bench on {client_target}: {e}")
                                 continue
                         else:
-                            # verify the bench script exists locally (heuristic)
                             ok, tried = _bench_script_resolves(bench_cmd)
                             if not ok:
                                 print(f"Bench script not found locally (tried: {tried}). Skipping run.\n  Tip: run this from the repo root or use an absolute path in --bench-template.")
                                 continue
-                            # if we resolved an absolute path different from the template, substitute it
                             try:
                                 parts = shlex.split(bench_cmd)
                                 if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
@@ -1019,20 +1015,16 @@ def main():
                     time.sleep(ramp)
                     mid = sample_mem(pid) if pid else {"vmrss_kb": None, "vmsize_kb": None}
 
-                    # stop and collect dirtymap for this run (best-effort)
                     dirty_bytes = ""
                     if args.dirtymap and device_fd and execute_dirty_track and container_pids and container_may_dump_size and dirtymap_path:
                         try:
-                            # attempt to generate a dirtymap snapshot
                             execute_dirty_track(device_fd, first=True)
                             dirty_bytes = str(container_may_dump_size(container_pids, dirtymap_path))
                         except Exception as e:
                             print(f"per-run dirtymap capture failed: {e}")
                             dirty_bytes = ""
 
-                    # wait for bench to finish (local or remote)
                     if args.remote_client and bench_pid is not None:
-                        # wait remotely by polling the pid on the client
                         wait_cmd = (
                             "bash -c 'start=$(date +%s); while kill -0 "
                             + str(bench_pid)
@@ -1055,12 +1047,10 @@ def main():
                     bench_stats = ""
                     avg_payload_val = ""
                     median_payload_val = ""
-                    # If remote run, optionally fetch the remote log; otherwise try to read it via ssh cat
                     target_log = local_logname
                     content = None
                     if args.remote_client:
                         if args.fetch_remote_log:
-                            # copy remote log to local path
                             try:
                                 scp_cmd = f"scp {args.client_ip}:{shlex.quote(remote_logname)} {shlex.quote(local_logname)}"
                                 run_cmd(scp_cmd, quiet=True)
@@ -1069,7 +1059,6 @@ def main():
                                 print(f"Failed to scp remote log: {e}")
                                 target_log = remote_logname
                         else:
-                            # try to read remote log via ssh cat and parse content directly
                             try:
                                 res = run_cmd(f"ssh {args.client_ip} cat {shlex.quote(remote_logname)}", quiet=True)
                                 content = (getattr(res, "stdout", "") or "")
@@ -1085,23 +1074,22 @@ def main():
                             content = None
 
                     if content:
-                        header, values = extract_stats_from_output(content)
-                        if header and values:
-                            # header and values are tab-separated strings
-                            h_fields = header.split("\t")
+                        header_s, values = extract_stats_from_output(content)
+                        if header_s and values:
+                            h_fields = header_s.split("\t")
                             v_fields = values.split("\t")
-                            # map header to values
                             hv = dict(zip(h_fields, v_fields))
                             avg_payload_val = hv.get("avg_payload_bytes", "")
                             median_payload_val = hv.get("median_payload_bytes", "")
-                            # keep bench_stats as before for compatibility
                             bench_stats = values.replace("\t", "|")
                         else:
                             bench_stats = content.strip().splitlines()[-1] if content.strip() else ""
                     else:
                         bench_stats = ""
+
                     row = [
                         datetime.utcnow().isoformat() + "Z",
+                        rate_name,
                         str(rate),
                         str(payload_mode),
                         str(payload),
@@ -1120,7 +1108,6 @@ def main():
                         str(dirty_bytes),
                         shlex.quote(bench_stats),
                     ]
-                    # placeholders for dump summary columns (filled in per-combo summary row)
                     row += ["", "", "", "", "", "", "", ""]
                     with open(args.output, "a", encoding="utf-8") as f:
                         f.write(",".join(row) + "\n")
@@ -1128,152 +1115,7 @@ def main():
                     print(f"Finished run, wrote row to {args.output}")
                     time.sleep(3)
 
-                    # end of single run loop; continue to next run_idx
-                # After completing all 'runs' for this parameter combination,
-                # perform a single checkpoint+decode to capture the container
-                # memory image for this parameter set (exclude runs dimension).
-                try:
-                    # derive bench short name for load name
-                    bench_short = "bench"
-                    try:
-                        parts = shlex.split(args.bench_template)
-                        if parts:
-                            if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
-                                script_token = parts[1]
-                            else:
-                                script_token = parts[0]
-                            bench_short = os.path.splitext(os.path.basename(script_token))[0]
-                    except Exception:
-                        pass
-
-                    # build params string for this combination
-                    param_items = []
-                    # include rate (rps or framerate) for the params string
-                    if rate_name == "rps":
-                        param_items.append(f"rps={rate}")
-                    else:
-                        param_items.append(f"fr={rate}")
-                    param_items.append(f"payload={payload}")
-                    if payload_mode:
-                        param_items.append(f"mode={payload_mode}")
-                    if pattern:
-                        param_items.append(f"pattern={pattern}")
-                    param_items.append(f"threads={args.threads}")
-                    param_items.append(f"dur={args.duration}")
-                    paramstr = "__".join(param_items) if param_items else "default"
-                    paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
-
-                    safe_container = re.sub(r"[^A-Za-z0-9._-]+", "_", str(args.container or "container"))
-                    dump_dirname = f"{safe_container}_{bench_short}_{paramstr}_dump"
-                    dump_base = os.path.join("results", dump_dirname)
-
-                    # dry-run: only print
-                    if args.dry_run:
-                        print(f"[dry-run] would create per-combo dump dir: {dump_base}")
-                        chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(args.container))}"
-                        print(f"[dry-run] would run per-combo checkpoint (cwd={dump_base}): {chk_cmd}")
-                        decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
-                        decode_cmd = f"{sys.executable} {shlex.quote(decode_script)} analyze {os.path.join(dump_base, 'image')} --output {os.path.join(dump_base, 'analysis.json')}"
-                        print(f"[dry-run] would run per-combo decode: {decode_cmd}")
-                    else:
-                        try:
-                            os.makedirs(dump_base, exist_ok=True)
-                        except Exception:
-                            pass
-                        old_cwd = os.getcwd()
-                        try:
-                            os.chdir(dump_base)
-                            # sample memory before checkpoint
-                            try:
-                                cpid = get_container_pid(args.container)
-                            except Exception:
-                                cpid = None
-                            before_ck = sample_mem(cpid) if cpid else {"vmrss_kb": None, "vmsize_kb": None}
-                            chk_cmd = f"runc checkpoint --image-path image --work-path d_log --leave-running --tcp-established --shell-job {shlex.quote(str(args.container))}"
-                            print(f"[per-combo checkpoint] -> {chk_cmd}")
-                            try:
-                                run_cmd(chk_cmd, quiet=False, ignore_error=True)
-                            except Exception as e:
-                                print(f"runc checkpoint failed for {args.container} (per-combo): {e}")
-                            # sample memory after checkpoint
-                            try:
-                                after_pid = get_container_pid(args.container)
-                            except Exception:
-                                after_pid = cpid
-                            after_ck = sample_mem(after_pid) if after_pid else {"vmrss_kb": None, "vmsize_kb": None}
-
-                            decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
-                            image_path = os.path.join(dump_base, "image")
-                            out_path = os.path.join(dump_base, "analysis.json")
-                            decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(image_path)} --output {shlex.quote(out_path)}"
-                            print(f"[per-combo decode] -> {decode_cmd}")
-                            try:
-                                run_cmd(decode_cmd, quiet=False, ignore_error=True)
-                            except Exception as e:
-                                print(f"decode_criu_memimages failed for {image_path} (per-combo): {e}")
-                            # attempt to read analysis.json and append a summary row to the main CSV
-                            try:
-                                analysis = None
-                                if os.path.exists(out_path):
-                                    with open(out_path, "r", encoding="utf-8") as af:
-                                        try:
-                                            analysis = json.load(af)
-                                        except Exception:
-                                            analysis = None
-                                total_tracked = analysis.get("total_tracked_pages") if analysis else None
-                                total_writes = analysis.get("total_writes") if analysis else None
-                                hot_pages = len(analysis.get("hot_pages", [])) if analysis else None
-                                analysis_ref = out_path if os.path.exists(out_path) else ""
-                                # compose a summary CSV row
-                                summary_row = [
-                                    datetime.utcnow().isoformat() + "Z",
-                                    str(rate),
-                                    str(payload_mode),
-                                    str(payload),
-                                    "",  # avg_payload_bytes
-                                    "",  # median_payload_bytes
-                                    str(pattern),
-                                    "combo",
-                                    args.container,
-                                    str(cpid) if cpid else "",
-                                    str(before_ck.get("vmrss_kb") or ""),
-                                    str(before_ck.get("vmsize_kb") or ""),
-                                    "",  # vmrss_mid_kb
-                                    "",  # vmsize_mid_kb
-                                    str(after_ck.get("vmrss_kb") or ""),
-                                    str(after_ck.get("vmsize_kb") or ""),
-                                    "",  # dirtymap_bytes
-                                    shlex.quote("dump_summary"),
-                                ]
-                                # append dump summary columns
-                                summary_row += [
-                                    str(total_tracked) if total_tracked is not None else "",
-                                    str(total_writes) if total_writes is not None else "",
-                                    str(hot_pages) if hot_pages is not None else "",
-                                    analysis_ref,
-                                    str(before_ck.get("vmrss_kb") or ""),
-                                    str(before_ck.get("vmsize_kb") or ""),
-                                    str(after_ck.get("vmrss_kb") or ""),
-                                    str(after_ck.get("vmsize_kb") or ""),
-                                ]
-                                try:
-                                    with open(args.output, "a", encoding="utf-8") as of:
-                                        of.write(",".join(summary_row) + "\n")
-                                    print(f"Wrote per-combo dump summary to {args.output}")
-                                except Exception as e:
-                                    print(f"Failed to write per-combo summary to {args.output}: {e}")
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            print(f"per-combo checkpoint/decode orchestration failed: {e}")
-                        finally:
-                            try:
-                                os.chdir(old_cwd)
-                            except Exception:
-                                pass
-                except Exception:
-                    # best-effort: never fail the whole experiment because checkpoint failed
-                    pass
+    # end main
 
 
 if __name__ == "__main__":

@@ -116,10 +116,11 @@ class VideoCacheRealisticBench:
         # Initialize camera positions
         self._init_camera_positions()
 
-    logger.info("Realistic configuration - Frame: %dx%d, Framerate: %dfps, Analysis: %s",
-           self.frame_width, self.frame_height, self.framerate, self.analysis_intensity)
-    logger.info("Calculated payload size: %.1fKB per frame (base: %.1fKB, intensity: %.2f)",
-           self.effective_payload_size_bytes / 1024.0, self.base_payload_size_bytes / 1024.0, self.intensity_multiplier)
+        # Log effective configuration after initialization
+        logger.info("Realistic configuration - Frame: %dx%d, Framerate: %dfps, Analysis: %s",
+            self.frame_width, self.frame_height, self.framerate, self.analysis_intensity)
+        logger.info("Calculated payload size: %.1fKB per frame (base: %.1fKB, intensity: %.2f)",
+            self.effective_payload_size_bytes / 1024.0, self.base_payload_size_bytes / 1024.0, self.intensity_multiplier)
 
     def _calculate_realistic_payload_size(self) -> float:
         """Calculate realistic payload size based on frame parameters
@@ -686,6 +687,9 @@ def main():
     )
 
     bench.payload_mode = args.payload_mode
+
+    # Payload size is determined from resolution, framerate and analysis intensity
+    # Do not allow overriding via CLI to keep realistic sizing calculation.
 
     bench.run(threads=args.threads, duration=args.duration,
              write_pct=args.write_pct, fallback_rate=args.fallback_rate,
