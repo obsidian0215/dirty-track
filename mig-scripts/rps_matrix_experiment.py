@@ -268,14 +268,16 @@ def main():
                 continue
             # If requested, start backends using runc by container name (no docker/image/ports required)
             def start_runc_backends(names, dry_run=False):
-                """Start runc backends by container name.
+                """Start runc backends by following the mig-scripts convention.
 
-                Behavior:
-                - For each name, look for a bundle at /runc/containers/<name> (convention from repo).
-                - If a bundle with config.json exists, attempt `runc create --bundle <bundle> <name>` then `runc start <name>`.
-                - If create fails because container already exists, fallback to `runc start <name>`.
-                - If bundle is missing, attempt `runc start <name>` anyway (best-effort).
-                - In dry_run mode, only print the commands.
+                Exact sequence (per mig-scripts/redis_test.py and influxdb_test.py):
+                1) rm -rf /runc/containers/<name>
+                2) cp -r /runc/containers/<name>.bak /runc/containers/<name>
+                3) nohup recvtty -m <mode> /runc/containers/<name>/console.sock & echo $! > /tmp/recvtty_<name>.pid
+                4) runc run --console-socket /runc/containers/<name>/console.sock -d -b /runc/containers/<name> <name>
+
+                This function implements that sequence. In dry_run mode it prints the commands
+                instead of executing them.
                 """
                 started = []
                 if not names:
@@ -285,53 +287,74 @@ def main():
                     if not name:
                         continue
                     bundle_dir = os.path.join("/runc/containers", name)
-                    bundle_config = os.path.join(bundle_dir, "config.json")
-                    # prefer create+start when bundle exists
-                    if os.path.exists(bundle_config):
-                        create_cmd = f"runc create --bundle {shlex.quote(bundle_dir)} {shlex.quote(name)}"
-                        start_cmd = f"runc start {shlex.quote(name)}"
-                        print(f"[backend] -> {create_cmd}")
-                        print(f"[backend] -> {start_cmd}")
-                        if not dry_run:
-                            try:
-                                run_cmd(create_cmd, quiet=False)
-                            except Exception as e:
-                                # if create failed, try to start in case it already exists
-                                print(f"runc create failed for {name}, attempting start: {e}")
-                            try:
-                                run_cmd(start_cmd, quiet=False)
-                                started.append(name)
-                            except Exception as e:
-                                print(f"Failed to start runc container {name}: {e}")
-                        else:
+                    # 1/2: reset bundle from .bak if available (best-effort)
+                    rm_cmd = f"rm -rf {shlex.quote(bundle_dir)}"
+                    cp_cmd = f"cp -r {shlex.quote(bundle_dir + '.bak')} {shlex.quote(bundle_dir)}"
+                    recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
+                    console_sock = os.path.join(bundle_dir, "console.sock")
+                    run_cmd_str = f"runc run --console-socket {shlex.quote(console_sock)} -d -b {shlex.quote(bundle_dir)} {shlex.quote(name)}"
+
+                    print(f"[backend] -> {rm_cmd}")
+                    print(f"[backend] -> {cp_cmd}")
+                    print(f"[backend] -> nohup recvtty -m null {console_sock} > /dev/null 2>&1 & echo $! > {recvtty_pidfile}")
+                    print(f"[backend] -> {run_cmd_str}")
+                    if not dry_run:
+                        try:
+                            run_cmd(rm_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        try:
+                            run_cmd(cp_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        # Start recvtty to create the console socket; do not fail hard if it errors
+                        try:
+                            recvtty_cmd = f"nohup recvtty -m null {shlex.quote(console_sock)} > /dev/null 2>&1 & echo $! > {shlex.quote(recvtty_pidfile)}"
+                            run_cmd(recvtty_cmd, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        # Finally run the container using the console socket
+                        try:
+                            run_cmd(run_cmd_str, quiet=False)
                             started.append(name)
+                        except Exception as e:
+                            print(f"Failed to runc run {name}: {e}")
                     else:
-                        # No bundle found; try simple start (container may have been pre-created)
-                        start_cmd = f"runc start {shlex.quote(name)}"
-                        print(f"[backend] -> {start_cmd}  (no bundle at {bundle_dir})")
-                        if not dry_run:
-                            try:
-                                run_cmd(start_cmd, quiet=False)
-                                started.append(name)
-                            except Exception as e:
-                                print(f"Failed to start runc container {name} (no bundle): {e}")
-                        else:
-                            started.append(name)
+                        started.append(name)
                 return started
 
             def stop_runc_backends(names, dry_run=False):
+                """Stop runc backends using the mig-scripts cleanup pattern.
+
+                Attempts to kill the recvtty pidfile (if present), unmount tmpfs and
+                then runc kill/delete. All operations are best-effort and tolerate errors.
+                """
                 if not names:
                     return
                 for name in names:
                     name = name.strip()
                     if not name:
                         continue
-                    # Best-effort: attempt to kill then delete
+                    recvtty_pidfile = f"/tmp/recvtty_{name}.pid"
+                    kill_recvtty = f"kill -9 $(cat {shlex.quote(recvtty_pidfile)}) 2>/dev/null || true"
+                    # unmount any local tmpfs under /runc/containers/<name>/migrate
+                    umount_note = f"# unmount tmpfs for {name} (best-effort)"
                     kill_cmd = f"runc kill {shlex.quote(name)} || true"
                     delete_cmd = f"runc delete {shlex.quote(name)} || true"
+                    print(f"[backend] -> {kill_recvtty}")
+                    print(f"[backend] -> {umount_note}")
                     print(f"[backend] -> {kill_cmd}")
                     print(f"[backend] -> {delete_cmd}")
                     if not dry_run:
+                        try:
+                            run_cmd(kill_recvtty, quiet=True, ignore_error=True)
+                        except Exception:
+                            pass
+                        try:
+                            # unmount helper will quietly ignore failures
+                            unmount_local_migration_tmpfs(name, ignore_error=True, quiet=True)
+                        except Exception:
+                            pass
                         try:
                             run_cmd(kill_cmd, quiet=True, ignore_error=True)
                         except Exception:
