@@ -656,8 +656,8 @@ def main():
                        help="Fallback to persistence percentage")
     parser.add_argument("--do-get-pct", default=5, type=int,
                        help="Immediate get after set percentage")
-    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
-                        help="Payload mode: json (structured) or binary (base64 blob)")
+    parser.add_argument("--payload-mode", default=None, choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob). If omitted, an automatic default may be chosen based on --inference-model and --analysis-intensity.")
 
     args = parser.parse_args()
 
@@ -686,7 +686,25 @@ def main():
         pool_size=args.pool_size
     )
 
-    bench.payload_mode = args.payload_mode
+    # If payload_mode not explicitly provided, choose a sensible default
+    # based on the inference model and analysis intensity. This is opinionated
+    # and can be overridden by passing --payload-mode explicitly.
+    chosen_payload_mode = args.payload_mode
+    try:
+        if chosen_payload_mode is None:
+            # Prefer binary for heavier/compressed payload scenarios where the
+            # inference model produces large frames or analysis blobs. Use JSON
+            # for lightweight/default modes.
+            if args.analysis_intensity == "comprehensive":
+                chosen_payload_mode = "binary"
+            elif isinstance(args.inference_model, str) and args.inference_model.lower().startswith("yolov5"):
+                chosen_payload_mode = "binary"
+            else:
+                chosen_payload_mode = "json"
+    except Exception:
+        chosen_payload_mode = args.payload_mode or "json"
+
+    bench.payload_mode = chosen_payload_mode
 
     # Payload size is determined from resolution, framerate and analysis intensity
     # Do not allow overriding via CLI to keep realistic sizing calculation.

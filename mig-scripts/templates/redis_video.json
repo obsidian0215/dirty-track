@@ -1,17 +1,17 @@
-{
-  "name": "redis_video",
-  "bench_template": "python3 experiment/migration/redis/bench_video_cache_realistic.py --threads {threads} --payload-mode {payload_mode} --framerate {rate} --duration {duration} --frame-width {frame_width} --frame-height {frame_height} --analysis-intensity {analysis_intensity}",
-  "payload_modes": "binary,json",
-  "resolution_list": "1920x1080,1280x720,640x360",
-  "patterns": "random,repeat",
-  "duration": 120,
-  "threads": 4,
-  "framerate_list": "15,30,60",
-  "runs": 3,
-  "container": "redis",
-  "output": "results/redis_video_matrix.csv",
-  "log_dir": "logs/redis_video",
-  "frame_width": 1920,
-  "frame_height": 1080,
-  "analysis_intensity": "comprehensive"
-}
+  {
+    "name": "redis_video",
+    "bench_template": "python3 experiment/migration/redis/bench_video_cache_realistic.py --threads {threads} --payload-mode {payload_mode} --framerate {framerate} --duration {duration} --frame-width {frame_width} --frame-height {frame_height} --objects-per-frame {objects_per_frame} --analysis-intensity {analysis_intensity} --inference-model {inference_model}",
+    "resolution": "1920x1080,1280x720",
+    "payload_mode": "binary",
+    "analysis_intensity": "mechanical,comprehensive",
+    "inference_model": "ssd_mobile,yolov5_medium",
+    "objects_per_frame": "4,8",
+    "duration": 120,
+    "threads": 4,
+    "framerate": "30,60",
+    "runs": 3,
+    "container": "redis",
+    "output": "results/redis_video_matrix.csv",
+    "log_dir": "logs/redis_video"
+  }
+]
