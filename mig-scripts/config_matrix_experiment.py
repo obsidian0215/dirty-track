@@ -739,6 +739,161 @@ def main():
             return set()
         return flags
 
+    def _start_bench_and_collect(bench_cmd: str, local_logname: str, args_local, repo_root_local, client_ip=None):
+        """Resolve, start a bench (local or remote), wait for completion and return (pid, target_log, content).
+
+        This consolidates the repeated logic for resolving bench scripts, stripping
+        unsupported flags, probing host endpoints, starting the bench (local or
+        remote), and retrieving the log content.
+        """
+        bench_pid = None
+        target_log = local_logname
+        content = None
+        try:
+            ok, tried = _bench_script_resolves(bench_cmd)
+        except Exception:
+            ok, tried = False, bench_cmd
+
+        # Prepare parts and strip unsupported flags
+        parts = None
+        try:
+            parts = shlex.split(bench_cmd)
+            if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+                parts[1] = tried
+            else:
+                parts[0] = tried
+        except Exception:
+            parts = None
+
+        supported = set()
+        try:
+            if parts:
+                supported = _get_bench_supported_flags(tried)
+        except Exception:
+            supported = set()
+
+        try:
+            if parts:
+                new_parts = []
+                skip_next = False
+                for tok in parts:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if tok.startswith("--"):
+                        key = tok.split("=")[0]
+                        if key not in supported:
+                            if "=" not in tok:
+                                skip_next = True
+                            continue
+                    new_parts.append(tok)
+                if new_parts:
+                    bench_cmd = " ".join(shlex.quote(p) for p in new_parts)
+        except Exception:
+            pass
+
+        # Probe endpoint and possibly skip
+        try:
+            if _should_skip_due_to_probe(args_local.container, bench_cmd, args_local.client_ip if args_local.remote_client else None):
+                print(f"[host-probe] aborting run: host endpoint not reachable for bench {bench_cmd}")
+                return None, target_log, None
+        except Exception:
+            pass
+
+        if args_local.dry_run:
+            try:
+                with open(local_logname, "w", encoding="utf-8") as df:
+                    df.write("DRY-RUN\n")
+                    df.write(bench_cmd + "\n")
+                    df.write("METRIC_HEADER\ttotal_ops\tops_per_sec\n")
+                    df.write("METRIC_VALUES\t0\t0\n")
+            except Exception:
+                pass
+            return None, target_log, None
+
+        # Remote client path
+        if getattr(args_local, "remote_client", False):
+            if not getattr(args_local, "client_ip", None):
+                print("--remote-client set but --client-ip is empty; skipping run")
+                return None, target_log, None
+            client_target = args_local.client_ip if "@" in args_local.client_ip else f"root@{args_local.client_ip}"
+            remote_logname = f"/tmp/{os.path.basename(local_logname)}"
+            remote_cmd = f"nohup {bench_cmd} > {shlex.quote(remote_logname)} 2>&1 < /dev/null & echo $!"
+            try:
+                res = run_cmd(f"ssh -n {client_target} {shlex.quote(remote_cmd)}", quiet=True)
+                out = (getattr(res, "stdout", "") or "").strip()
+                if out:
+                    try:
+                        bench_pid = int(out.splitlines()[-1].strip())
+                    except Exception:
+                        bench_pid = None
+            except Exception as e:
+                print(f"Failed to start remote bench on {client_target}: {e}")
+                return None, target_log, None
+            target_log = local_logname
+            # Attempt to scp back the remote log once bench completes
+            try:
+                if bench_pid is not None:
+                    wait_for_pid_exit(bench_pid, timeout=args_local.duration + 10)
+            except Exception:
+                pass
+            try:
+                scp_cmd = f"scp {args_local.client_ip}:{shlex.quote(remote_logname)} {shlex.quote(local_logname)}"
+                run_cmd(scp_cmd, quiet=True)
+                target_log = local_logname
+            except Exception:
+                target_log = remote_logname
+        else:
+            # Local bench
+            ok, tried = _bench_script_resolves(bench_cmd)
+            if not ok:
+                print(f"Bench script not found locally (tried: {tried}). Skipping run.\n  Tip: run this from the repo root or use an absolute path in --bench-template.")
+                return None, target_log, None
+            try:
+                parts = shlex.split(bench_cmd)
+                if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
+                    parts[1] = tried
+                else:
+                    parts[0] = tried
+            except Exception:
+                pass
+            try:
+                if parts:
+                    bench_cmd = " ".join(shlex.quote(p) for p in parts)
+            except Exception:
+                pass
+            print(f"Starting local: {bench_cmd} -> log {local_logname}")
+            bench_pid = run_bench_background(bench_cmd, local_logname)
+            if bench_pid is None:
+                print("bench failed to start; skipping")
+                return None, target_log, None
+            try:
+                wait_for_pid_exit(bench_pid, timeout=args_local.duration + 10)
+            except Exception:
+                pass
+
+        # Read content if available
+        try:
+            with open(target_log, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            content = None
+
+        return bench_pid, target_log, content
+
+    def _extract_stats_from_log(content: Optional[str]):
+        try:
+            if not content:
+                return "", ""
+            header_s, values = extract_stats_from_output(content)
+            if header_s and values:
+                bench_stats = values.replace("\t", "|")
+            else:
+                bench_stats = content.strip().splitlines()[-1] if content.strip() else ""
+            return header_s, bench_stats
+        except Exception:
+            return "", ""
+
     if not args.tests_file:
         missing = []
         if not args.container:
@@ -1341,84 +1496,14 @@ def main():
                             # removed debug print
                             # --- Start of inserted bench-start + log-capture for resolution-driven runs ---
                             try:
-                                ok, tried = _bench_script_resolves(bench_cmd)
-                                if not ok:
-                                    print(f"Bench script not found locally (tried: {tried}). Skipping run.\n  Tip: run this from the repo root or use an absolute path in --bench-template.")
-                                    continue
+                                bench_pid, target_log, content = _start_bench_and_collect(bench_cmd, local_logname, args, repo_root)
+                                # make content available to later aggregation logic
                                 try:
-                                    parts = shlex.split(bench_cmd)
-                                    if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
-                                        parts[1] = tried
-                                    else:
-                                        parts[0] = tried
-                                except Exception:
-                                    parts = None
-
-                                # Detect supported flags from the bench script and strip
-                                # any unsupported flags (common offender: --pattern).
-                                supported = set()
-                                try:
-                                    if parts:
-                                        supported = _get_bench_supported_flags(tried)
-                                except Exception:
-                                    supported = set()
-
-                                # Reconstruct bench_cmd while removing unsupported flags
-                                try:
-                                    if parts:
-                                        new_parts = []
-                                        skip_next = False
-                                        for tok in parts:
-                                            if skip_next:
-                                                skip_next = False
-                                                continue
-                                            if tok.startswith("--"):
-                                                key = tok.split("=")[0]
-                                                if key not in supported:
-                                                            # unsupported flag: skip it
-                                                    # if flag uses separate value, skip the next token
-                                                    if "=" not in tok:
-                                                        skip_next = True
-                                                    continue
-                                            new_parts.append(tok)
-                                        if new_parts:
-                                            bench_cmd = " ".join(shlex.quote(p) for p in new_parts)
+                                    globals()['content'] = content
                                 except Exception:
                                     pass
-
-                                print(f"Starting local: {bench_cmd} -> log {local_logname}")
-                                # Probe host endpoint before starting a local bench to avoid
-                                # race conditions where the service is not yet accepting
-                                # connections from the host. Use a container-aware probe
-                                # URL (e.g. Influx -> 8181, Elasticsearch -> 9200). If a
-                                # probe URL is supplied and the probe fails, skip this run.
-                                try:
-                                    if _should_skip_due_to_probe(args.container, bench_cmd, args.client_ip if args.remote_client else None):
-                                        print(f"[host-probe] aborting run: host endpoint not reachable for bench {bench_cmd}")
-                                        continue
-                                except Exception:
-                                    # non-fatal: if probe helper misbehaves, proceed with run
-                                    pass
-                                # If we're in dry-run mode, simulate a bench log and skip starting processes
-                                if args.dry_run:
-                                    try:
-                                        with open(local_logname, "w", encoding="utf-8") as df:
-                                            df.write("DRY-RUN\n")
-                                            df.write(bench_cmd + "\n")
-                                            df.write("METRIC_HEADER\ttotal_ops\tops_per_sec\n")
-                                            df.write("METRIC_VALUES\t0\t0\n")
-                                    except Exception:
-                                        pass
-                                    bench_pid = None
-                                else:
-                                    bench_pid = run_bench_background(bench_cmd, local_logname)
-                                    if bench_pid is None:
-                                        print("bench failed to start; skipping")
-                                        continue
-                                    # wait for bench to complete (no debug/tail logging)
-                                    wait_for_pid_exit(bench_pid, timeout=args.duration + 10)
                             except Exception:
-                                pass
+                                bench_pid = None
                             # --- End of inserted block ---
                             # --- Begin per-run aggregation + checkpoint (resolution branch) ---
                             try:
@@ -1712,70 +1797,14 @@ def main():
                             remote_logname = local_logname
                             client_target = args.client_ip
 
-                            if args.dry_run:
-                                print(f"DRY-RUN: would run: {bench_cmd} -> {local_logname}")
-                                try:
-                                    with open(local_logname, "w", encoding="utf-8") as df:
-                                        df.write("DRY-RUN\n")
-                                        df.write(bench_cmd + "\n")
-                                        df.write("METRIC_HEADER\ttotal_ops\tops_per_sec\n")
-                                        df.write("METRIC_VALUES\t0\t0\n")
-                                except Exception:
-                                    pass
-                            else:
-                                if args.remote_client:
-                                    if not args.client_ip:
-                                        print("--remote-client set but --client-ip is empty; skipping run")
-                                        continue
-                                    if "@" not in args.client_ip:
-                                        client_target = f"root@{args.client_ip}"
-                                    remote_logname = f"/tmp/bench_{rate}_{payload}_{pattern}_{run_idx}_{ts}.log"
-                                    remote_cmd = f"nohup {bench_cmd} > {shlex.quote(remote_logname)} 2>&1 < /dev/null & echo $!"
-                                    try:
-                                        res = run_cmd(f"ssh -n {client_target} {shlex.quote(remote_cmd)}", quiet=True)
-                                        out = (getattr(res, "stdout", "") or "").strip()
-                                        if out:
-                                            try:
-                                                bench_pid = int(out.splitlines()[-1].strip())
-                                            except Exception:
-                                                bench_pid = None
-                                    except Exception as e:
-                                        print(f"Failed to start remote bench on {client_target}: {e}")
-                                        continue
-                                else:
-                                    ok, tried = _bench_script_resolves(bench_cmd)
-                                    if not ok:
-                                        print(f"Bench script not found locally (tried: {tried}). Skipping run.\n  Tip: run this from the repo root or use an absolute path in --bench-template.")
-                                        continue
-                                    try:
-                                        parts = shlex.split(bench_cmd)
-                                        if os.path.basename(parts[0]).startswith("python") and len(parts) > 1:
-                                            parts[1] = tried
-                                        else:
-                                            parts[0] = tried
-                                        bench_cmd = " ".join(shlex.quote(p) for p in parts)
-                                    except Exception:
-                                        pass
-                                    # Debug: confirm we reached the bench-start path
-                                    print("[debug] reached bench-start path")
-                                    print(f"Starting local: {bench_cmd} -> log {local_logname}")
-                                    # Probe host endpoint before starting a local bench to avoid
-                                    # race conditions where the service is not yet accepting
-                                    # connections from the host. Use a container-aware probe
-                                    # URL when available. If a probe URL is supplied and the
-                                    # probe fails, skip this run.
-                                    try:
-                                        if _should_skip_due_to_probe(args.container, bench_cmd, args.client_ip if args.remote_client else None):
-                                            print(f"[host-probe] aborting run: host endpoint not reachable for bench {bench_cmd}")
-                                            continue
-                                    except Exception:
-                                        # non-fatal: if probe helper misbehaves, proceed with run
-                                        pass
-                                    # Start bench (no debug/tail logging)
-                                    bench_pid = run_bench_background(bench_cmd, local_logname)
-                                    if bench_pid is None:
-                                        print("bench failed to start; skipping")
-                                        continue
+                            try:
+                                bench_pid, target_log, content = _start_bench_and_collect(bench_cmd, local_logname, args, repo_root)
+                            except Exception:
+                                bench_pid = None
+                                target_log = local_logname
+                                content = None
+                            # ensure remote_logname variable exists for later scp/ssh handling
+                            remote_logname = f"/tmp/bench_{rate}_{payload}_{pattern}_{run_idx}_{ts}.log"
 
                             ramp = max(2, min(8, args.duration // 6))
                             time.sleep(ramp)
@@ -1844,6 +1873,7 @@ def main():
                                 datetime.utcnow().isoformat() + "Z",
                                 rate_name,
                                 str(rate),
+                                "",  # resolution empty for non-resolution (rps) runs
                                 str(payload_mode),
                                 str(payload),
                                 str(pattern),
@@ -1985,21 +2015,10 @@ def main():
 
                                 # Allow a short settle period before checkpoint orchestration
                                 time.sleep(3)
-                                print(f"[run-debug] reached pre-checkpoint for run_idx={locals().get('run_idx','MISSING')} args.runs={args.runs}")
 
                                 # Checkpoint+decode: perform once per experiment parameterization on run_idx==1
                                 if USE_POST_CHECKPOINT:
                                     try:
-                                        print(f"[checkpoint-branch] entering checkpoint decision: run_idx={locals().get('run_idx', 'MISSING')} args.runs={args.runs} tests_file={bool(args.tests_file)}")
-                                        print(f"[checkpoint-branch] locals keys: {sorted(list(locals().keys()))}")
-                                        if 'entry' in locals():
-                                            try:
-                                                print(f"[checkpoint-branch] ctx entry present: {bool(locals().get('entry'))} name={locals().get('entry', {}).get('name')}")
-                                            except Exception:
-                                                print("[checkpoint-branch] ctx entry present but cannot print details")
-                                        if 'test_name' in locals():
-                                            print(f"[checkpoint-branch] ctx test_name: {locals().get('test_name')}")
-
                                         if run_idx == args.runs:
                                             ctx_entry = locals().get("entry", None)
                                             ctx_test_name = locals().get("test_name", None)

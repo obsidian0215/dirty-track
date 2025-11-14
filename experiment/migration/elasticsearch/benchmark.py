@@ -261,7 +261,7 @@ def main():
                 time.sleep(1)
 
     if not connected:
-        print(f"错误: 无法连接到Elasticsearch {args.es_host}:{args.es_port} after {max_retries} attempts")
+        print(f"ERROR: Unable to connect to Elasticsearch {args.es_host}:{args.es_port} after {max_retries} attempts")
         exit(1)
 
     # 创建索引（如果不存在）
@@ -348,14 +348,14 @@ def main():
     if not perform_indices_exists(args.index_name):
         perform_create_index(args.index_name)
 
-    print(f'开始Elasticsearch基准测试: threads={args.threads} operations/thread={args.operations} mode={args.test_mode}')
+    print(f'Starting Elasticsearch benchmark: threads={args.threads} operations/thread={args.operations} mode={args.test_mode}')
 
     latencies = []
     total_operations = 0
     total_time = 0
 
     if args.test_mode in ['index', 'mixed']:
-        print("执行索引基准测试...")
+        print("Running index benchmark...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = []
             for tid in range(args.threads):
@@ -372,10 +372,10 @@ def main():
                     avg_lat_ms = avg_lat * 1000.0
                     print(f'Thread result: ops={ops} time={time_taken:.3f}s avg_lat={avg_lat_ms:.3f}ms throughput={throughput:.3f} ops/s')
                 except Exception as e:
-                    print(f'索引线程错误: {e}')
+                    print(f'Index thread error: {e}')
 
     if args.test_mode in ['search', 'mixed']:
-        print("执行搜索基准测试...")
+        print("Running search benchmark...")
         latencies = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = []
@@ -388,7 +388,7 @@ def main():
                 try:
                     future.result()
                 except Exception as e:
-                    print(f'搜索线程错误: {e}')
+                    print(f'Search thread error: {e}')
 
         total_operations += args.operations * args.threads
 
@@ -409,7 +409,7 @@ def main():
         min_ms = min_latency * 1000.0
         max_ms = max_latency * 1000.0
 
-        print("\n=== Elasticsearch基准测试结果 ===")
+        print("\n=== Elasticsearch Benchmark ===")
         print(f"Total operations: {total_operations}")
         print(f"Total time (s): {total_time:.3f}")
         print(f"Overall throughput (ops/s): {overall_throughput:.3f}")
@@ -418,12 +418,29 @@ def main():
         print(f"p95 latency (ms): {p95_ms:.3f}")
         print(f"Min latency (ms): {min_ms:.3f}")
         print(f"Max latency (ms): {max_ms:.3f}")
-    else:
-        print("无延迟数据，无法计算统计信息")
 
-    # 不再交互询问是否删除索引（避免在自动化跑批中阻塞）
-    print("Skipping interactive index deletion (non-interactive run). Index left in place.")
-    print("测试完成，可与chk_restore.py迁移测试结合分析迁移期间性能影响。")
+        # Emit single-line metric header and values for harness parsing
+        # Format matches other benches: METRIC_HEADER\ttotal_ops\tops_per_sec
+        try:
+            ops = int(total_operations)
+        except Exception:
+            ops = 0
+        try:
+            overall_ops = float(overall_throughput)
+        except Exception:
+            overall_ops = 0.0
+        print(f"METRIC_HEADER\ttotal_ops\tops_per_sec")
+        print(f"METRIC_VALUES\t{ops}\t{overall_ops:.3f}")
+    else:
+        print("No latency data available; cannot compute statistics")
+        # Still print metric header/values if possible
+        try:
+            ops = int(total_operations)
+        except Exception:
+            ops = 0
+        overall_ops = (total_operations / total_time) if total_time > 0 else 0.0
+        print(f"METRIC_HEADER\ttotal_ops\tops_per_sec")
+        print(f"METRIC_VALUES\t{ops}\t{overall_ops:.3f}")
 
 if __name__ == '__main__':
     main()
