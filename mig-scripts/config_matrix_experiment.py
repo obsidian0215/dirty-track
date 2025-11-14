@@ -674,8 +674,22 @@ def main():
         parser.add_argument("--payload-mode", dest="payload_mode", required=False, help="Comma-separated payload modes to test (e.g. json,binary).")
     except Exception:
         pass
+    # Generic '--pattern' removed: benches use benchmark-specific options
+    # such as '--vehicle-pattern', '--size-distribution' or
+    # '--sensors-per-device'. Those alternate args were added above.
+    # Some benches don't use a generic 'pattern' token. Accept common
+    # alternative parameter names so users can pass them via CLI and so
+    # the matrix runner will forward them into bench templates and CSVs.
     try:
-        parser.add_argument("--pattern", dest="pattern", required=False)
+        parser.add_argument("--size-distribution", dest="size_distribution", required=False)
+    except Exception:
+        pass
+    try:
+        parser.add_argument("--vehicle-pattern", dest="vehicle_pattern", required=False)
+    except Exception:
+        pass
+    try:
+        parser.add_argument("--sensors-per-device", dest="sensors_per_device", required=False)
     except Exception:
         pass
 
@@ -925,7 +939,10 @@ def main():
         override_parser.add_argument("--analysis-intensity", dest="analysis_intensity")
         override_parser.add_argument("--inference-model", dest="inference_model")
         override_parser.add_argument("--objects-per-frame", dest="objects_per_frame")
-        override_parser.add_argument("--pattern", dest="pattern")
+        # do not include generic pattern here; use specific overrides if present
+        override_parser.add_argument("--size-distribution", dest="size_distribution")
+        override_parser.add_argument("--vehicle-pattern", dest="vehicle_pattern")
+        override_parser.add_argument("--sensors-per-device", dest="sensors_per_device")
         override_parser.add_argument("--duration", dest="duration", type=int)
         override_parser.add_argument("--threads", dest="threads", type=int)
         override_parser.add_argument("--runs", dest="runs", type=int)
@@ -950,7 +967,6 @@ def main():
                 "analysis_intensity",
                 "inference_model",
                 "objects_per_frame",
-                "pattern",
                 "duration",
                 "threads",
                 "runs",
@@ -1146,9 +1162,13 @@ def main():
                 or has_fr
             )
             # payload_size applies only to non-video (rps-driven) benches
+            # Forward benchmark-specific pattern-like flags instead of a
+            # generic '--pattern' which is unused by bench scripts.
             if not is_video_bench:
                 add_flag("payload_size", "--payload-size")
-                add_flag("pattern", "--pattern")
+                add_flag("size_distribution", "--size-distribution")
+                add_flag("vehicle_pattern", "--vehicle-pattern")
+                add_flag("sensors_per_device", "--sensors-per-device")
 
             # payload_mode and generic run params apply to both
             add_flag("payload_mode", "--payload-mode")
@@ -1349,7 +1369,18 @@ def main():
         rate_name = "rps"
         rate_values = [int(x) for x in (args.rps or "").split(",") if x.strip()]
     payloads = [parse_size_token(x) for x in (args.payload_size or "").split(",") if x.strip()]
-    patterns = [x for x in (args.pattern or "").split(",") if x.strip()]
+    # Generic --pattern removed; derive patterns from benchmark-specific
+    # alternate flags when present so matrix iteration remains sensible.
+    patterns = []
+    try:
+        sd = getattr(args, "size_distribution", None) or ""
+        vp = getattr(args, "vehicle_pattern", None) or ""
+        spd = getattr(args, "sensors_per_device", None) or ""
+        alt = sd or vp or spd
+        if alt:
+            patterns = [x for x in str(alt).split(",") if x.strip()]
+    except Exception:
+        pass
     payload_modes = [x for x in args.payload_mode.split(",") if x.strip()] if args.payload_mode else [""]
 
     # resolution_list: optional comma-separated list of WxH tokens. When
@@ -1403,7 +1434,10 @@ def main():
         "resolution",
         "payload_mode",
         "payload_bytes",
-        "pattern",
+        # Bench-specific columns: only one will be populated depending on bench
+        "size_distribution",
+        "vehicle_pattern",
+        "sensors_per_device",
         "run",
         "container",
         "vmrss_before_kb",
@@ -1470,6 +1504,12 @@ def main():
                                     "duration": args.duration,
                                     "threads": args.threads,
                                     "pattern": pattern,
+                                    # Provide alternate placeholders so bench templates
+                                    # that expect these names won't KeyError during
+                                    # `.format()` substitution. Value may be empty.
+                                    "size_distribution": getattr(args, "size_distribution", ""),
+                                    "vehicle_pattern": getattr(args, "vehicle_pattern", ""),
+                                    "sensors_per_device": getattr(args, "sensors_per_device", ""),
                                     "payload_mode": payload_mode,
                                     "frame_width": fw,
                                     "frame_height": fh,
@@ -1541,6 +1581,36 @@ def main():
                                 # resolution branch doesn't have explicit payload value; leave blank
                                 payload_val = ""
                                 resolution_str = f"{fw}x{fh}"
+                                # derive bench-specific columns: prefer per-entry values when present
+                                try:
+                                    entry_local = locals().get("entry", None)
+                                except Exception:
+                                    entry_local = None
+                                try:
+                                    sd_val = ""
+                                    if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
+                                        sd_val = str(entry_local.get("size_distribution"))
+                                    else:
+                                        sd_val = str(getattr(args, "size_distribution", "") or "")
+                                except Exception:
+                                    sd_val = ""
+                                try:
+                                    vp_val = ""
+                                    if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
+                                        vp_val = str(entry_local.get("vehicle_pattern"))
+                                    else:
+                                        vp_val = str(getattr(args, "vehicle_pattern", "") or "")
+                                except Exception:
+                                    vp_val = ""
+                                try:
+                                    spd_val = ""
+                                    if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
+                                        spd_val = str(entry_local.get("sensors_per_device"))
+                                    else:
+                                        spd_val = str(getattr(args, "sensors_per_device", "") or "")
+                                except Exception:
+                                    spd_val = ""
+
                                 row = [
                                     datetime.utcnow().isoformat() + "Z",
                                     rate_name,
@@ -1548,7 +1618,9 @@ def main():
                                     resolution_str,
                                     str(payload_mode),
                                     str(payload_val),
-                                    str(pattern),
+                                    sd_val,
+                                    vp_val,
+                                    spd_val,
                                     str(run_idx),
                                     args.container,
                                     str(before.get("vmrss_kb") or ""),
@@ -1583,12 +1655,26 @@ def main():
 
                                         parts = []
                                         if ctx_entry:
-                                            for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode", "pattern"):
-                                                v = ctx_entry.get(k)
-                                                if v is None:
-                                                    continue
-                                                s = str(v).replace(",", "+").replace(" ", "_")
-                                                parts.append(f"{k}={s}")
+                                            # Prefer to enumerate any explicit fields present
+                                            # in the tests-file entry. Accept multiple common
+                                            # alternate keys for pattern-like parameters.
+                                            try:
+                                                for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
+                                                    v = ctx_entry.get(k)
+                                                    if v is None:
+                                                        continue
+                                                    s = str(v).replace(",", "+").replace(" ", "_")
+                                                    parts.append(f"{k}={s}")
+                                                # pattern-like alternatives
+                                                alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
+                                                for ak in alt_keys:
+                                                    v = ctx_entry.get(ak)
+                                                    if v is None:
+                                                        continue
+                                                    s = str(v).replace(",", "+").replace(" ", "_")
+                                                    parts.append(f"{ak}={s}")
+                                            except Exception:
+                                                pass
                                         else:
                                             try:
                                                 parts.append(f"{rate_name}={rate}")
@@ -1604,7 +1690,12 @@ def main():
                                             except Exception:
                                                 pass
                                             try:
-                                                parts.append(f"pattern={pattern}")
+                                                # include any alternate pattern-like placeholders
+                                                ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
+                                                if ap:
+                                                    parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                                else:
+                                                    parts.append(f"pattern={pattern}")
                                             except Exception:
                                                 pass
                                             try:
@@ -1724,7 +1815,12 @@ def main():
                                 "duration": args.duration,
                                 "threads": args.threads,
                                 "payload": payload,
+                                # Generic 'pattern' kept for backwards-compatibility.
                                 "pattern": pattern,
+                                # Alternate parameter names (may be empty)
+                                "size_distribution": getattr(args, "size_distribution", ""),
+                                "vehicle_pattern": getattr(args, "vehicle_pattern", ""),
+                                "sensors_per_device": getattr(args, "sensors_per_device", ""),
                                 "payload_mode": payload_mode,
                             }
                             # Ensure objects_per_frame placeholder is present when templates reference it
@@ -1869,6 +1965,36 @@ def main():
                             # Build a compact row matching the simplified header
                             # sanitize bench_stats to avoid commas/newlines
                             safe_bench_stats = (bench_stats or "").replace('\n', ' ').replace('\r', ' ').replace(',', ';')
+                            # derive bench-specific columns for non-resolution runs
+                            try:
+                                entry_local = locals().get("entry", None)
+                            except Exception:
+                                entry_local = None
+                            try:
+                                sd_val = ""
+                                if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
+                                    sd_val = str(entry_local.get("size_distribution"))
+                                else:
+                                    sd_val = str(getattr(args, "size_distribution", "") or "")
+                            except Exception:
+                                sd_val = ""
+                            try:
+                                vp_val = ""
+                                if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
+                                    vp_val = str(entry_local.get("vehicle_pattern"))
+                                else:
+                                    vp_val = str(getattr(args, "vehicle_pattern", "") or "")
+                            except Exception:
+                                vp_val = ""
+                            try:
+                                spd_val = ""
+                                if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
+                                    spd_val = str(entry_local.get("sensors_per_device"))
+                                else:
+                                    spd_val = str(getattr(args, "sensors_per_device", "") or "")
+                            except Exception:
+                                spd_val = ""
+
                             row = [
                                 datetime.utcnow().isoformat() + "Z",
                                 rate_name,
@@ -1876,7 +2002,9 @@ def main():
                                 "",  # resolution empty for non-resolution (rps) runs
                                 str(payload_mode),
                                 str(payload),
-                                str(pattern),
+                                sd_val,
+                                vp_val,
+                                spd_val,
                                 str(run_idx),
                                 args.container,
                                 str(before.get("vmrss_kb") or ""),
@@ -1912,12 +2040,22 @@ def main():
 
                                     parts = []
                                     if ctx_entry:
-                                        for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode", "pattern"):
-                                            v = ctx_entry.get(k)
-                                            if v is None:
-                                                continue
-                                            s = str(v).replace(",", "+").replace(" ", "_")
-                                            parts.append(f"{k}={s}")
+                                        try:
+                                            for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
+                                                v = ctx_entry.get(k)
+                                                if v is None:
+                                                    continue
+                                                s = str(v).replace(",", "+").replace(" ", "_")
+                                                parts.append(f"{k}={s}")
+                                            alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
+                                            for ak in alt_keys:
+                                                v = ctx_entry.get(ak)
+                                                if v is None:
+                                                    continue
+                                                s = str(v).replace(",", "+").replace(" ", "_")
+                                                parts.append(f"{ak}={s}")
+                                        except Exception:
+                                            pass
                                     else:
                                         try:
                                             parts.append(f"{rate_name}={rate}")
@@ -1933,7 +2071,11 @@ def main():
                                         except Exception:
                                             pass
                                         try:
-                                            parts.append(f"pattern={pattern}")
+                                            ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
+                                            if ap:
+                                                parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                            else:
+                                                parts.append(f"pattern={pattern}")
                                         except Exception:
                                             pass
                                         try:
@@ -2031,12 +2173,22 @@ def main():
 
                                             parts = []
                                             if ctx_entry:
-                                                for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode", "pattern"):
-                                                    v = ctx_entry.get(k)
-                                                    if v is None:
-                                                        continue
-                                                    s = str(v).replace(",", "+").replace(" ", "_")
-                                                    parts.append(f"{k}={s}")
+                                                try:
+                                                    for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
+                                                        v = ctx_entry.get(k)
+                                                        if v is None:
+                                                            continue
+                                                        s = str(v).replace(",", "+").replace(" ", "_")
+                                                        parts.append(f"{k}={s}")
+                                                    alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
+                                                    for ak in alt_keys:
+                                                        v = ctx_entry.get(ak)
+                                                        if v is None:
+                                                            continue
+                                                        s = str(v).replace(",", "+").replace(" ", "_")
+                                                        parts.append(f"{ak}={s}")
+                                                except Exception:
+                                                    pass
                                             else:
                                                 try:
                                                     parts.append(f"{rate_name}={rate}")
@@ -2052,7 +2204,11 @@ def main():
                                                 except Exception:
                                                     pass
                                                 try:
-                                                    parts.append(f"pattern={pattern}")
+                                                    ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
+                                                    if ap:
+                                                        parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                                    else:
+                                                        parts.append(f"pattern={pattern}")
                                                 except Exception:
                                                     pass
                                                 try:
