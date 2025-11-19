@@ -19,48 +19,170 @@ Notes:
 - Use {rate} in your template if you want to be agnostic to whether rate means rps or framerate.
 """
 import argparse
-import sys
-import atexit
-import json
 import os
-import re
-import shlex
-import subprocess
+import sys
 import time
-from datetime import datetime
-from typing import Dict, List, Optional
+import shlex
+import json
 import glob
-import shutil
+import re
+import atexit
+from datetime import datetime
+from typing import Optional, Dict, List
 
-# Toggle to enable/disable the post-checkpoint branch. During debugging we prefer
-# to rely on the per-branch inline checkpoints first.
-USE_POST_CHECKPOINT = False
-
-
-# Debug instrumentation and bench .tail generation removed per user request.
-# Previously this file wrote per-test instrument logs and bench .tail files.
-# The harness now avoids generating those artifacts.
-
-from cmd_utils import run_cmd, unmount_local_migration_tmpfs
-from result_writer import extract_stats_from_output
+import subprocess
 
 
+def run_cmd(cmd: str, quiet: bool = False, ignore_error: bool = False, timeout: Optional[int] = None):
+    """Run `cmd` in the shell and return a simple result object.
 
+    The returned object exposes `stdout`, `stderr` and `returncode` attributes.
+    When `quiet` is False the command is printed before execution. When
+    `ignore_error` is True failures will not raise an exception.
+    """
+    class _R:
+        def __init__(self, stdout: str, stderr: str, returncode: int):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
 
-
-def get_container_pid(container: str) -> Optional[int]:
+    if not quiet:
+        try:
+            print(f"$ {cmd}")
+        except Exception:
+            pass
     try:
-        res = run_cmd(f"runc state {shlex.quote(container)}", quiet=True)
-        out = getattr(res, "stdout", "") or ""
-        data = json.loads(out)
-        pid = int(data.get("pid", 0))
-        if pid <= 0:
-            return None
-        return pid
+        completed = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return _R(getattr(completed, 'stdout', '') or '', getattr(completed, 'stderr', '') or '', getattr(completed, 'returncode', 1))
+    except subprocess.TimeoutExpired as e:
+        if ignore_error:
+            return _R(getattr(e, 'stdout', '') or '', getattr(e, 'stderr', '') or '', 124)
+        raise
+    except Exception as e:
+        if ignore_error:
+            return _R('', str(e), 1)
+        raise
+
+
+def get_container_pid(container_name: str) -> Optional[int]:
+    """Return the host PID of a runc container name, or None if not found.
+
+    Tries `runc state` and parses JSON output when available; falls back to
+    a regex search in stdout/stderr for older runc versions.
+    """
+    if not container_name:
+        return None
+    try:
+        res = run_cmd(f"runc state {shlex.quote(container_name)}", quiet=True, ignore_error=True)
     except Exception:
         return None
+    out = (getattr(res, 'stdout', '') or '') + "\n" + (getattr(res, 'stderr', '') or '')
+    try:
+        # runc state prints JSON with a 'pid' field on modern versions
+        j = json.loads(out)
+        pid = j.get('pid')
+        if pid:
+            return int(pid)
+    except Exception:
+        pass
+    # fallback regex: look for 'pid': N or pid: N
+    m = re.search(r'"pid"\s*:\s*(\d+)', out)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    m2 = re.search(r'pid\s*[:=]\s*(\d+)', out)
+    if m2:
+        try:
+            return int(m2.group(1))
+        except Exception:
+            pass
+    return None
 
 
+def _effective_param(key: str, ctx_entry: Optional[dict], args_obj, local_vars: dict):
+    """Return the effective single value for `key` for this run.
+
+    Priority: runtime local_vars (non-empty, single) -> ctx_entry dict -> args_obj attr.
+    If a comma-separated string is encountered, prefer the first element (current run).
+    Returns None when no value available.
+    """
+    if not key:
+        return None
+    k_underscore = key.replace('-', '_')
+    try:
+        # Prefer a local runtime value (this is usually the loop variable)
+        v_local = None
+        try:
+            v_local = local_vars.get(key)
+        except Exception:
+            v_local = None
+        if v_local is None:
+            try:
+                v_local = local_vars.get(k_underscore)
+            except Exception:
+                v_local = None
+        if v_local:
+            if isinstance(v_local, str) and ',' in v_local:
+                parts = [x.strip() for x in v_local.split(',') if x.strip()]
+                if parts:
+                    return parts[0]
+            return v_local
+
+        # Next prefer tests-file entry
+        if isinstance(ctx_entry, dict):
+            try:
+                v_entry = ctx_entry.get(key) or ctx_entry.get(k_underscore)
+            except Exception:
+                v_entry = None
+            if v_entry:
+                if isinstance(v_entry, str) and ',' in v_entry:
+                    parts = [x.strip() for x in v_entry.split(',') if x.strip()]
+                    if parts:
+                        return parts[0]
+                return v_entry
+
+        # Finally, fallback to top-level CLI args
+        try:
+            v_arg = getattr(args_obj, k_underscore, None)
+        except Exception:
+            v_arg = None
+        if v_arg:
+            if isinstance(v_arg, str) and ',' in v_arg:
+                parts = [x.strip() for x in v_arg.split(',') if x.strip()]
+                if parts:
+                    return parts[0]
+            return v_arg
+    except Exception:
+        pass
+    return None
+
+
+def _effective_pattern(ctx_entry: Optional[dict], args_obj, local_vars: dict):
+    """Return the first available pattern-like value for this run.
+
+    Checks in order: 'pattern', 'size-distribution'/'size_distribution',
+    'vehicle-pattern'/'vehicle_pattern', 'sensors-per-device'/'sensors_per_device'.
+    Uses _effective_param to apply the same resolution rules.
+    """
+    alt_keys = [
+        "pattern",
+        "size-distribution",
+        "size_distribution",
+        "vehicle-pattern",
+        "vehicle_pattern",
+        "sensors-per-device",
+        "sensors_per_device",
+    ]
+    for ak in alt_keys:
+        try:
+            v = _effective_param(ak, ctx_entry, args_obj, local_vars)
+            if v:
+                return v
+        except Exception:
+            continue
+    return None
 def sample_mem(pid: int) -> Dict[str, Optional[int]]:
     stats = {"vmrss_kb": None, "vmsize_kb": None, "pss_kb": None}
     try:
@@ -141,7 +263,35 @@ def _start_one_backend(container_name: str, repo_root: str, dry_run: bool = Fals
             pass
 
         try:
-            run_cmd(f"runc run --console-socket {shlex.quote(console_sock)} -d -b {shlex.quote(bundle_dir)} {shlex.quote(container_name)}", quiet=False, ignore_error=True)
+            # Try starting the container, retrying if console.sock is not yet
+            # available (recvtty not ready). On failure attempt to (re)start
+            # recvtty and retry a few times before giving up.
+            run_success = False
+            runc_cmd = f"runc run --console-socket {shlex.quote(console_sock)} -d -b {shlex.quote(bundle_dir)} {shlex.quote(container_name)}"
+            for attempt in range(3):
+                try:
+                    res = run_cmd(runc_cmd, quiet=False, ignore_error=True)
+                except Exception:
+                    res = None
+                rc = getattr(res, "returncode", 1) if res is not None else 1
+                if rc == 0:
+                    run_success = True
+                    break
+                # If we see a console.sock/connect error, try restarting recvtty
+                out = (getattr(res, "stdout", "") or "") if res is not None else ""
+                err = (getattr(res, "stderr", "") or "") if res is not None else ""
+                if "console.sock" in out or "console.sock" in err or "connect: no such file" in err or "connect: no such file" in out:
+                    try:
+                        recvtty_cmd = f"nohup recvtty -m null {shlex.quote(console_sock)} > /dev/null 2>&1 & echo $! > {shlex.quote(recvtty_pidfile)}"
+                        run_cmd(recvtty_cmd, quiet=True, ignore_error=True)
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                else:
+                    # Non-console.sock error; wait a bit and retry anyway
+                    time.sleep(1)
+            if not run_success:
+                print(f"Warning: failed to runc run {container_name} after retries; last rc={getattr(res, 'returncode', 'unknown')}")
         except Exception:
             pass
     except Exception:
@@ -806,12 +956,14 @@ def main():
         except Exception:
             pass
 
-        # Probe endpoint and possibly skip
+        # Probe endpoint and possibly skip. Skip probe entirely for dry-run
         try:
-            if _should_skip_due_to_probe(args_local.container, bench_cmd, args_local.client_ip if args_local.remote_client else None):
-                print(f"[host-probe] aborting run: host endpoint not reachable for bench {bench_cmd}")
-                return None, target_log, None
+            if not getattr(args_local, "dry_run", False):
+                if _should_skip_due_to_probe(args_local.container, bench_cmd, args_local.client_ip if args_local.remote_client else None):
+                    print(f"[host-probe] aborting run: host endpoint not reachable for bench {bench_cmd}")
+                    return None, target_log, None
         except Exception:
+            # In non-dry-run mode probe failures should not crash the run
             pass
 
         if args_local.dry_run:
@@ -906,6 +1058,13 @@ def main():
                 bench_stats = content.strip().splitlines()[-1] if content.strip() else ""
             return header_s, bench_stats
         except Exception:
+            return "", ""
+
+    # Backwards-compatibility: older code used `extract_stats_from_output`.
+    try:
+        extract_stats_from_output = _extract_stats_from_log
+    except Exception:
+        def extract_stats_from_output(content: Optional[str]):
             return "", ""
 
     if not args.tests_file:
@@ -1083,8 +1242,33 @@ def main():
                                 ensure_container_quiescent(name, bundle_dir, dry_run_local=dry_run)
                             except Exception:
                                 pass
-                            run_cmd(run_cmd_str, quiet=False)
-                            started.append(name)
+                            # Retry runc run when console.sock isn't ready (recvtty)
+                            run_success = False
+                            last_res = None
+                            for attempt in range(3):
+                                try:
+                                    last_res = run_cmd(run_cmd_str, quiet=False, ignore_error=True)
+                                except Exception:
+                                    last_res = None
+                                rc = getattr(last_res, 'returncode', 1) if last_res is not None else 1
+                                if rc == 0:
+                                    run_success = True
+                                    break
+                                out = (getattr(last_res, 'stdout', '') or '') if last_res is not None else ''
+                                err = (getattr(last_res, 'stderr', '') or '') if last_res is not None else ''
+                                if 'console.sock' in out or 'console.sock' in err or 'connect: no such file' in out or 'connect: no such file' in err:
+                                    try:
+                                        recvtty_cmd = f"nohup recvtty -m null {shlex.quote(console_sock)} > /dev/null 2>&1 & echo $! > {shlex.quote(recvtty_pidfile)}"
+                                        run_cmd(recvtty_cmd, quiet=True, ignore_error=True)
+                                    except Exception:
+                                        pass
+                                    time.sleep(1)
+                                else:
+                                    time.sleep(1)
+                            if not run_success:
+                                print(f"Failed to runc run {name} after retries; last rc={getattr(last_res, 'returncode', 'unknown')}")
+                            else:
+                                started.append(name)
                         except Exception as e:
                             print(f"Failed to runc run {name}: {e}")
                     else:
@@ -1656,23 +1840,34 @@ def main():
                                         parts = []
                                         if ctx_entry:
                                             # Prefer to enumerate any explicit fields present
-                                            # in the tests-file entry. Accept multiple common
-                                            # alternate keys for pattern-like parameters.
+                                            # in the tests-file entry. For video-like benches
+                                            # (resolution/framerate driven) include analysis
+                                            # specific keys rather than payload/pattern keys.
                                             try:
-                                                for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
-                                                    v = ctx_entry.get(k)
-                                                    if v is None:
-                                                        continue
-                                                    s = str(v).replace(",", "+").replace(" ", "_")
-                                                    parts.append(f"{k}={s}")
-                                                # pattern-like alternatives
-                                                alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
-                                                for ak in alt_keys:
-                                                    v = ctx_entry.get(ak)
-                                                    if v is None:
-                                                        continue
-                                                    s = str(v).replace(",", "+").replace(" ", "_")
-                                                    parts.append(f"{ak}={s}")
+                                                bt_str = str(ctx_entry.get("bench_template", "")).lower()
+                                                is_video_like = bool(ctx_entry.get("resolution") or ctx_entry.get("framerate") or ("video" in bt_str))
+                                                if is_video_like:
+                                                    for k in ("framerate", "analysis_intensity", "inference_model", "objects_per_frame"):
+                                                        v = ctx_entry.get(k)
+                                                        if v is None:
+                                                            continue
+                                                        s = str(v).replace(",", "+").replace(" ", "_")
+                                                        parts.append(f"{k}={s}")
+                                                else:
+                                                    for k in ("rps", "framerate", "payload_size", "payload_mode"):
+                                                        v = ctx_entry.get(k)
+                                                        if v is None:
+                                                            continue
+                                                        s = str(v).replace(",", "+").replace(" ", "_")
+                                                        parts.append(f"{k}={s}")
+                                                    # pattern-like alternatives
+                                                    alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
+                                                    for ak in alt_keys:
+                                                        v = ctx_entry.get(ak)
+                                                        if v is None:
+                                                            continue
+                                                        s = str(v).replace(",", "+").replace(" ", "_")
+                                                        parts.append(f"{ak}={s}")
                                             except Exception:
                                                 pass
                                         else:
@@ -1691,24 +1886,68 @@ def main():
                                                 pass
                                             try:
                                                 # include any alternate pattern-like placeholders
-                                                ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
-                                                if ap:
-                                                    parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                                # Prefer runtime 'pattern'/local value when available
+                                                try:
+                                                    ap_local = _effective_pattern(ctx_entry, args, locals())
+                                                except Exception:
+                                                    ap_local = None
+                                                if ap_local:
+                                                    parts.append(f"pattern={str(ap_local).replace(',', '+').replace(' ','_')}")
                                                 else:
                                                     parts.append(f"pattern={pattern}")
                                             except Exception:
                                                 pass
-                                            try:
-                                                parts.append(f"threads={args.threads}")
-                                            except Exception:
-                                                pass
-                                            try:
-                                                parts.append(f"duration={args.duration}")
-                                            except Exception:
-                                                pass
+                                            # omit threads/duration from dump dir name to keep names stable
 
-                                        paramstr = "__".join(parts) if parts else "default"
-                                        paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
+                                        try:
+                                            parts.append(f"resolution={fw}x{fh}")
+                                        except Exception:
+                                            pass
+                                        # Build a short, stable param string: only include
+                                        # non-empty parts and use short abbreviations so
+                                        # dump directory names stay compact and readable.
+                                        abbr = {
+                                            "framerate": "fr",
+                                            "rps": "r",
+                                            "payload": "p",
+                                            "mode": "m",
+                                            "payload_mode": "m",
+                                            "threads": "th",
+                                            "duration": "d",
+                                            "pattern": "pat",
+                                            "size-distribution": "sd",
+                                            "size_distribution": "sd",
+                                            "vehicle-pattern": "vp",
+                                            "vehicle_pattern": "vp",
+                                            "sensors-per-device": "spd",
+                                            "sensors_per_device": "spd",
+                                            "analysis_intensity": "ai",
+                                            "inference_model": "im",
+                                            "objects_per_frame": "opf",
+                                            "resolution": "res",
+                                        }
+                                        short_parts = []
+                                        for p in parts:
+                                            try:
+                                                if "=" in p:
+                                                    k, v = p.split("=", 1)
+                                                    v = v.strip()
+                                                    if not v:
+                                                        continue
+                                                    k = k.replace("-", "_")
+                                                    key = k
+                                                    ab = abbr.get(key, key)
+                                                    # compress commas to + for compactness
+                                                    v2 = v.replace(",", "+").replace(" ", "_")
+                                                    short_parts.append(f"{ab}{v2}")
+                                                else:
+                                                    s = p.strip()
+                                                    if s:
+                                                        short_parts.append(s)
+                                            except Exception:
+                                                continue
+                                        paramstr = "__".join(short_parts) if short_parts else "default"
+                                        paramstr = re.sub(r"[^A-Za-z0-9._+=-]+", "_", paramstr)
 
                                         if ctx_test_name:
                                             safe_test = re.sub(r"[^A-Za-z0-9._-]+", "_", str(ctx_test_name))
@@ -2041,18 +2280,29 @@ def main():
                                     parts = []
                                     if ctx_entry:
                                         try:
-                                            for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
-                                                v = ctx_entry.get(k)
-                                                if v is None:
+                                            # Prefer runtime loop values when available so
+                                            # dump names reflect the actual run (not the
+                                            # comma-separated list from the tests file).
+                                            keys = ("rps", "framerate", "payload_size", "payload_mode")
+                                            for k in keys:
+                                                try:
+                                                    eff = _effective_param(k, ctx_entry, args, locals())
+                                                except Exception:
+                                                    eff = None
+                                                if eff is None:
                                                     continue
-                                                s = str(v).replace(",", "+").replace(" ", "_")
+                                                s = str(eff).replace(',', '+').replace(' ', '_')
                                                 parts.append(f"{k}={s}")
+
                                             alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
                                             for ak in alt_keys:
-                                                v = ctx_entry.get(ak)
-                                                if v is None:
+                                                try:
+                                                    eff = _effective_param(ak, ctx_entry, args, locals())
+                                                except Exception:
+                                                    eff = None
+                                                if eff is None:
                                                     continue
-                                                s = str(v).replace(",", "+").replace(" ", "_")
+                                                s = str(eff).replace(',', '+').replace(' ', '_')
                                                 parts.append(f"{ak}={s}")
                                         except Exception:
                                             pass
@@ -2071,24 +2321,59 @@ def main():
                                         except Exception:
                                             pass
                                         try:
-                                            ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
-                                            if ap:
-                                                parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                            try:
+                                                ap_local = _effective_pattern(ctx_entry, args, locals())
+                                            except Exception:
+                                                ap_local = None
+                                            if ap_local:
+                                                parts.append(f"pattern={str(ap_local).replace(',', '+').replace(' ','_')}")
                                             else:
                                                 parts.append(f"pattern={pattern}")
                                         except Exception:
                                             pass
-                                        try:
-                                            parts.append(f"threads={args.threads}")
-                                        except Exception:
-                                            pass
-                                        try:
-                                            parts.append(f"duration={args.duration}")
-                                        except Exception:
-                                            pass
+                                        # omit threads/duration from dump dir name to keep names stable
 
-                                    paramstr = "__".join(parts) if parts else "default"
-                                    paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
+                                    # Shorten and filter param parts as above
+                                    abbr = {
+                                        "framerate": "fr",
+                                        "rps": "r",
+                                        "payload": "p",
+                                        "mode": "m",
+                                        "payload_mode": "m",
+                                        "threads": "th",
+                                        "duration": "d",
+                                        "pattern": "pat",
+                                        "size-distribution": "sd",
+                                        "size_distribution": "sd",
+                                        "vehicle-pattern": "vp",
+                                        "vehicle_pattern": "vp",
+                                        "sensors-per-device": "spd",
+                                        "sensors_per_device": "spd",
+                                        "analysis_intensity": "ai",
+                                        "inference_model": "im",
+                                        "objects_per_frame": "opf",
+                                        "resolution": "res",
+                                    }
+                                    short_parts = []
+                                    for p in parts:
+                                        try:
+                                            if "=" in p:
+                                                k, v = p.split("=", 1)
+                                                v = v.strip()
+                                                if not v:
+                                                    continue
+                                                k = k.replace("-", "_")
+                                                ab = abbr.get(k, k)
+                                                v2 = v.replace(",", "+").replace(" ", "_")
+                                                short_parts.append(f"{ab}{v2}")
+                                            else:
+                                                s = p.strip()
+                                                if s:
+                                                    short_parts.append(s)
+                                        except Exception:
+                                            continue
+                                    paramstr = "__".join(short_parts) if short_parts else "default"
+                                    paramstr = re.sub(r"[^A-Za-z0-9._+=-]+", "_", paramstr)
 
                                     if ctx_test_name:
                                         safe_test = re.sub(r"[^A-Za-z0-9._-]+", "_", str(ctx_test_name))
@@ -2174,15 +2459,37 @@ def main():
                                             parts = []
                                             if ctx_entry:
                                                 try:
-                                                    for k in ("rps", "framerate", "payload_size", "threads", "duration", "payload_mode"):
-                                                        v = ctx_entry.get(k)
+                                                    for k in ("rps", "framerate", "payload_size", "payload_mode"):
+                                                        v = None
+                                                        try:
+                                                            v = locals().get(k)
+                                                        except Exception:
+                                                            v = None
+                                                        if v is None:
+                                                            try:
+                                                                v = locals().get(k.replace('-', '_'))
+                                                            except Exception:
+                                                                v = None
+                                                        if v is None:
+                                                            v = ctx_entry.get(k)
                                                         if v is None:
                                                             continue
                                                         s = str(v).replace(",", "+").replace(" ", "_")
                                                         parts.append(f"{k}={s}")
                                                     alt_keys = ["pattern", "size-distribution", "size_distribution", "vehicle-pattern", "vehicle_pattern", "sensors-per-device", "sensors_per_device"]
                                                     for ak in alt_keys:
-                                                        v = ctx_entry.get(ak)
+                                                        v = None
+                                                        try:
+                                                            v = locals().get(ak)
+                                                        except Exception:
+                                                            v = None
+                                                        if v is None:
+                                                            try:
+                                                                v = locals().get(ak.replace('-', '_'))
+                                                            except Exception:
+                                                                v = None
+                                                        if v is None:
+                                                            v = ctx_entry.get(ak)
                                                         if v is None:
                                                             continue
                                                         s = str(v).replace(",", "+").replace(" ", "_")
@@ -2204,24 +2511,62 @@ def main():
                                                 except Exception:
                                                     pass
                                                 try:
-                                                    ap = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
-                                                    if ap:
-                                                        parts.append(f"pattern={str(ap).replace(',', '+').replace(' ','_')}")
+                                                    try:
+                                                        try:
+                                                            ap_local = _effective_pattern(ctx_entry, args, locals())
+                                                        except Exception:
+                                                            ap_local = None
+                                                    except Exception:
+                                                        ap_local = getattr(args, "size_distribution", None) or getattr(args, "vehicle_pattern", None) or getattr(args, "sensors_per_device", None)
+                                                    if ap_local:
+                                                        parts.append(f"pattern={str(ap_local).replace(',', '+').replace(' ','_')}")
                                                     else:
                                                         parts.append(f"pattern={pattern}")
                                                 except Exception:
                                                     pass
-                                                try:
-                                                    parts.append(f"threads={args.threads}")
-                                                except Exception:
-                                                    pass
-                                                try:
-                                                    parts.append(f"duration={args.duration}")
-                                                except Exception:
-                                                    pass
+                                                # omit threads/duration from dump dir name to keep names stable
 
-                                            paramstr = "__".join(parts) if parts else "default"
-                                            paramstr = re.sub(r"[^A-Za-z0-9._=-]+", "_", paramstr)
+                                            # Shorten and filter param parts as above
+                                            abbr = {
+                                                "framerate": "fr",
+                                                "rps": "r",
+                                                "payload": "p",
+                                                "mode": "m",
+                                                "payload_mode": "m",
+                                                "threads": "th",
+                                                "duration": "d",
+                                                "pattern": "pat",
+                                                "size-distribution": "sd",
+                                                "size_distribution": "sd",
+                                                "vehicle-pattern": "vp",
+                                                "vehicle_pattern": "vp",
+                                                "sensors-per-device": "spd",
+                                                "sensors_per_device": "spd",
+                                                "analysis_intensity": "ai",
+                                                "inference_model": "im",
+                                                "objects_per_frame": "opf",
+                                                "resolution": "res",
+                                            }
+                                            short_parts = []
+                                            for p in parts:
+                                                try:
+                                                    if "=" in p:
+                                                        k, v = p.split("=", 1)
+                                                        v = v.strip()
+                                                        if not v:
+                                                            continue
+                                                        k = k.replace("-", "_")
+                                                        ab = abbr.get(k, k)
+                                                        v2 = v.replace(",", "+").replace(" ", "_")
+                                                        short_parts.append(f"{ab}{v2}")
+                                                    else:
+                                                        s = p.strip()
+                                                        if s:
+                                                            short_parts.append(s)
+                                                except Exception:
+                                                    continue
+                                            paramstr = "__".join(short_parts) if short_parts else "default"
+                                            paramstr = re.sub(r"[^A-Za-z0-9._+=-]+", "_", paramstr)
 
                                             if ctx_test_name:
                                                 safe_test = re.sub(r"[^A-Za-z0-9._-]+", "_", str(ctx_test_name))

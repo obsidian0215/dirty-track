@@ -1,0 +1,14 @@
+{
+  "name": "elasticsearch",
+  "bench_template": "python3 experiment/migration/elasticsearch/benchmark.py --rps {rate} --duration {duration} --payload-size {payload} --threads {threads}",
+  "rps": "10,50,220",
+  "payload_size": "256B,1KB",
+  "payload_mode": "json",
+  "pattern": "random",
+  "duration": 90,
+  "threads": 2,
+  "runs": 3,
+  "container": "elasticsearch",
+  "output": "results/elasticsearch_matrix.csv",
+  "log_dir": "logs/elasticsearch"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "redis_cartelem",
+  "bench_template": "python3 experiment/migration/redis/bench_cartelem.py --threads {threads} --payload-mode {payload_mode} --rps {rate} --duration {duration} --payload-size {payload}",
+  "rps": "60,180,450",
+  "payload_size": "256B,1KB,4KB",
+  "payload_mode": "json",
+  "pattern": "random",
+  "duration": 120,
+  "threads": 4,
+  "runs": 3,
+  "container": "redis",
+  "output": "results/redis_cartelem.csv",
+  "log_dir": "logs/redis_cartelem"
+}

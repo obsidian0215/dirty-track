@@ -274,7 +274,23 @@ class SensorInfluxBench:
             "battery_level": state["battery_level"], "readings_count": state["readings_count"]
         }))
         target_size_bytes = int(self.payload_size_bytes)  # 已经是字节
-        random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
+        # Apply size distribution to vary target payload: support uniform/normal/zipf similar to other benches
+        try:
+            sd = getattr(self, "size_distribution", "uniform") or "uniform"
+        except Exception:
+            sd = "uniform"
+        if sd == "uniform":
+            random_multiplier = random.uniform(0.8, 1.2)
+        elif sd == "normal":
+            # gaussian around 1.0, clamp to [0.7,1.3]
+            val = random.gauss(1.0, 0.1)
+            random_multiplier = max(0.7, min(1.3, val))
+        elif sd == "zipf":
+            # zipf-like skew towards smaller sizes
+            random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6
+        else:
+            random_multiplier = random.uniform(0.8, 1.2)
+
         random_stop_bytes = int(target_size_bytes * random_multiplier)
 
         remaining_types = [st for st in self.sensor_types if st != primary_sensor_type]
@@ -573,6 +589,11 @@ def main():
     parser.add_argument("--environmental-noise", default=0.05, type=float,
                        help="Environmental noise level")
 
+    # Size distribution option (align with other benches)
+    parser.add_argument("--size-distribution", default="uniform", type=str,
+                       choices=["uniform", "normal", "zipf"],
+                       help="Distribution type for payload sizes (uniform, normal, zipf)")
+
     # Workload parameters
     parser.add_argument("--threads", default=4, type=int, help="Worker threads")
     parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
@@ -629,6 +650,8 @@ def main():
     )
 
     bench.payload_mode = args.payload_mode
+    # size distribution forwarding for payload sizing variability
+    bench.size_distribution = args.size_distribution
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

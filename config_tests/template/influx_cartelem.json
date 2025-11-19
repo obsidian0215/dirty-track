@@ -1,0 +1,14 @@
+{
+  "name": "influx_cartelem",
+  "bench_template": "python3 experiment/migration/influxdb/bench_cartelem.py --threads {threads} --payload-mode {payload_mode} --rps {rate} --duration {duration} --payload-size {payload} --vehicle-pattern normal_city",
+  "rps": "80,300,460",
+  "payload_size": "384B,1600B,4KB",
+  "payload_mode": "json",
+  "pattern": "random",
+  "duration": 100,
+  "threads": 4,
+  "runs": 3,
+  "container": "influxdb",
+  "output": "results/influx_cartelem_matrix.csv",
+  "log_dir": "logs/influx_cartelem"
+}
