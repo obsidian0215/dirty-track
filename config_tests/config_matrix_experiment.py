@@ -661,7 +661,13 @@ def _checkpoint_and_decode(ctx_container: str, ctx_entry: Optional[dict], repo_r
             except Exception:
                 files_ok = False
 
+            # Prefer the 'mig-scripts' helper when available for historical reasons,
+            # but fall back to the repo-provided config_tests helper if present.
             decode_script = os.path.join(repo_root, "mig-scripts", "decode_criu_memimages.py")
+            if not os.path.exists(decode_script):
+                alt = os.path.join(repo_root, "config_tests", "decode_criu_memimages.py")
+                if os.path.exists(alt):
+                    decode_script = alt
             out_path = os.path.join(abs_dump, "analysis.json")
             decode_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(decode_script)} analyze {shlex.quote(abs_dump)} --output {shlex.quote(out_path)}"
 
@@ -845,6 +851,32 @@ def main():
 
     args = parser.parse_args()
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Prefer storing outputs and logs under the repository's `config_tests/` tree
+    base_config_tests = os.path.join(repo_root, "config_tests")
+    base_results_dir = os.path.join(base_config_tests, "results")
+    base_logs_dir = os.path.join(base_config_tests, "logs")
+
+    def _ensure_config_tests_path(p: str | None, kind: str = "results") -> str:
+        """Return a path guaranteed to be rooted under `config_tests` when a
+        relative path is supplied. Absolute paths are returned unchanged."""
+        if not p:
+            return os.path.join(base_results_dir, "matrix.csv") if kind == "results" else base_logs_dir
+        if os.path.isabs(p):
+            return p
+        # If already rooted at config_tests, resolve relative to repo_root
+        if p.startswith("config_tests" + os.sep) or p.startswith("config_tests/"):
+            return os.path.join(repo_root, p)
+        # Otherwise prefix with config_tests
+        return os.path.join(base_config_tests, p)
+
+    # Normalize top-level output location into config_tests/results
+    args.output = _ensure_config_tests_path(getattr(args, "output", "results/matrix.csv"), "results")
+    try:
+        os.makedirs(os.path.dirname(args.output) or base_results_dir, exist_ok=True)
+    except Exception:
+        pass
+
 
     def _checkpoint_extra_opts_for(container_name, entry_dict=None):
         """Return a string with extra runc checkpoint options for this container/entry.
@@ -1382,7 +1414,11 @@ def main():
                 cmd.append("--dry-run")
 
             out = entry.get("output") or os.path.join("results", f"{entry.get('name','test')}_matrix.csv")
+            # ensure output path is under config_tests/results when relative
+            out = _ensure_config_tests_path(out, "results")
             logd = entry.get("log_dir") or os.path.join("logs", entry.get("name", "test"))
+            # ensure log dir is under config_tests/logs when relative
+            logd = _ensure_config_tests_path(logd, "logs")
             try:
                 os.makedirs(logd, exist_ok=True)
             except Exception:
@@ -1684,6 +1720,35 @@ def main():
                                 ts = int(time.time())
                                 safe_mode = payload_mode if payload_mode else "default"
                                 local_logname = os.path.join(args.log_dir, f"bench_{rate}_{fw}x{fh}_{safe_mode}_{pattern}_{run_idx}_{ts}.log")
+                                # Determine which alternate "pattern-like" argument
+                                # (size_distribution / vehicle_pattern / sensors_per_device)
+                                # is active for this run and map the per-run `pattern`
+                                # variable into that explicit placeholder so we pass a
+                                # single value (e.g. "uniform") to bench scripts
+                                # instead of the comma-separated list.
+                                sd_present = bool(getattr(args, "size_distribution", None))
+                                vp_present = bool(getattr(args, "vehicle_pattern", None))
+                                spd_present = bool(getattr(args, "sensors_per_device", None))
+                                # extract specific per-run effective values for pattern-like params
+                                try:
+                                    ctx_entry = locals().get('entry', None)
+                                    sd_local = _effective_param('size-distribution', ctx_entry, args, locals()) or _effective_param('size_distribution', ctx_entry, args, locals())
+                                    pass
+                                except Exception as e:
+                                    sd_local = None
+                                    pass
+                                try:
+                                    vp_local = _effective_param('vehicle-pattern', ctx_entry, args, locals()) or _effective_param('vehicle_pattern', ctx_entry, args, locals())
+                                    pass
+                                except Exception as e:
+                                    vp_local = None
+                                    pass
+                                try:
+                                    spd_local = _effective_param('sensors-per-device', ctx_entry, args, locals()) or _effective_param('sensors_per_device', ctx_entry, args, locals())
+                                    pass
+                                except Exception as e:
+                                    spd_local = None
+                                    pass
                                 fmt_kwargs = {
                                     "duration": args.duration,
                                     "threads": args.threads,
@@ -1691,9 +1756,10 @@ def main():
                                     # Provide alternate placeholders so bench templates
                                     # that expect these names won't KeyError during
                                     # `.format()` substitution. Value may be empty.
-                                    "size_distribution": getattr(args, "size_distribution", ""),
-                                    "vehicle_pattern": getattr(args, "vehicle_pattern", ""),
-                                    "sensors_per_device": getattr(args, "sensors_per_device", ""),
+                                    # Use explicit per-run effective value when available; fall back to pattern or top-level arg
+                                    "size_distribution": (sd_local if sd_local is not None else (pattern if sd_present and pattern else getattr(args, "size_distribution", ""))),
+                                    "vehicle_pattern": (vp_local if vp_local is not None else (pattern if vp_present and pattern else getattr(args, "vehicle_pattern", ""))),
+                                    "sensors_per_device": (spd_local if spd_local is not None else (pattern if spd_present and pattern else getattr(args, "sensors_per_device", ""))),
                                     "payload_mode": payload_mode,
                                     "frame_width": fw,
                                     "frame_height": fh,
@@ -1772,26 +1838,45 @@ def main():
                                     entry_local = None
                                 try:
                                     sd_val = ""
-                                    if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
-                                        sd_val = str(entry_local.get("size_distribution"))
+                                    sd_present = (isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None) or bool(getattr(args, "size_distribution", None))
+                                    # prefer the per-run effective sd_local if present
+                                    if 'sd_local' in locals() and sd_local is not None:
+                                        sd_val = str(sd_local)
+                                    elif sd_present and pattern:
+                                        sd_val = str(pattern)
                                     else:
-                                        sd_val = str(getattr(args, "size_distribution", "") or "")
+                                        if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
+                                            sd_val = str(entry_local.get("size_distribution"))
+                                        else:
+                                            sd_val = str(getattr(args, "size_distribution", "") or "")
                                 except Exception:
                                     sd_val = ""
                                 try:
                                     vp_val = ""
-                                    if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
-                                        vp_val = str(entry_local.get("vehicle_pattern"))
+                                    vp_present = (isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None) or bool(getattr(args, "vehicle_pattern", None))
+                                    if 'vp_local' in locals() and vp_local is not None:
+                                        vp_val = str(vp_local)
+                                    elif vp_present and pattern:
+                                        vp_val = str(pattern)
                                     else:
-                                        vp_val = str(getattr(args, "vehicle_pattern", "") or "")
+                                        if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
+                                            vp_val = str(entry_local.get("vehicle_pattern"))
+                                        else:
+                                            vp_val = str(getattr(args, "vehicle_pattern", "") or "")
                                 except Exception:
                                     vp_val = ""
                                 try:
                                     spd_val = ""
-                                    if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
-                                        spd_val = str(entry_local.get("sensors_per_device"))
+                                    spd_present = (isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None) or bool(getattr(args, "sensors_per_device", None))
+                                    if 'spd_local' in locals() and spd_local is not None:
+                                        spd_val = str(spd_local)
+                                    elif spd_present and pattern:
+                                        spd_val = str(pattern)
                                     else:
-                                        spd_val = str(getattr(args, "sensors_per_device", "") or "")
+                                        if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
+                                            spd_val = str(entry_local.get("sensors_per_device"))
+                                        else:
+                                            spd_val = str(getattr(args, "sensors_per_device", "") or "")
                                 except Exception:
                                     spd_val = ""
 
@@ -1964,7 +2049,25 @@ def main():
                                         safe_test_clean = re.sub(r"^bench_", "", safe_test)
                                         safe_test_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_test_clean)
                                         dump_dirname = f"{safe_container}_{safe_test_clean}__{paramstr}_dump"
-                                        dump_base = os.path.join("results", dump_dirname)
+                                        # Use the output directory parent's path as the
+                                        # base for dump directories when possible so
+                                        # the CRIU dumps live next to the output CSV
+                                        # (useful when running with --output config_tests/results/...).
+                                        try:
+                                            out_parent = os.path.dirname(args.output) or "results"
+                                        except Exception:
+                                            out_parent = "results"
+                                        try:
+                                            dump_base = os.path.join(out_parent, dump_dirname)
+                                        except Exception:
+                                            try:
+                                                out_parent = os.path.dirname(args.output) or "results"
+                                            except Exception:
+                                                out_parent = "results"
+                                            try:
+                                                dump_base = os.path.join(out_parent, dump_dirname)
+                                            except Exception:
+                                                dump_base = os.path.join("results", dump_dirname)
                                         if ctx_dry or args.dry_run:
                                             print(f"[dry-run] would create dump dir: {dump_base}")
                                         else:
@@ -2050,6 +2153,29 @@ def main():
                             local_logname = os.path.join(args.log_dir, f"bench_{rate}_{payload}_{safe_mode}_{pattern}_{run_idx}_{ts}.log")
                             # default target log path for local runs
                             target_log = local_logname
+                            # Determine which alternate "pattern-like" argument
+                            # (size_distribution / vehicle_pattern / sensors_per_device)
+                            # is active for this run and map the per-run `pattern`
+                            # variable into that explicit placeholder.
+                            sd_present = bool(getattr(args, "size_distribution", None))
+                            vp_present = bool(getattr(args, "vehicle_pattern", None))
+                            spd_present = bool(getattr(args, "sensors_per_device", None))
+                            # extract per-run effective values to avoid passing CSVs to bench scripts
+                            try:
+                                sd_local = (_effective_param('size-distribution', None, args, locals()) or _effective_param('size_distribution', None, args, locals())) if not pattern else None
+                                pass
+                            except Exception as e:
+                                sd_local = None
+                            try:
+                                vp_local = (_effective_param('vehicle-pattern', None, args, locals()) or _effective_param('vehicle_pattern', None, args, locals())) if not pattern else None
+                                pass
+                            except Exception as e:
+                                vp_local = None
+                            try:
+                                spd_local = (_effective_param('sensors-per-device', None, args, locals()) or _effective_param('sensors_per_device', None, args, locals())) if not pattern else None
+                                pass
+                            except Exception as e:
+                                spd_local = None
                             fmt_kwargs = {
                                 "duration": args.duration,
                                 "threads": args.threads,
@@ -2057,9 +2183,10 @@ def main():
                                 # Generic 'pattern' kept for backwards-compatibility.
                                 "pattern": pattern,
                                 # Alternate parameter names (may be empty)
-                                "size_distribution": getattr(args, "size_distribution", ""),
-                                "vehicle_pattern": getattr(args, "vehicle_pattern", ""),
-                                "sensors_per_device": getattr(args, "sensors_per_device", ""),
+                                # use per-run effective values if available; otherwise the pattern or top-level arg
+                                "size_distribution": (sd_local if sd_local is not None else (pattern if sd_present and pattern else getattr(args, "size_distribution", ""))),
+                                "vehicle_pattern": (vp_local if vp_local is not None else (pattern if vp_present and pattern else getattr(args, "vehicle_pattern", ""))),
+                                "sensors_per_device": (spd_local if spd_local is not None else (pattern if spd_present and pattern else getattr(args, "sensors_per_device", ""))),
                                 "payload_mode": payload_mode,
                             }
                             # Ensure objects_per_frame placeholder is present when templates reference it
@@ -2166,11 +2293,10 @@ def main():
                                 except Exception as e:
                                     print(f"Failed to scp remote log: {e}")
                                     target_log = remote_logname
-                            else:
-                                # Only attempt ssh cat when a client IP/target is provided.
-                                # Previously an empty args.client_ip produced the shell
-                                # string `ssh  cat ...` which makes ssh treat `cat` as
-                                # the hostname (hence "Could not resolve hostname cat").
+
+                                # If a client IP is provided, attempt to ssh/cat the
+                                # remote log into `content`, otherwise leave `content`
+                                # as None so a local file will be read.
                                 if getattr(args, "client_ip", None):
                                     try:
                                         client_target = args.client_ip if "@" in args.client_ip else f"root@{args.client_ip}"
@@ -2180,8 +2306,6 @@ def main():
                                         print(f"Failed to read remote log via ssh: {e}")
                                         content = None
                                 else:
-                                    # No remote client specified; leave content None so
-                                    # the local file path is used below for reading.
                                     content = None
 
                             if content is None:
@@ -2211,26 +2335,44 @@ def main():
                                 entry_local = None
                             try:
                                 sd_val = ""
-                                if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
-                                    sd_val = str(entry_local.get("size_distribution"))
+                                sd_present = (isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None) or bool(getattr(args, "size_distribution", None))
+                                if 'sd_local' in locals() and sd_local is not None:
+                                    sd_val = str(sd_local)
+                                elif sd_present and pattern:
+                                    sd_val = str(pattern)
                                 else:
-                                    sd_val = str(getattr(args, "size_distribution", "") or "")
+                                    if isinstance(entry_local, dict) and entry_local.get("size_distribution") is not None:
+                                        sd_val = str(entry_local.get("size_distribution"))
+                                    else:
+                                        sd_val = str(getattr(args, "size_distribution", "") or "")
                             except Exception:
                                 sd_val = ""
                             try:
                                 vp_val = ""
-                                if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
-                                    vp_val = str(entry_local.get("vehicle_pattern"))
+                                vp_present = (isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None) or bool(getattr(args, "vehicle_pattern", None))
+                                if 'vp_local' in locals() and vp_local is not None:
+                                    vp_val = str(vp_local)
+                                elif vp_present and pattern:
+                                    vp_val = str(pattern)
                                 else:
-                                    vp_val = str(getattr(args, "vehicle_pattern", "") or "")
+                                    if isinstance(entry_local, dict) and entry_local.get("vehicle_pattern") is not None:
+                                        vp_val = str(entry_local.get("vehicle_pattern"))
+                                    else:
+                                        vp_val = str(getattr(args, "vehicle_pattern", "") or "")
                             except Exception:
                                 vp_val = ""
                             try:
                                 spd_val = ""
-                                if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
-                                    spd_val = str(entry_local.get("sensors_per_device"))
+                                spd_present = (isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None) or bool(getattr(args, "sensors_per_device", None))
+                                if 'spd_local' in locals() and spd_local is not None:
+                                    spd_val = str(spd_local)
+                                elif spd_present and pattern:
+                                    spd_val = str(pattern)
                                 else:
-                                    spd_val = str(getattr(args, "sensors_per_device", "") or "")
+                                    if isinstance(entry_local, dict) and entry_local.get("sensors_per_device") is not None:
+                                        spd_val = str(entry_local.get("sensors_per_device"))
+                                    else:
+                                        spd_val = str(getattr(args, "sensors_per_device", "") or "")
                             except Exception:
                                 spd_val = ""
 
@@ -2255,8 +2397,11 @@ def main():
                                 "",
                                 "",
                             ]
-                            with open(args.output, "a", encoding="utf-8") as f:
-                                f.write(",".join(row) + "\n")
+                            try:
+                                with open(args.output, "a", encoding="utf-8") as f:
+                                    f.write(",".join(row) + "\n")
+                            except Exception:
+                                pass
 
                             print(f"Finished run, wrote row to {args.output}")
 
@@ -2394,7 +2539,14 @@ def main():
                                     safe_test_clean = re.sub(r"^bench_", "", safe_test)
                                     safe_test_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_test_clean)
                                     dump_dirname = f"{safe_container}_{safe_test_clean}__{paramstr}_dump"
-                                    dump_base = os.path.join("results", dump_dirname)
+                                    try:
+                                        out_parent = os.path.dirname(args.output) or "results"
+                                    except Exception:
+                                        out_parent = "results"
+                                    try:
+                                        dump_base = os.path.join(out_parent, dump_dirname)
+                                    except Exception:
+                                        dump_base = os.path.join("results", dump_dirname)
                                     if ctx_dry or args.dry_run:
                                         print(f"[dry-run] would create dump dir: {dump_base}")
                                     else:
@@ -2587,7 +2739,14 @@ def main():
                                             safe_test_clean = re.sub(r"^bench_", "", safe_test)
                                             safe_test_clean = re.sub(r"[^A-Za-z0-9._-]+", "_", safe_test_clean)
                                             dump_dirname = f"{safe_container}_{safe_test_clean}__{paramstr}_dump"
-                                            dump_base = os.path.join("results", dump_dirname)
+                                            try:
+                                                out_parent = os.path.dirname(args.output) or "results"
+                                            except Exception:
+                                                out_parent = "results"
+                                            try:
+                                                dump_base = os.path.join(out_parent, dump_dirname)
+                                            except Exception:
+                                                dump_base = os.path.join("results", dump_dirname)
                                             if ctx_dry or args.dry_run:
                                                 print(f"[dry-run] would create dump dir: {dump_base}")
                                             else:

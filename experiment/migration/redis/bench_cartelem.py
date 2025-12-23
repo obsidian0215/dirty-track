@@ -33,6 +33,7 @@ import random
 import threading
 import time
 import statistics
+from collections import Counter
 from typing import List, Optional
 import os
 import base64
@@ -137,6 +138,13 @@ class CarTelematicsBench:
         self.fail = 0
         self.lock = threading.Lock()
 
+        # device tracking and realism controls
+        self.device_counter = Counter()
+        self.device_count = 10000  # default vehicle id pool
+        self.pacing = "none"  # none|poisson
+        self.payload_mixture = None
+        self.report_realism = False
+
         # ensure payload_sizes exists and payload_mode default
         self.payload_sizes = getattr(self, "payload_sizes", [])
         self.payload_mode = "json"
@@ -236,10 +244,35 @@ class CarTelematicsBench:
 
         return round(new_speed, 2)
 
+    def sample_payload_size_from_mixture(self):
+        spec = getattr(self, 'payload_mixture', None)
+        if not spec:
+            return int(self.payload_size_bytes)
+        total = sum(w for w, lo, hi in spec)
+        p = random.random() * total
+        cum = 0.0
+        for w, lo, hi in spec:
+            cum += w
+            if p <= cum:
+                return random.randint(lo, hi)
+        w, lo, hi = spec[-1]
+        return random.randint(lo, hi)
+
+    def sample_interarrival(self):
+        if getattr(self, 'pacing', None) == 'poisson':
+            rate = getattr(self, 'max_requests_per_second', None) or 1.0
+            if not rate or rate <= 0:
+                return 0.0
+            return random.expovariate(rate)
+        return 0.0
+
     def _make_payload(self, vehicle_id: Optional[str] = None):
         """生成增强的车辆遥测数据"""
         if not vehicle_id:
-            vehicle_id = f"veh-{random.randint(1000,9999)}"
+            if getattr(self, 'device_count', None):
+                vehicle_id = f"veh-{random.randint(1, self.device_count)}"
+            else:
+                vehicle_id = f"veh-{random.randint(1000,9999)}"
 
         # 获取车辆状态
         state = self._get_vehicle_state(vehicle_id)
@@ -269,7 +302,10 @@ class CarTelematicsBench:
 
         # 数据规模扩展 (应用指定分布)
         current_size = len(json.dumps(payload))
-        base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小
+        if getattr(self, 'payload_mixture', None):
+            base_target_bytes = int(self.sample_payload_size_from_mixture())
+        else:
+            base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小
 
         # 应用分布函数
         if self.size_distribution == "uniform":
@@ -321,7 +357,15 @@ class CarTelematicsBench:
         op_start_time = time.time()
 
         while time.time() < end_time and not self._stop.is_set():
-            # 应用速率控制
+            # realism-driven pacing (poisson)
+            if getattr(self, 'pacing', None) == 'poisson' and getattr(self, 'max_requests_per_second', None):
+                try:
+                    interval = self.sample_interarrival()
+                    if interval and interval > 0:
+                        time.sleep(interval)
+                except Exception:
+                    pass
+            # 应用速率控制 (token-bucket upper bound)
             self._rate_controller(op_start_time)
 
             payload = self._make_payload(vehicle_id)
@@ -354,6 +398,11 @@ class CarTelematicsBench:
                         # update avg if adaptive
                         if self.target_db_size_mb:
                             self.avg_payload_size = sum(self.payload_sizes) / len(self.payload_sizes)
+                        # track device usage
+                        try:
+                            self.device_counter[vehicle_id] += 1
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -516,6 +565,26 @@ class CarTelematicsBench:
         logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
         logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
+        # optionally write realism report
+        if getattr(self, 'report_realism', False):
+            try:
+                ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+                outdir = os.path.join(ROOT, 'config_tests', 'results')
+                os.makedirs(outdir, exist_ok=True)
+                fn = os.path.join(outdir, f'realism_report_redis_cartelem_{int(time.time())}.json')
+                ps = {'count': len(self.payload_sizes)}
+                if self.payload_sizes:
+                    ps['avg'] = statistics.mean(self.payload_sizes)
+                    ps['median'] = statistics.median(self.payload_sizes)
+                    ps['p95'] = sorted(self.payload_sizes)[int(len(self.payload_sizes) * 0.95)]
+                top_veh = self.device_counter.most_common(10)
+                rep = {'bench': 'redis_cartelem', 'payload': ps, 'unique_vehicles': len(self.device_counter), 'top_vehicles': top_veh, 'pacing': self.pacing, 'device_count': self.device_count, 'payload_mixture': self.payload_mixture}
+                with open(fn, 'w', encoding='utf-8') as f:
+                    json.dump(rep, f, indent=2, ensure_ascii=False)
+                logger.info("Wrote realism report %s", fn)
+            except Exception as e:
+                logger.debug("Failed to write realism report: %s", e)
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Car Telematics Redis Benchmark")
 
@@ -568,6 +637,12 @@ def main():
     parser.add_argument("--stream-maxlen", type=int,
                         help="Optional: Maximum Redis Stream length (complements TTL, use as needed)")
 
+    # Realism controls
+    parser.add_argument("--device-count", type=int, default=None, help="Total number of vehicles/devices")
+    parser.add_argument("--pacing", default="none", choices=["none","poisson"], help="Traffic pacing mode (none|poisson)")
+    parser.add_argument("--payload-mixture", default=None, type=str, help="payload mixture e.g. '70:50-200,25:512-1024,5:3500-8000'")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism JSON report to config_tests/results on completion")
+
     args = parser.parse_args()
 
     # 计算默认池大小
@@ -594,6 +669,21 @@ def main():
     # parse canonical unit-aware --payload-size (string) into bytes
     payload_bytes = parse_size_token(args.payload_size)
 
+    def parse_mixture_spec(spec: str):
+        parts = [p.strip() for p in spec.split(',') if p.strip()]
+        out = []
+        for part in parts:
+            try:
+                w, rng = part.split(':', 1)
+                lo, hi = rng.split('-', 1)
+                wv = float(w)
+                lval = parse_size_token(lo)
+                hval = parse_size_token(hi)
+                out.append((wv, int(lval), int(hval)))
+            except Exception:
+                raise ValueError(f"invalid payload_mixture spec: {part}")
+        return out
+
     bench = CarTelematicsBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
@@ -616,6 +706,13 @@ def main():
         stream_maxlen=args.stream_maxlen
     )
     bench.payload_mode = args.payload_mode
+
+    # realism assignments
+    bench.device_count = args.device_count or bench.device_count
+    bench.pacing = args.pacing
+    bench.report_realism = args.report_realism
+    bench.payload_mixture = parse_mixture_spec(args.payload_mixture) if args.payload_mixture else None
+
     bench.run(threads=args.threads, duration=args.duration)
 
 if __name__ == "__main__":

@@ -32,6 +32,8 @@ import random
 import threading
 import time
 import statistics
+import math
+import os
 from typing import List, Optional, Dict, Any
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
@@ -90,13 +92,29 @@ class SensorInfluxBench:
                  # 数据生命周期管理
                  retention_policy: str = "1h",
                  # 消息速率控制
-                 max_requests_per_second: Optional[int] = None):
+                 max_requests_per_second: Optional[int] = None,
+                 # Realism extensions
+                 device_count: int = 0,
+                 pacing: bool = False,
+                 payload_mixture: bool = False,
+                 report_realism: bool = False):
 
         self.influx_url = influx_url
         self.token = token
         self.org = org
         self.bucket = bucket
         self._stop = threading.Event()
+
+        # Realism config
+        self.device_count = device_count
+        self.pacing = pacing
+        self.payload_mixture = payload_mixture
+        self.report_realism = report_realism
+        self.device_counter = {}  # Track device usage for report
+        self.interarrivals = []   # Track inter-arrival times for report
+        self.payload_sizes_tracked = [] # Track payload sizes for report
+        self.last_gen_time = None
+        self._realism_profile = None # Will be set externally if needed
 
         # Data scale extension config (bytes)
         self.payload_size_bytes = payload_size_bytes
@@ -235,10 +253,39 @@ class SensorInfluxBench:
 
         return round(final_reading, 3)
 
-    def _generate_sensor_data(self) -> List[Point]:
+    def sample_interarrival(self) -> float:
+        """Sample inter-arrival time (seconds). If pacing is on, use Poisson process."""
+        if not self.pacing:
+            return 0.0
+
+        # If using external profile
+        if self._realism_profile:
+            return self._realism_profile.next_interarrival()
+
+        # Default internal Poisson logic if no profile but pacing=True
+        target_rate = self._rate_limiter.rate if self._rate_limiter.rate else 100.0
+        # Poisson inter-arrival: -ln(U) / lambda
+        return -math.log(1.0 - random.random()) / target_rate
+
+    def sample_payload_size_from_mixture(self) -> int:
+        """Sample payload size from a mixture model if enabled."""
+        if self._realism_profile:
+            return self._realism_profile.sample_payload_size()
+
+        if not self.payload_mixture:
+            return self.payload_size_bytes
+
+        # Simple internal mixture if no profile: 80% small (base), 20% large (5x)
+        if random.random() < 0.8:
+            return self.payload_size_bytes
+        else:
+            return self.payload_size_bytes * 5
+
+    def _generate_sensor_data(self, device_id: Optional[str] = None, target_size_override: Optional[int] = None) -> List[Point]:
         """Generate enhanced sensor data points"""
         points = []
-        device_id = f"dev-{random.randint(1, self.sensors_per_device * 10)}"
+        if not device_id:
+            device_id = f"dev-{random.randint(1, self.sensors_per_device * 10)}"
         base_timestamp = int(time.time() * 1000000000)  # nanoseconds
 
         # Primary sensor readings
@@ -273,7 +320,7 @@ class SensorInfluxBench:
             "sensor_id": primary_sensor_id, "value": value,
             "battery_level": state["battery_level"], "readings_count": state["readings_count"]
         }))
-        target_size_bytes = int(self.payload_size_bytes)  # 已经是字节
+        target_size_bytes = int(target_size_override) if target_size_override else int(self.payload_size_bytes)  # 已经是字节
         # Apply size distribution to vary target payload: support uniform/normal/zipf similar to other benches
         try:
             sd = getattr(self, "size_distribution", "uniform") or "uniform"
@@ -423,7 +470,14 @@ class SensorInfluxBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
-            # 速率控制检查
+            # Pacing
+            interval = self.sample_interarrival()
+            if interval > 0:
+                time.sleep(interval)
+                if self.report_realism:
+                    with self.lock:
+                        self.interarrivals.append(interval)
+            # enforce upper bound (token bucket)
             self._rate_control()
 
             try:
@@ -438,21 +492,36 @@ class SensorInfluxBench:
                         self._execute_minmax_query()
                 else:
                     # Write sensor data
-                    points = self._generate_sensor_data()
+                    dev = None
+                    if self.device_count > 0:
+                        idx = random.randint(1, self.device_count)
+                        dev = f"sensor-gateway-{idx:04d}"
+                    elif hasattr(self, '_realism_profile') and self._realism_profile:
+                        dev = self._realism_profile.choose_device_id()
+
+                    if self.report_realism and dev:
+                        with self.lock:
+                            self.device_counter[dev] = self.device_counter.get(dev, 0) + 1
+
+                    size_override = self.sample_payload_size_from_mixture()
+                    if self.report_realism:
+                        with self.lock:
+                            self.payload_sizes_tracked.append(size_override)
+
+                    points = self._generate_sensor_data(device_id=dev, target_size_override=size_override)
                     self.write_api.write(bucket=self.bucket, org=self.org, record=points)
                     lat = (time.perf_counter() - start) * 1000.0
 
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
-                    # record estimated payload size if available
-                    try:
-                        p = int(getattr(self, '_last_payload_estimate', 0))
-                        self.payload_sizes.append(p)
-                        if len(self.payload_sizes) > 1000:
-                            self.payload_sizes.pop(0)
-                    except Exception:
-                        pass
+
+                    # Track payload size for stats
+                    if not self.report_realism:
+                        with self.lock:
+                            self.payload_sizes.append(size_override)
+                            if len(self.payload_sizes) > 1000:
+                                self.payload_sizes.pop(0)
             except Exception as e:
                 logger.debug("Operation failed: %s", e)
                 with self.lock:
@@ -569,6 +638,29 @@ class SensorInfluxBench:
         logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
         logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
+        if self.report_realism:
+            try:
+                import json
+                report = {
+                    "bench": "influx_sensoragg",
+                    "timestamp": time.time(),
+                    "duration": duration,
+                    "total_ops": total,
+                    "ops_per_sec": ops_per_sec,
+                    "interarrivals": self.interarrivals,
+                    "payload_sizes": self.payload_sizes_tracked,
+                    "device_counts": self.device_counter
+                }
+                # Write to config_tests/results/realism_report_influx_sensoragg_<ts>.json
+                out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../config_tests/results'))
+                os.makedirs(out_dir, exist_ok=True)
+                fn = os.path.join(out_dir, f"realism_report_influx_sensoragg_{int(time.time())}.json")
+                with open(fn, 'w') as f:
+                    json.dump(report, f)
+                logger.info(f"Wrote realism report to {fn}")
+            except Exception as e:
+                logger.error(f"Failed to write realism report: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Sensor Aggregator InfluxDB Benchmark")
@@ -608,6 +700,14 @@ def main():
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
                         type=int, help="Maximum requests per second (default: no limit)")
 
+    parser.add_argument("--realism", default=None, help="Realism profile name (e.g., edge_basic) or 'edge_bursty')")
+
+    # Realism extensions
+    parser.add_argument("--device-count", default=0, type=int, help="Limit number of unique devices (0=unlimited)")
+    parser.add_argument("--pacing", action="store_true", help="Enable Poisson pacing")
+    parser.add_argument("--payload-mixture", action="store_true", help="Enable payload size mixture")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism report JSON")
+
     args = parser.parse_args()
 
     # Parse sensor types
@@ -646,12 +746,27 @@ def main():
         # 数据生命周期管理
         retention_policy=args.retention_policy,
         # 消息速率控制
-        max_requests_per_second=args.rps
+        max_requests_per_second=args.rps,
+        # Realism extensions
+        device_count=args.device_count,
+        pacing=args.pacing,
+        payload_mixture=args.payload_mixture,
+        report_realism=args.report_realism
     )
 
     bench.payload_mode = args.payload_mode
     # size distribution forwarding for payload sizing variability
     bench.size_distribution = args.size_distribution
+
+    # optional realism profile (prototype)
+    if args.realism:
+        try:
+            from experiment.migration.realistic import load_profile
+            bench._realism_profile = load_profile(args.realism)
+        except Exception:
+            bench._realism_profile = None
+    else:
+        bench._realism_profile = None
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

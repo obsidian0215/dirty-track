@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Video Cache Benchmark Script
+Realistic Video Cache Benchmark Script with Frame Size and Frame Rate Calculation
+增强版视频缓存基准测试脚本，负载大小基于图像帧大小、帧率和分析复杂度自动计算
 
-Full-featured video cache benchmark tool, includes:
-- Data scaling: Dynamic load size, object count control
+Full-featured video cache benchmark tool with realistic payload sizes, includes:
+- Realistic frame size calculations: HD/4K resolutions based on camera types
+- Framerate-based load distribution: 30fps/60fps processing simulation
+- Dynamic payload scaling: Based on object count, frame resolution, and analysis types
 - Data authenticity: Camera geo-distribution, AI model characteristics, multi-class object detection
 - Connection timeout config: Connection pooling, retry mechanism, timeout control
 - Periodic monitoring: Real-time TPS and latency statistics
 
+REALISTIC PAYLOAD CALCULATION:
+- Base frame size: 1920x1080 (HD), 3840x2160 (4K)
+- Per-object overhead: ~200-500B per object for coordinates, confidence, tracking data
+- Analysis overhead: Multiplies per frame resolution and object count
+- Framerate impact: Higher frame rates mean more data over time
+
 EXTENDED USAGE:
-    --payload-size: Target payload size (supports units, e.g., 256B, 16KB, default 1KB)
-  --objects-per-frame: Number of objects per frame (default 3)
-  --camera-count: Camera count in simulation (default 10)
-  --inference-model: AI inference model type (yolov5_small/medium/ssd_mobile)
-  --connect-timeout: Connection timeout in seconds (default 5)
-  --pool-size: Connection pool size (default CPU cores * 4)
+  --frame-width: Frame width (default: 1920)
+  --frame-height: Frame height (default: 1080)
+  --framerate: Target framerate in fps (default: 30)
+  --analysis-intensity: Analysis complexity (mechanical/objective/comprehensive)
 """
 import argparse
 import json
@@ -26,11 +33,11 @@ import threading
 import time
 import statistics
 import sys
+import math
 from typing import List, Optional, Dict, Any
 import redis
 import os
 import base64
-import re
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -39,18 +46,25 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(ch)
 
-class VideoCacheEnhancedBench:
-    """Video cache benchmark test"""
+class VideoCacheRealisticBench:
+    """Video cache benchmark test with realistic frame size calculations"""
 
     def __init__(self, redis_host: str = "127.0.0.1", redis_port: int = 6379,
-              cache_ttl: int = 60, persist_hash: str = "video_inference_persist",
-              # Data scaling expansion (bytes)
-              payload_size_bytes: int = 2048, objects_per_frame: int = 3,
-              # Data authenticity configuration
-              camera_count: int = 10, inference_model: str = "yolov5_medium",
+                 cache_ttl: int = 60, persist_hash: str = "video_inference_persist",
+                 # Realistic frame parameters
+                 frame_width: int = 1920, frame_height: int = 1080,
+                 framerate: int = 30, analysis_intensity: str = "comprehensive",
+                 objects_per_frame: int = 8,
+                 # Data authenticity configuration
+                 camera_count: int = 100, inference_model: str = "yolov5_medium",
                  # Connection timeout configuration
                  connect_timeout: int = 5, socket_timeout: int = 5,
-                 pool_timeout: int = 10, pool_size: Optional[int] = None):
+                 pool_timeout: int = 10, pool_size: Optional[int] = None,
+                 # Realism extensions
+                 device_count: int = 0,
+                 pacing: bool = False,
+                 payload_mixture: bool = False,
+                 report_realism: bool = False):
 
         # Basic configuration
         self.redis_host = redis_host
@@ -58,9 +72,33 @@ class VideoCacheEnhancedBench:
         self.cache_ttl = cache_ttl
         self.persist_hash = persist_hash
 
-        # Data scaling expansion configuration (bytes)
-        self.payload_size_bytes = int(payload_size_bytes)
+        # Realism config
+        self.device_count = device_count
+        self.pacing = pacing
+        self.payload_mixture = payload_mixture
+        self.report_realism = report_realism
+        self.device_counter = {}
+        self.interarrivals = []
+        self.payload_sizes_tracked = []
+        self._realism_profile = None
+
+        # Realistic frame configuration
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.framerate = framerate
+        self.analysis_intensity = analysis_intensity
         self.objects_per_frame = objects_per_frame
+        # Calculate realistic payload size based on frame parameters (bytes)
+        self.base_payload_size_bytes = int(self._calculate_realistic_payload_size() * 1024)
+
+        # Analysis intensity multipliers
+        self.intensity_multipliers = {
+            "mechanical": 0.5,    # Basic detection only
+            "objective": 1.0,     # Standard analysis
+            "comprehensive": 2.0  # Full AI analysis suite
+        }
+        self.intensity_multiplier = self.intensity_multipliers.get(self.analysis_intensity, 1.0)
+        self.effective_payload_size_bytes = int(self.base_payload_size_bytes * self.intensity_multiplier)
 
         # Data authenticity configuration
         self.camera_count = camera_count
@@ -81,10 +119,6 @@ class VideoCacheEnhancedBench:
         # Monitoring configuration
         self.monitor_interval = 1.0
         self.last_report_time = 0
-        self.last_success_count = 0
-
-        # Initialize camera positions
-        self._init_camera_positions()
 
         # Statistics
         self.latencies_ms: List[float] = []
@@ -94,6 +128,75 @@ class VideoCacheEnhancedBench:
         # payload sizing and mode
         self.payload_sizes: List[int] = []
         self.payload_mode = "json"
+
+        # Initialize camera positions
+        self._init_camera_positions()
+
+        # Log effective configuration after initialization
+        logger.info("Realistic configuration - Frame: %dx%d, Framerate: %dfps, Analysis: %s",
+            self.frame_width, self.frame_height, self.framerate, self.analysis_intensity)
+        logger.info("Calculated payload size: %.1fKB per frame (base: %.1fKB, intensity: %.2f)",
+            self.effective_payload_size_bytes / 1024.0, self.base_payload_size_bytes / 1024.0, self.intensity_multiplier)
+
+    def sample_interarrival(self) -> float:
+        """Sample inter-arrival time (seconds). If pacing is on, use Poisson process."""
+        if not self.pacing:
+            return 0.0
+        
+        if self._realism_profile:
+            return self._realism_profile.next_interarrival()
+            
+        # Default internal Poisson logic using framerate as target rate
+        target_rate = float(self.framerate) if self.framerate > 0 else 30.0
+        return -math.log(1.0 - random.random()) / target_rate
+
+    def sample_payload_size_from_mixture(self) -> int:
+        """Sample payload size from a mixture model if enabled."""
+        if self._realism_profile:
+            return self._realism_profile.sample_payload_size()
+            
+        if not self.payload_mixture:
+            return self.effective_payload_size_bytes
+            
+        # Mixture: 80% base size, 20% large (keyframe/full analysis)
+        if random.random() < 0.8:
+            return self.effective_payload_size_bytes
+        else:
+            return self.effective_payload_size_bytes * 3
+
+    def _calculate_realistic_payload_size(self) -> float:
+        """Calculate realistic payload size based on frame parameters
+
+        Base calculation:
+        - Frame resolution factor: (width * height) / (1920 * 1080)
+        - Per-object overhead: ~300B per object for coordinates, confidence, tracking
+        - Frame metadata overhead: ~500B base + frame resolution factor
+        - Compression factor: Realistic JSON vs binary difference
+        """
+        # Base resolution reference (1920x1080)
+        reference_pixels = 1920 * 1080
+        current_pixels = self.frame_width * self.frame_height
+        resolution_factor = current_pixels / reference_pixels
+
+        # Base metadata size (JSON overhead for frame data)
+        base_metadata_kb = 1.5  # Base frame metadata, timestamps, etc.
+
+        # Resolution-contributed size (higher resolution = more detailed analysis)
+        resolution_contribution_kb = (current_pixels / 1000000) * 0.8  # ~0.8KB per megapixel
+
+        # Object count contribution (each object adds metadata)
+        # Average realistic object count based on frame
+        base_object_count = self.objects_per_frame  # Use configured objects per frame
+        object_contribution_kb = base_object_count * 0.25  # ~250B per object for coords/confidence/metadata
+
+        # Framerate consideration (higher fps might need more processing metadata)
+        framerate_factor = min(self.framerate / 30.0, 2.0)  # Up to 2x at 60fps
+        framerate_contribution_kb = base_metadata_kb * (framerate_factor - 1) * 0.1
+
+        calculated_size_kb = (base_metadata_kb + resolution_contribution_kb +
+                            object_contribution_kb + framerate_contribution_kb)
+
+        return max(calculated_size_kb, 1.0)  # Minimum 1KB
 
     def _init_connection_pool(self):
         """Initialize Redis connection pool"""
@@ -133,9 +236,8 @@ class VideoCacheEnhancedBench:
 
         for i in range(self.camera_count):
             # Random distribution of cameras within urban area
-            lat_offset = (random.random() - 0.5) * 0.03  # +/-15km
-            lng_offset = (random.random() - 0.5) * 0.03
-
+            lat_offset = (random.random() - 0.5) * 0.08  # +/-40km for larger city area
+            lng_offset = (random.random() - 0.5) * 0.08
             self.camera_positions[f"cam-{i+1}"] = {
                 "lat": base_lat + lat_offset,
                 "lng": base_lng + lng_offset
@@ -180,11 +282,15 @@ class VideoCacheEnhancedBench:
 
         return objects
 
-    def _make_result(self) -> dict:
-        """Generate enhanced video inference results"""
+    def _make_result(self, camera_id_override: Optional[str] = None) -> dict:
+        """Generate realistic video inference results based on frame parameters"""
         # Select random camera
-        camera_id = f"cam-{random.randint(1, self.camera_count)}"
-        camera_pos = self.camera_positions[camera_id]
+        if camera_id_override:
+            camera_id = camera_id_override
+        else:
+            camera_id = f"cam-{random.randint(1, self.camera_count)}"
+        
+        camera_pos = self.camera_positions.get(camera_id, {"lat": 0.0, "lng": 0.0})
 
         # Generate basic inference results
         frame_id = f"frame-{random.randint(1000000, 9999999)}"
@@ -193,22 +299,26 @@ class VideoCacheEnhancedBench:
         # Generate object detection results
         objects = self._generate_inference_objects()
 
-        # Calculate inference time (based on model type)
+        # Calculate inference time (based on model type and frame resolution)
         model_processing_times = {
             "yolov5_small": random.gauss(50, 10),
             "yolov5_medium": random.gauss(80, 15),
             "ssd_mobile": random.gauss(40, 8)
         }
-        inference_time = max(10, model_processing_times.get(self.inference_model, 50))
+        # Resolution affects processing time
+        resolution_factor = (self.frame_width * self.frame_height) / (1920 * 1080)
+        base_inference_time = model_processing_times.get(self.inference_model, 50)
+        inference_time = base_inference_time * (0.8 + 0.2 * resolution_factor)
 
         result = {
             "frame_id": frame_id,
             "timestamp": timestamp,
+            "framerate": self.framerate,
             "inference_model": self.inference_model,
             "inference_time_ms": round(inference_time, 2),
             "total_objects": len(objects),
             "objects": objects,
-            "frame_size": {"width": 1920, "height": 1080},
+            "frame_size": {"width": self.frame_width, "height": self.frame_height},
             "camera_id": camera_id,
             "location": {
                 "lat": round(camera_pos["lat"], 6),
@@ -218,46 +328,91 @@ class VideoCacheEnhancedBench:
                 "brightness": round(random.uniform(0.3, 0.9), 2),
                 "contrast": round(random.uniform(0.4, 1.0), 2),
                 "motion_blur": random.choice([0, 0, 0, 1])  # Most frames have no motion blur
-            }
+            },
+            "analysis_intensity": self.analysis_intensity
         }
 
-        # Data scaling expansion - Add additional video analysis data
-        current_size = len(json.dumps(result))
-        target_size_bytes = int(self.payload_size_bytes)
-
-        if current_size < target_size_bytes:
-            # Add granular analysis results
-            analysis_types = ["pose_estimation", "anomaly_detection", "scene_classification", "behavior_analysis"]
+        # Realistic analysis data generation based on intensity
+        if self.analysis_intensity in ["objective", "comprehensive"]:
             additional_analysis = {}
 
-            while len(json.dumps({**result, "detailed_analysis": additional_analysis})) < target_size_bytes:
-                analysis_type = random.choice(analysis_types)
-                if analysis_type == "pose_estimation":
-                    keypoint_count = 17  # COCO format keypoint count
-                    additional_analysis["pose_estimation"] = {
-                        "person_count": len([obj for obj in objects if obj["class"] == "person"]),
-                        "keypoints": [[round(random.random(), 3) for _ in range(3)] for _ in range(keypoint_count)]
-                    }
-                elif analysis_type == "anomaly_detection":
-                    additional_analysis["anomaly_detection"] = {
-                        "score": round(random.uniform(0, 1), 3),
-                        "anomalies": ["crowd_gathering", "wrong_direction", "object_falling"][:random.randint(0, 2)]
-                    }
-                elif analysis_type == "behavior_analysis":
-                    additional_analysis["behavior_analysis"] = {
-                        "person_behaviors": ["standing", "walking", "running", "interacting"][:random.randint(1, 4)],
-                        "group_activities": random.choice(["gathering", "dispersion", "normal_flow"])
-                    }
-                else:  # scene_classification
-                    scenes = ["urban_street", "parking_lot", "crosswalk", "highway"]
-                    additional_analysis["scene_classification"] = {
-                        "primary_scene": random.choice(scenes),
-                        "confidence": round(random.uniform(0.8, 0.99), 3),
-                        "scene_attributes": ["busy", "calm", "well_lit", "crowded"][:random.randint(1, 4)]
+            # Pose estimation (if people present)
+            people_count = len([obj for obj in objects if obj["class"] == "person"])
+            if people_count > 0:
+                keypoint_count = 17
+                person_estimators = []
+                for _ in range(people_count):
+                    person_estimators.append({
+                        "confidence": round(random.uniform(0.5, 0.95), 3),
+                        "keypoints": [round(random.random(), 3) for _ in range(keypoint_count * 3)]
+                    })
+                additional_analysis["pose_estimation"] = {
+                    "person_count": people_count,
+                    "person_estimators": person_estimators[:min(people_count, self.intensity_multiplier)]
+                }
+
+            if self.analysis_intensity == "comprehensive":
+                # Additional comprehensive analysis
+                additional_analysis["scene_analysis"] = {
+                    "crowd_density": round(random.uniform(0, 1), 3),
+                    "traffic_flow": random.choice(["free", "moderate", "heavy", "jammed"]),
+                    "anomaly_score": round(random.uniform(0, 1), 3)
+                }
+
+                # Enhanced object tracking
+                if len(objects) > 0:
+                    tracking_data = []
+                    for obj in objects[:int(len(objects) * 0.7)]:  # Track 70% of objects
+                        track_length = random.randint(2, self.framerate // 10)  # Track for ~1-3 seconds
+                        trajectory = []
+                        for step in range(track_length):
+                            trajectory.append({
+                                "x": obj["bbox"][0] + random.gauss(0, 5),
+                                "y": obj["bbox"][1] + random.gauss(0, 5),
+                                "timestamp": timestamp + step * (1000 // self.framerate)
+                            })
+                        tracking_data.append({
+                            "object_id": obj["tracking_id"],
+                            "trajectory": trajectory
+                        })
+                    additional_analysis["trajectory_tracking"] = {
+                        "track_count": len(tracking_data),
+                        "trajectories": tracking_data
                     }
 
             if additional_analysis:
-                result["detailed_analysis"] = additional_analysis
+                result["additional_analysis"] = additional_analysis
+
+        # Dynamic payload expansion to meet target size
+        current_size = len(json.dumps(result))
+        target_size_bytes = int(self.effective_payload_size_bytes)
+
+        if current_size < target_size_bytes:
+            if "additional_analysis" not in result:
+                result["additional_analysis"] = {}
+
+            # Fill up to target size with realistic additional data
+            while len(json.dumps(result)) < target_size_bytes:
+                if random.random() < 0.5:
+                    # Add more detailed frame analysis
+                    analysis_key = f"frame_analysis_{random.randint(1000, 9999)}"
+                    result["additional_analysis"][analysis_key] = {
+                        "analysis_type": "detailed_" + random.choice(["texture", "color_histogram", "edges"]),
+                        "data_points": [[round(random.random(), 3) for _ in range(10)] for _ in range(10)],
+                        "confidence": round(random.uniform(0.7, 0.95), 3)
+                    }
+                else:
+                    # Add performance metrics
+                    metric_key = f"process_metrics_{random.randint(1000, 9999)}"
+                    result["additional_analysis"][metric_key] = {
+                        "stages": [
+                            {"stage": "preprocessing", "time_ms": random.gauss(10, 2)},
+                            {"stage": "inference", "time_ms": random.gauss(60, 8)},
+                            {"stage": "postprocessing", "time_ms": random.gauss(15, 3)}
+                        ],
+                        "memory_usage_mb": random.gauss(500, 50),
+                        "cpu_usage_percent": random.gauss(40, 8)
+                    }
 
         return result
 
@@ -293,131 +448,170 @@ class VideoCacheEnhancedBench:
                     self.last_success_count = success_count
 
     def _worker(self, duration: float, write_pct: int, fallback_rate: int,
-               do_get_pct: int, pool):
-        """Worker thread containing all read/write logic"""
+               do_get_pct: int, pool, total_threads: int):
+        """Worker thread containing all read/write logic with realistic framerate control"""
         r = redis.Redis(connection_pool=pool, decode_responses=True)
         end_time = time.time() + duration
 
-        op_count = 0
-        last_debug_time = time.time()
+        # Improved frame generation with higher concurrency
+        # Allow more cameras per thread and optimize processing intervals
+        cameras_per_thread = max(1, self.camera_count // total_threads)  # Distribute cameras across threads
+
+        # Calculate target operations per second for the thread based on framerate
+        target_ops_per_second = self.framerate * cameras_per_thread
+        min_inter_operation_delay = 1.0 / target_ops_per_second  # Minimum delay between operations
+        last_operation_time = time.time()
+
+        logger.info(f"Thread targeting {target_ops_per_second:.1f} ops/sec (cameras: {cameras_per_thread}, effective: {1.0/min_inter_operation_delay:.3f}s)")
 
         while time.time() < end_time and not self._stop.is_set():
+            current_time = time.time()
 
-            op_rand = random.randint(1, 100)
-            start = time.perf_counter()
+            # Control operation rate based on target framerate
+            should_run = False
+            if self.pacing:
+                interval = self.sample_interarrival()
+                if interval > 0:
+                    time.sleep(interval)
+                    if self.report_realism:
+                        with self.lock:
+                            self.interarrivals.append(interval)
+                should_run = True
+            else:
+                time_since_last_op = current_time - last_operation_time
+                if time_since_last_op >= min_inter_operation_delay:
+                    should_run = True
+                    last_operation_time = time.time()
 
-            # Periodic debug output to verify thread is active
-            current_debug_time = time.time()
-            if current_debug_time - last_debug_time >= 5.0:  # Every 5 seconds
-                logger.info(f"Thread active: processed {op_count} operations so far (total success: {self.success})")
-                last_debug_time = current_debug_time
+            if should_run:
+                # Process operation with rate limiting
+                op_rand = random.randint(1, 100)
+                start = time.perf_counter()
 
-            try:
-                if op_rand <= write_pct:
-                    # Write path
-                    logger.debug(f"Executing write operation (thread)")
-                    res = self._make_result()
-                    key = res["frame_id"]
-                    payload = json.dumps(res)
+                try:
+                    if op_rand <= write_pct:
+                        # Write path - simulate video frame processing
+                        # Reduce AI inference time from ~17ms to ~3-5ms to allow higher throughput
+                        processing_delay = random.gauss(2.0, 1.0) / 1000.0  # ~2ms AI inference for high throughput
+                        time.sleep(processing_delay)  # Simulate AI processing time
 
-                    if random.randint(1, 100) <= fallback_rate:
-                        # Fallback to persistent storage
-                        try:
+                        # Device selection
+                        dev = None
+                        if self.device_count > 0:
+                            idx = random.randint(1, self.device_count)
+                            dev = f"cam-{idx}"
+                        elif hasattr(self, '_realism_profile') and self._realism_profile:
+                            dev = self._realism_profile.choose_device_id()
+                        
+                        if self.report_realism and dev:
+                            with self.lock:
+                                self.device_counter[dev] = self.device_counter.get(dev, 0) + 1
+
+                        res = self._make_result(camera_id_override=dev)
+                        
+                        # Payload mixture / size override
+                        size_override = self.sample_payload_size_from_mixture()
+                        if self.report_realism:
+                            with self.lock:
+                                self.payload_sizes_tracked.append(size_override)
+                        
+                        # Pad if needed (for JSON mode)
+                        if getattr(self, "payload_mode", "json") == "json":
+                            payload = json.dumps(res)
+                            current_len = len(payload.encode("utf-8"))
+                            if size_override > current_len:
+                                pad_len = size_override - current_len
+                                # Approximate padding
+                                res["_padding"] = "x" * max(0, pad_len - 20) 
+                                payload = json.dumps(res)
+                        else:
+                            # Binary mode handled below
+                            payload = ""
+
+                        key = res["frame_id"]
+
+                        if random.randint(1, 100) <= fallback_rate:
+                            # Fallback to persistent storage
                             if getattr(self, "payload_mode", "json") == "json":
                                 r.hset(self.persist_hash, key, payload)
                                 payload_size = len(payload.encode("utf-8"))
                             else:
-                                target_bytes = int(self.payload_size_bytes)
+                                target_bytes = size_override if size_override else int(self.effective_payload_size_bytes)
                                 raw = os.urandom(max(1, target_bytes))
                                 b64 = base64.b64encode(raw).decode("ascii")
                                 r.hset(self.persist_hash, key, b64)
                                 payload_size = len(raw)
-
                             lat = (time.perf_counter() - start) * 1000.0
                             with self.lock:
                                 self.latencies_ms.append(lat)
                                 self.success += 1
-                                op_count += 1
+                                if not self.report_realism:
+                                    self.payload_sizes.append(payload_size)
                             try:
                                 self.payload_sizes.append(int(payload_size))
                                 if len(self.payload_sizes) > 1000:
                                     self.payload_sizes.pop(0)
                             except Exception:
                                 pass
-                            logger.debug(f"HSET operation success: {self.success} operations")
-                        except Exception as e:
-                            logger.warning(f"HSET operation failed: {e}")
-                    else:
-                        # Normal cache write
-                        try:
+                        else:
+                            # Normal cache write
                             if getattr(self, "payload_mode", "json") == "json":
                                 r.set(key, payload, ex=self.cache_ttl)
                                 payload_size = len(payload.encode("utf-8"))
                             else:
-                                target_bytes = int(self.payload_size_bytes)
+                                target_bytes = int(self.effective_payload_size_bytes)
                                 raw = os.urandom(max(1, target_bytes))
                                 b64 = base64.b64encode(raw).decode("ascii")
                                 r.set(key, b64, ex=self.cache_ttl)
                                 payload_size = len(raw)
-
                             lat = (time.perf_counter() - start) * 1000.0
                             with self.lock:
                                 self.latencies_ms.append(lat)
                                 self.success += 1
-                                op_count += 1
                             try:
                                 self.payload_sizes.append(int(payload_size))
                                 if len(self.payload_sizes) > 1000:
                                     self.payload_sizes.pop(0)
                             except Exception:
                                 pass
-                            logger.debug(f"SET operation success: {self.success} operations")
-                        except Exception as e:
-                            logger.warning(f"SET operation failed: {e}")
 
-                        # Optional immediate read verification
-                        if random.randint(1, 100) <= do_get_pct:
-                            try:
+                            # Optional immediate read verification
+                            if random.randint(1, 100) <= do_get_pct:
                                 gstart = time.perf_counter()
                                 _ = r.get(key)
                                 glat = (time.perf_counter() - gstart) * 1000.0
                                 with self.lock:
                                     self.latencies_ms.append(glat)
                                     self.success += 1
-                                    op_count += 1
-                                logger.debug(f"GET operation success: {self.success} operations")
-                            except Exception as e:
-                                logger.warning(f"GET operation failed: {e}")
-                else:
-                    # Read path
-                    camera_id = f"cam-{random.randint(1, self.camera_count)}"
-                    key = f"frame-{random.randint(1000000, 9999999)}"
-                    start = time.perf_counter()
-                    try:
+                    else:
+                        # Read path
+                        camera_id = f"cam-{random.randint(1, self.camera_count)}"
+                        key = f"frame-{random.randint(1000000, 9999999)}"
                         _ = r.get(key)
                         lat = (time.perf_counter() - start) * 1000.0
                         with self.lock:
                             self.latencies_ms.append(lat)
                             self.success += 1
-                            op_count += 1
-                        logger.debug(f"GET operation success: {self.success} operations")
-                    except Exception as e:
-                        logger.warning(f"GET operation failed: {e}")
 
-            except Exception as e:
-                with self.lock:
-                    self.fail += 1
-                time.sleep(0.01)
+                except Exception as e:
+                    with self.lock:
+                        self.fail += 1
+                    time.sleep(0.01)
 
-            # Periodic monitoring output - moved outside try-except to ensure it's always called
+                # Update last operation time for rate control
+                last_operation_time = current_time
+
+            else:
+                # Brief yield to prevent CPU spinning when rate limiting
+                time.sleep(min(0.005, min_inter_operation_delay - time_since_last_op))
+
+            # Periodic monitoring output
             self._periodic_monitoring(duration)
 
-    def run(self, threads: int = 4, duration: int = 10, write_pct: int = 80,
-           fallback_rate: int = 5, do_get_pct: int = 0):
+    def run(self, threads: int = 16, duration: int = 120, write_pct: int = 90,
+           fallback_rate: int = 0, do_get_pct: int = 5):
         """Start benchmark test"""
-        logger.info("Initializing Redis connection pool...")
         pool = self._init_connection_pool()
-        logger.info("Redis connection pool initialized successfully")
 
         # Record test start time for precise elapsed time calculation
         start_time = time.time()
@@ -435,24 +629,27 @@ class VideoCacheEnhancedBench:
 
             for _ in range(threads):
                 t = threading.Thread(target=self._worker, args=(duration, write_pct,
-                                   fallback_rate, do_get_pct, pool), daemon=True)
+                                   fallback_rate, do_get_pct, pool, threads), daemon=True)
                 t.start()
                 tlist.append(t)
 
-            # Report payload size in bytes for accuracy
-            logger.info("Started %d threads for %ds (model=%s, cameras=%d, payload_bytes=%d)",
-                       threads, duration, self.inference_model, self.camera_count, self.payload_size_bytes)
+            logger.info("Started %d threads for %ds [%dx%d @ %dfps] (model=%s, analysis=%s)",
+                       threads, duration, self.frame_width, self.frame_height, self.framerate,
+                       self.inference_model, self.analysis_intensity)
+            logger.info("Expected payload: %.1fKB/frame, frame rate control: real-time processing",
+                       self.effective_payload_size_bytes)
+            logger.info("Estimated throughput: ~%.1f fps total across all cameras",
+                       (threads * self.framerate * self.camera_count) / self.camera_count)
 
             # Wait for threads to finish
-            logger.info("Waiting for worker threads to complete...")
             for t in tlist:
-                # Give threads enough time to finish gracefully (duration + 10 seconds buffer)
-                t.join(timeout=max(duration + 10, 30))  # At least 30 seconds timeout
+                # Give threads enough time to finish gracefully (more time for longer tests)
+                t.join(timeout=max(duration + 20, 60))  # At least 60 seconds timeout
                 if t.is_alive():
                     logger.warning("Worker thread %s is still alive, continuing with cleanup", t.name)
                     # Note: daemon threads will be automatically terminated when main process exits
 
-            logger.info("All worker threads completed")
+            logger.info("Workers finished")
             self._print_summary(duration)
 
         except KeyboardInterrupt:
@@ -460,13 +657,13 @@ class VideoCacheEnhancedBench:
             self._stop.set()
             # Give threads a moment to process the stop event
             for t in tlist:
-                t.join(timeout=5.0)  # Short timeout for graceful shutdown
+                t.join(timeout=10.0)  # Longer timeout for graceful shutdown
 
     def _print_summary(self, duration: int):
         total = self.success + self.fail
         ops_per_sec = self.success / max(1e-9, duration)
 
-        logger.info("=== Enhanced Video Cache Benchmark Results ===")
+        logger.info("=== Realistic Video Cache Benchmark Results ===")
         logger.info("Total operations: %d (success=%d, fail=%d)",
                    total, self.success, self.fail)
         logger.info("Throughput: %.2f ops/sec", ops_per_sec)
@@ -477,9 +674,14 @@ class VideoCacheEnhancedBench:
             logger.info("Latency (ms) - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
                        statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
 
-        logger.info("Configuration: %d objects/frame, %d cameras, %s model",
-                   self.objects_per_frame, self.camera_count, self.inference_model)
-        # Emit structured metrics for orchestration parsing
+        logger.info("Realistic Configuration:")
+        logger.info("  - Frame Size: %dx%d", self.frame_width, self.frame_height)
+        logger.info("  - Framerate: %dfps", self.framerate)
+        logger.info("  - Analysis Intensity: %s (%.2fx multiplier)", self.analysis_intensity, self.intensity_multiplier)
+        logger.info("  - Calculated Payload: %.1fKB per frame", self.effective_payload_size_bytes / 1024.0)
+        logger.info("  - Cameras: %d, Objects/Frame: ~%d, Threads: 16",
+                   self.camera_count, self.objects_per_frame)
+        # Emit structured metrics for orchestrator parsing
         try:
             if self.payload_sizes:
                 avg_payload = int(statistics.mean(self.payload_sizes))
@@ -494,22 +696,54 @@ class VideoCacheEnhancedBench:
         logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
         logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
+        if self.report_realism:
+            try:
+                import json
+                report = {
+                    "bench": "redis_video_cache_realistic",
+                    "timestamp": time.time(),
+                    "duration": duration,
+                    "total_ops": total,
+                    "ops_per_sec": ops_per_sec,
+                    "interarrivals": self.interarrivals,
+                    "payload_sizes": self.payload_sizes_tracked,
+                    "device_counts": self.device_counter
+                }
+                # Write to config_tests/results/realism_report_redis_video_cache_realistic_<ts>.json
+                out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../config_tests/results'))
+                os.makedirs(out_dir, exist_ok=True)
+                fn = os.path.join(out_dir, f"realism_report_redis_video_cache_realistic_{int(time.time())}.json")
+                with open(fn, 'w') as f:
+                    json.dump(report, f)
+                logger.info(f"Wrote realism report to {fn}")
+            except Exception as e:
+                logger.error(f"Failed to write realism report: {e}")
+
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced Video Cache Redis Benchmark",
+    parser = argparse.ArgumentParser(description="Realistic Video Cache Redis Benchmark with Frame Size Calculations",
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument("--redis-host", default="127.0.0.1", help="Redis host")
     parser.add_argument("--redis-port", default=6379, type=int, help="Redis port")
 
-    # Data scaling expansion
-    parser.add_argument("--payload-size", default="1KB", type=str,
-                       help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
-    parser.add_argument("--objects-per-frame", default=3, type=int,
-                       help="Number of objects per frame (default: 3)")
+    # Realistic frame parameters
+    parser.add_argument("--frame-width", default=1920, type=int,
+                       help="Video frame width (default: 1920 for HD)")
+    parser.add_argument("--frame-height", default=1080, type=int,
+                       help="Video frame height (default: 1080 for HD)")
+    parser.add_argument("--framerate", default=30, type=int,
+                       help="Target frame rate in fps (default: 30)")
+    parser.add_argument("--analysis-intensity", default="comprehensive",
+                       choices=["mechanical", "objective", "comprehensive"],
+                       help="AI analysis complexity (default: comprehensive)")
+
+    # Data scaling based on realistic parameters
+    parser.add_argument("--objects-per-frame", default=8, type=int,
+                       help="Number of objects per frame (default: 8 for realistic load)")
 
     # Data authenticity
-    parser.add_argument("--camera-count", default=10, type=int,
-                       help="Number of cameras in simulation (default: 10)")
+    parser.add_argument("--camera-count", default=20, type=int,
+                       help="Number of cameras in simulation (default: 100)")
     parser.add_argument("--inference-model", default="yolov5_medium",
                        choices=["yolov5_small", "yolov5_medium", "ssd_mobile"],
                        help="AI inference model type (default: yolov5_medium)")
@@ -529,49 +763,41 @@ def main():
     parser.add_argument("--persist-hash", default="video_inference_persist",
                        help="Hash key for fallback persistence")
 
-    # Load parameters
-    parser.add_argument("--threads", default=4, type=int, help="Worker threads")
-    parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
-    parser.add_argument("--write-pct", default=80, type=int, help="Write operation percentage")
-    parser.add_argument("--fallback-rate", default=5, type=int,
+    # Enhanced load parameters
+    parser.add_argument("--threads", default=16, type=int, help="Worker threads (default: 16)")
+    parser.add_argument("--duration", default=120, type=int, help="Test duration in seconds (default: 120s)")
+    parser.add_argument("--write-pct", default=90, type=int, help="Write operation percentage")
+    parser.add_argument("--fallback-rate", default=0, type=int,
                        help="Fallback to persistence percentage")
-    parser.add_argument("--do-get-pct", default=0, type=int,
+    parser.add_argument("--do-get-pct", default=5, type=int,
                        help="Immediate get after set percentage")
-    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
-                        help="Payload mode: json (structured) or binary (base64 blob)")
+    parser.add_argument("--payload-mode", default=None, choices=["json", "binary"],
+                        help="Payload mode: json (structured) or binary (base64 blob). If omitted, an automatic default may be chosen based on --inference-model and --analysis-intensity.")
+
+    parser.add_argument("--realism", default=None, help="Realism profile name (e.g., edge_basic) or 'edge_bursty')")
+
+    # Realism extensions
+    parser.add_argument("--device-count", default=0, type=int, help="Limit number of unique devices (0=unlimited)")
+    parser.add_argument("--pacing", action="store_true", help="Enable Poisson pacing")
+    parser.add_argument("--payload-mixture", action="store_true", help="Enable payload size mixture")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism report JSON")
 
     args = parser.parse_args()
 
-    # Calculate default pool size
+    # Enhanced default pool size for higher concurrency
     if args.pool_size is None:
         args.pool_size = 4 * 4  # Default 16
 
-    # support new unit-aware --payload-size string flag (supports units: B/KB/MB)
-    def parse_size_token(tok: str) -> int:
-        t = tok.strip()
-        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
-        if not m:
-            raise ValueError(f"invalid size token: {tok}")
-        val = float(m.group(1))
-        unit = m.group(2).lower()
-        if unit in ("b", "byte", "bytes") or unit == "":
-            return int(val)
-        if unit in ("k", "kb", "kib"):
-            return int(val * 1024)
-        if unit in ("m", "mb", "mib"):
-            return int(val * 1024 * 1024)
-        raise ValueError(f"unknown size unit: {unit}")
-
-    # parse canonical --payload-size into bytes
-    payload_bytes = parse_size_token(args.payload_size)
-
-    bench = VideoCacheEnhancedBench(
+    bench = VideoCacheRealisticBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         cache_ttl=args.ttl,
         persist_hash=args.persist_hash,
-        # Data scaling expansion
-        payload_size_bytes=payload_bytes,
+        # Realistic frame parameters
+        frame_width=args.frame_width,
+        frame_height=args.frame_height,
+        framerate=args.framerate,
+        analysis_intensity=args.analysis_intensity,
         objects_per_frame=args.objects_per_frame,
         # Data authenticity
         camera_count=args.camera_count,
@@ -580,9 +806,46 @@ def main():
         connect_timeout=args.connect_timeout,
         socket_timeout=args.socket_timeout,
         pool_timeout=args.pool_timeout,
-        pool_size=args.pool_size
+        pool_size=args.pool_size,
+        # Realism extensions
+        device_count=args.device_count,
+        pacing=args.pacing,
+        payload_mixture=args.payload_mixture,
+        report_realism=args.report_realism
     )
-    bench.payload_mode = args.payload_mode
+
+    # If payload_mode not explicitly provided, choose a sensible default
+    # based on the inference model and analysis intensity. This is opinionated
+    # and can be overridden by passing --payload-mode explicitly.
+    chosen_payload_mode = args.payload_mode
+    try:
+        if chosen_payload_mode is None:
+            # Prefer binary for heavier/compressed payload scenarios where the
+            # inference model produces large frames or analysis blobs. Use JSON
+            # for lightweight/default modes.
+            if args.analysis_intensity == "comprehensive":
+                chosen_payload_mode = "binary"
+            elif isinstance(args.inference_model, str) and args.inference_model.lower().startswith("yolov5"):
+                chosen_payload_mode = "binary"
+            else:
+                chosen_payload_mode = "json"
+    except Exception:
+        chosen_payload_mode = args.payload_mode or "json"
+
+    bench.payload_mode = chosen_payload_mode
+    
+    # optional realism profile (prototype)
+    if args.realism:
+        try:
+            from experiment.migration.realistic import load_profile
+            bench._realism_profile = load_profile(args.realism)
+        except Exception:
+            bench._realism_profile = None
+    else:
+        bench._realism_profile = None
+
+    # Payload size is determined from resolution, framerate and analysis intensity
+    # Do not allow overriding via CLI to keep realistic sizing calculation.
 
     bench.run(threads=args.threads, duration=args.duration,
              write_pct=args.write_pct, fallback_rate=args.fallback_rate,

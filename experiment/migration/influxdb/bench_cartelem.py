@@ -30,6 +30,7 @@ import random
 import threading
 import time
 import statistics
+import math
 import os
 import base64
 from typing import Dict, Any, Optional
@@ -88,13 +89,28 @@ class VehicleInfluxBench:
                 # 数据生命周期管理
                 retention_policy: str = "1h",
                 # 消息速率控制
-                max_requests_per_second: Optional[int] = None):
+                max_requests_per_second: Optional[int] = None,
+                # Realism extensions
+                device_count: int = 0,
+                pacing: bool = False,
+                payload_mixture: bool = False,
+                report_realism: bool = False):
 
         self.influx_url = influx_url
         self.token = token
         self.org = org
         self.bucket = bucket
         self._stop = threading.Event()
+
+        # Realism config
+        self.device_count = device_count
+        self.pacing = pacing
+        self.payload_mixture = payload_mixture
+        self.report_realism = report_realism
+        self.device_counter = {}
+        self.interarrivals = []
+        self.payload_sizes_tracked = []
+        self._realism_profile = None
 
         # Data scale extension config (bytes)
         self.payload_size_bytes = int(payload_size_bytes)
@@ -215,9 +231,34 @@ class VehicleInfluxBench:
 
         return round(new_speed, 2)
 
-    def _generate_vehicle_data(self) -> list:
+    def sample_interarrival(self) -> float:
+        """Sample inter-arrival time (seconds). If pacing is on, use Poisson process."""
+        if not self.pacing:
+            return 0.0
+
+        if self._realism_profile:
+            return self._realism_profile.next_interarrival()
+
+        target_rate = self._rate_limiter.rate if self._rate_limiter.rate else 100.0
+        return -math.log(1.0 - random.random()) / target_rate
+
+    def sample_payload_size_from_mixture(self) -> int:
+        """Sample payload size from a mixture model if enabled."""
+        if self._realism_profile:
+            return self._realism_profile.sample_payload_size()
+
+        if not self.payload_mixture:
+            return self.payload_size_bytes
+
+        if random.random() < 0.8:
+            return self.payload_size_bytes
+        else:
+            return self.payload_size_bytes * 5
+
+    def _generate_vehicle_data(self, vehicle_id: Optional[str] = None, target_size_override: Optional[int] = None) -> list:
         """Generate enhanced vehicle telemetry data"""
-        vehicle_id = f"veh-{random.randint(1000, 9999)}"
+        if not vehicle_id:
+            vehicle_id = f"veh-{random.randint(1000, 9999)}"
         base_timestamp = int(time.time() * 1000000000)
 
         # Get vehicle state
@@ -265,20 +306,24 @@ class VehicleInfluxBench:
             "fuel_level": state["fuel"], "engine_temp": state["engine_temp"],
             "latitude": state["lat"], "longitude": state["lon"]
         }))
-        base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小 (bytes)
 
-        # Apply distribution function
-        if self.size_distribution == "uniform":
-            random_multiplier = random.uniform(0.8, 1.2)
-        elif self.size_distribution == "normal":
-            random_multiplier = random.gauss(1.0, 0.1)  # 正态分布，均值1，标准差0.1
-            random_multiplier = max(0.7, min(1.3, random_multiplier))  # 限制在70%-130%
-        elif self.size_distribution == "zipf":
-            random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6  # Zipf-like分布，偏向较小值
+        if target_size_override:
+            target_size_bytes = target_size_override
         else:
-            random_multiplier = 1.0  # 默认fallback
+            base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小 (bytes)
 
-        target_size_bytes = int(base_target_bytes * random_multiplier)
+            # Apply distribution function
+            if self.size_distribution == "uniform":
+                random_multiplier = random.uniform(0.8, 1.2)
+            elif self.size_distribution == "normal":
+                random_multiplier = random.gauss(1.0, 0.1)  # 正态分布，均值1，标准差0.1
+                random_multiplier = max(0.7, min(1.3, random_multiplier))  # 限制在70%-130%
+            elif self.size_distribution == "zipf":
+                random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6  # Zipf-like分布，偏向较小值
+            else:
+                random_multiplier = 1.0  # 默认fallback
+
+            target_size_bytes = int(base_target_bytes * random_multiplier)
 
         if current_size < target_size_bytes:
             # Add additional sensor readings
@@ -392,6 +437,15 @@ class VehicleInfluxBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
+
+            # Pacing
+            interval = self.sample_interarrival()
+            if interval > 0:
+                time.sleep(interval)
+                if self.report_realism:
+                    with self.lock:
+                        self.interarrivals.append(interval)
+
             # 速率控制检查
             self._rate_control()
 
@@ -400,7 +454,23 @@ class VehicleInfluxBench:
                     self._execute_location_query()
                 else:
                     # Write vehicle data
-                    points = self._generate_vehicle_data()
+                    dev = None
+                    if self.device_count > 0:
+                        idx = random.randint(1, self.device_count)
+                        dev = f"veh-{idx:04d}"
+                    elif hasattr(self, '_realism_profile') and self._realism_profile:
+                        dev = self._realism_profile.choose_device_id()
+
+                    if self.report_realism and dev:
+                        with self.lock:
+                            self.device_counter[dev] = self.device_counter.get(dev, 0) + 1
+
+                    size_override = self.sample_payload_size_from_mixture()
+                    if self.report_realism:
+                        with self.lock:
+                            self.payload_sizes_tracked.append(size_override)
+
+                    points = self._generate_vehicle_data(vehicle_id=dev, target_size_override=size_override)
                     self.write_api.write(bucket=self.bucket, org=self.org, record=points)
                     lat = (time.perf_counter() - start) * 1000.0
 
@@ -529,6 +599,29 @@ class VehicleInfluxBench:
         logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
         logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
+        if self.report_realism:
+            try:
+                import json
+                report = {
+                    "bench": "influx_cartelem",
+                    "timestamp": time.time(),
+                    "duration": duration,
+                    "total_ops": total,
+                    "ops_per_sec": ops_per_sec,
+                    "interarrivals": self.interarrivals,
+                    "payload_sizes": self.payload_sizes_tracked,
+                    "device_counts": self.device_counter
+                }
+                # Write to config_tests/results/realism_report_influx_cartelem_<ts>.json
+                out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../config_tests/results'))
+                os.makedirs(out_dir, exist_ok=True)
+                fn = os.path.join(out_dir, f"realism_report_influx_cartelem_{int(time.time())}.json")
+                with open(fn, 'w') as f:
+                    json.dump(report, f)
+                logger.info(f"Wrote realism report to {fn}")
+            except Exception as e:
+                logger.error(f"Failed to write realism report: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Advanced Vehicle Telematics InfluxDB Benchmark")
@@ -562,6 +655,14 @@ def main():
     # 消息速率控制
     parser.add_argument("--rps", "--max-requests-per-second", dest="rps",
                        type=int, help="Maximum requests per second (default: no limit)")
+
+    parser.add_argument("--realism", default=None, help="Realism profile name (e.g., edge_basic) or 'edge_bursty')")
+
+    # Realism extensions
+    parser.add_argument("--device-count", default=0, type=int, help="Limit number of unique devices (0=unlimited)")
+    parser.add_argument("--pacing", action="store_true", help="Enable Poisson pacing")
+    parser.add_argument("--payload-mixture", action="store_true", help="Enable payload size mixture")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism report JSON")
 
     args = parser.parse_args()
 
@@ -598,9 +699,24 @@ def main():
         # 数据生命周期管理
         retention_policy=args.retention_policy,
         # 消息速率控制
-        max_requests_per_second=args.rps
+        max_requests_per_second=args.rps,
+        # Realism extensions
+        device_count=args.device_count,
+        pacing=args.pacing,
+        payload_mixture=args.payload_mixture,
+        report_realism=args.report_realism
     )
     bench.payload_mode = args.payload_mode
+
+    # optional realism profile (prototype)
+    if args.realism:
+        try:
+            from experiment.migration.realistic import load_profile
+            bench._realism_profile = load_profile(args.realism)
+        except Exception:
+            bench._realism_profile = None
+    else:
+        bench._realism_profile = None
 
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 

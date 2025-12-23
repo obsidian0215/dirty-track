@@ -35,6 +35,7 @@ import random
 import threading
 import time
 import statistics
+from collections import Counter
 import os
 import base64
 from typing import List, Optional, Dict, Any
@@ -145,6 +146,12 @@ class SensorAggBench:
         self.lock = threading.Lock()
         # 动态跟踪每次写入的payload大小（以字节计）
         self.payload_sizes = []
+        # 设备跟踪和真实性控制
+        self.device_counter = Counter()
+        self.device_count = sensors_per_device * 10  # 可通过 CLI 覆盖
+        self.pacing = "none"  # none|poisson
+        self.payload_mixture = None  # list of (weight, min, max)
+        self.report_realism = False
 
         # 速率控制参数
         self.max_requests_per_second = max_requests_per_second
@@ -258,9 +265,36 @@ class SensorAggBench:
 
         return round(final_reading, 3)
 
+    def sample_payload_size_from_mixture(self):
+        """Sample a target payload size from configured mixture spec."""
+        spec = getattr(self, 'payload_mixture', None)
+        if not spec:
+            return int(self.payload_size_bytes)
+        total = sum(w for w, lo, hi in spec)
+        p = random.random() * total
+        cum = 0.0
+        for w, lo, hi in spec:
+            cum += w
+            if p <= cum:
+                return random.randint(lo, hi)
+        w, lo, hi = spec[-1]
+        return random.randint(lo, hi)
+
+    def sample_interarrival(self):
+        """Return next interarrival in seconds according to pacing mode."""
+        if getattr(self, 'pacing', None) == 'poisson':
+            rate = getattr(self, 'max_requests_per_second', None) or 1.0
+            if not rate or rate <= 0:
+                return 0.0
+            return random.expovariate(rate)
+        return 0.0
+
     def _make_reading(self):
         """生成增强的传感器数据，支持多传感器类型和数据规模扩展"""
-        sensor_id = f"dev-{random.randint(1, self.sensors_per_device * 10)}"
+        if getattr(self, 'device_count', None):
+            sensor_id = f"dev-{random.randint(1, self.device_count)}"
+        else:
+            sensor_id = f"dev-{random.randint(1, self.sensors_per_device * 10)}"
         sensor_type = random.choice(self.sensor_types)
 
         # 生成基础传感器数据
@@ -286,9 +320,12 @@ class SensorAggBench:
 
         # 数据规模扩展 - 添加额外传感器读数达到目标大小（添加随机性: 80%-120%）
         current_size = len(json.dumps(sensor_data))
-        target_size_bytes = int(self.payload_size_bytes)  # 已经是字节
+        if getattr(self, 'payload_mixture', None):
+            base_target_bytes = int(self.sample_payload_size_from_mixture())
+        else:
+            base_target_bytes = int(self.payload_size_bytes)  # 已经是字节
         random_multiplier = random.uniform(0.8, 1.2)  # 80%-120%的随机因子
-        random_stop_bytes = int(target_size_bytes * random_multiplier)
+        random_stop_bytes = int(base_target_bytes * random_multiplier)
 
         if current_size < random_stop_bytes:
             # 添加环境传感器读数，直到接近随机停止点
@@ -310,8 +347,8 @@ class SensorAggBench:
 
             if additional_readings:
                 sensor_data["environment_sensors"] = additional_readings
-            elif current_size > target_size_bytes:
-                logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
+            elif current_size > base_target_bytes:
+                logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {base_target_bytes} bytes")
 
         return sensor_data
 
@@ -325,7 +362,17 @@ class SensorAggBench:
         while time.time() < end_time and not self._stop.is_set():
             do_read = random.randint(1, 100) <= read_pct
             start = time.perf_counter()
-            # 速率控制检查
+
+            # realism-driven pacing (poisson)
+            if getattr(self, 'pacing', None) == 'poisson' and getattr(self, 'max_requests_per_second', None):
+                try:
+                    interval = self.sample_interarrival()
+                    if interval and interval > 0:
+                        time.sleep(interval)
+                except Exception:
+                    pass
+
+            # token-bucket upper bound
             self._rate_control()
 
             try:
@@ -376,6 +423,13 @@ class SensorAggBench:
                         if not hasattr(self, "payload_sizes"):
                             self.payload_sizes = []
                         self.payload_sizes.append(payload_bytes)
+                        # track device usage
+                        try:
+                            dev = rcd.get('sensor_id') or rcd.get('device_id')
+                            if dev:
+                                self.device_counter[dev] += 1
+                        except Exception:
+                            pass
 
                     # 设置Sorted Set TTL，确保数据会在设定时间后过期
                     if self.target_db_size_mb:
@@ -524,6 +578,26 @@ class SensorAggBench:
         logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
         logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
 
+        # optionally write a small realism report to config_tests/results
+        if getattr(self, 'report_realism', False):
+            try:
+                ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+                outdir = os.path.join(ROOT, 'config_tests', 'results')
+                os.makedirs(outdir, exist_ok=True)
+                fn = os.path.join(outdir, f'realism_report_redis_sensoragg_{int(time.time())}.json')
+                ps = {'count': len(self.payload_sizes)}
+                if self.payload_sizes:
+                    ps['avg'] = statistics.mean(self.payload_sizes)
+                    ps['median'] = statistics.median(self.payload_sizes)
+                    ps['p95'] = sorted(self.payload_sizes)[int(len(self.payload_sizes) * 0.95)]
+                top_devices = self.device_counter.most_common(10)
+                rep = {'bench': 'redis_sensoragg', 'payload': ps, 'unique_devices': len(self.device_counter), 'top_devices': top_devices, 'pacing': self.pacing, 'device_count': self.device_count, 'payload_mixture': self.payload_mixture}
+                with open(fn, 'w', encoding='utf-8') as f:
+                    json.dump(rep, f, indent=2, ensure_ascii=False)
+                logger.info("Wrote realism report %s", fn)
+            except Exception as e:
+                logger.debug("Failed to write realism report: %s", e)
+
 def main():
     parser = argparse.ArgumentParser(description="Enhanced Sensor Aggregator Redis Benchmark")
 
@@ -574,6 +648,12 @@ def main():
     parser.add_argument("--ttl", type=int, default=3600,
                         help="TTL in seconds when not using adaptive mode (default: 3600)")
 
+    # Realism-related controls
+    parser.add_argument("--device-count", default=None, type=int, help="Total number of devices (overrides sensors-per-device*10 default)")
+    parser.add_argument("--pacing", default="none", choices=["none","poisson"], help="Traffic pacing mode (none|poisson)")
+    parser.add_argument("--payload-mixture", default=None, type=str, help="payload mixture e.g. '70:50-200,25:512-1024,5:3500-8000'")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism JSON report to config_tests/results on completion")
+
     args = parser.parse_args()
 
     # 解析传感器类型参数
@@ -604,6 +684,21 @@ def main():
     payload_bytes = parse_size_token(args.payload_size)
     payload_size_bytes = int(payload_bytes)
 
+    def parse_mixture_spec(spec: str):
+        parts = [p.strip() for p in spec.split(',') if p.strip()]
+        out = []
+        for part in parts:
+            try:
+                w, rng = part.split(':', 1)
+                lo, hi = rng.split('-', 1)
+                wv = float(w)
+                lval = parse_size_token(lo)
+                hval = parse_size_token(hi)
+                out.append((wv, int(lval), int(hval)))
+            except Exception:
+                raise ValueError(f"invalid payload_mixture spec: {part}")
+        return out
+
     bench = SensorAggBench(
         redis_host=args.redis_host,
         redis_port=args.redis_port,
@@ -626,6 +721,13 @@ def main():
         ttl=args.ttl
     )
     bench.payload_mode = args.payload_mode
+
+    # assign realism related CLI args
+    bench.device_count = args.device_count or (bench.sensors_per_device * 10)
+    bench.pacing = args.pacing
+    bench.report_realism = args.report_realism
+    bench.payload_mixture = parse_mixture_spec(args.payload_mixture) if args.payload_mixture else None
+
     bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
 
 if __name__ == "__main__":
