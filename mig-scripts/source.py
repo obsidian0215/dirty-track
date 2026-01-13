@@ -1309,29 +1309,40 @@ def xfer_final(image_path, dest, compress, session, control_sock):
 
 
 # Run the pre-dump iteration and transfer it to the destination
+
+def read_convergence_metrics(container_pids, dirtymap_path):
+    """
+    Read convergence metrics from dirtymap_path for the given container PIDs.
+    Returns (overlap_ratio, max_scount)
+    """
+    for pid in container_pids:
+        metrics_file = os.path.join(dirtymap_path, f"convergence_metrics.{pid}")
+        if os.path.exists(metrics_file):
+            try:
+                overlap_ratio = 0.0
+                max_scount = 0
+                with open(metrics_file, 'r') as f:
+                    for line in f:
+                        if line.startswith('warm_set_overlap_ratio='):
+                            overlap_ratio = float(line.split('=')[1].strip())
+                        elif line.startswith('max_consecutive_scount='):
+                            max_scount = int(line.split('=')[1].strip())
+                return overlap_ratio, max_scount
+            except (ValueError, IndexError, IOError):
+                pass
+    return 0.0, 0
+
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_session):
     iter_terminate = False
     last_iter = 1
+    prev_overlap = None
+    low_gain_count = 0
     if dirtymap:
         # 在pre-copy开启前先启动对容器的dirty-track
         get_runc_container_pidtree(container)
         start_dirty_track(device_fd)
     while last_iter <= max_iter:
         last_path = parent_path[last_iter - 1]
-        # if diskless:
-        # #send the page server command,
-        # #after the server's response, CRIU can directly transfer memory dump with network
-        # pageserver_cmd = '{ "pageserver" : { "path" : "' + last_path + '", "iter" : "' + str(last_iter) + '} }'
-        # cs.send(bytes(pageserver_cmd, encoding='utf-8'))
-        # inputready, outputready, exceptready = select.select(input, [], [], 4)
-        # #If after 4 seconds there is something to read(e.g., error msg from the socket), then print it and exit
-        # if inputready:
-        #     for s in inputready:
-        #         answer = s.recv(1024)
-        #         print(answer)
-        #         error()
-        # diskless_pre_dump(mig_base, container, dest, last_iter, dirtymap)
-        # else:
         pre_dump(mig_base, container, last_iter, dirtymap)
 
         dir_size = float(getdirsize(last_path, "pages") or 0)
@@ -1343,11 +1354,9 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
             max_predump_size = dir_size
 
         if last_iter == 1:
-            # 第一次 pre-dump 不需要比较，直接判断目录大小
             if dir_size < 1024 * 64 or last_iter == max_iter:
                 iter_terminate = True
         else:
-            # 否则比较两次 pre-dump 目录大小
             less_last_size = float(getdirsize(less_last_path, "pages") or 0) if less_last_path else 0.0
             if (
                 abs(dir_size - less_last_size) < 1024 * 64
@@ -1357,7 +1366,29 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
                 iter_terminate = True
 
         if dirtymap:
-            if read_max_scount(container_pids, dirtymap_path) >= 3:
+            overlap, max_scount = read_convergence_metrics(container_pids, dirtymap_path)
+            print(f"Iteration {last_iter}: overlap={overlap:.4f}, max_scount={max_scount}")
+            
+            # 1. Reach 95% overlap
+            if overlap >= 0.95:
+                print(f"Converged at iteration {last_iter} (overlap >= 95%)")
+                iter_terminate = True
+            
+            # 2. Gradient stop
+            if prev_overlap is not None:
+                gain = overlap - prev_overlap
+                if gain < 0.005:
+                    low_gain_count += 1
+                    if low_gain_count >= 2:
+                        print(f"Diminishing returns at iteration {last_iter} (gain {gain:.4f} < 0.5% for 2 rounds)")
+                        iter_terminate = True
+                else:
+                    low_gain_count = 0
+            prev_overlap = overlap
+
+            # 3. Safety break
+            if max_scount >= 7:
+                print(f"Safety break at iteration {last_iter} (max_scount >= 7)")
                 iter_terminate = True
 
         session = resolve_session(last_iter, last_path)
@@ -1369,7 +1400,6 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
             break
         last_iter += 1
     print("last_iter:", last_iter)
-    print("less_last_path:", less_last_path)
     return last_iter
 
 

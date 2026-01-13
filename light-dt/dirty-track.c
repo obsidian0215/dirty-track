@@ -59,7 +59,7 @@ struct pid_check {
 // 强制全地址扫描周期
 #define FORCE_SCAN_CYCLE 5
 // 最大可跟踪进程数
-#define MAX_TRACKED_PROCESSES 24
+#define MAX_TRACKED_PROCESSES 1024
 
 // // 页面类型
 // #define PAGE_PTE 0                  // 4KB
@@ -808,6 +808,9 @@ static void post_kthread_stop(dirty_track_t *dti) {
         write_lock(&dirty_track_rwlock);
         list_del(&dti->list);
         write_unlock(&dirty_track_rwlock);
+
+        // [Obsidian0215] FIX: 减少跟踪进程计数，防止PID泄露
+        atomic_dec(&tracked_processes);
     }
 
     // 清理dirty_xarray
@@ -941,7 +944,7 @@ static int wp_fault_track(void *data) {
                         dti->delay_timer = max(INIT_DELAY, delta_ns + dti->delay_timer);
                     }
                 } else if (!dti->dirty_map_updated || xa_empty(&dti->dirty_xarray)) {
-                    printk("[PID %d]No dirty pages detected in this scan, increasing delay\n", dti->pid);
+                    // printk("[PID %d]No dirty pages detected in this scan, increasing delay\n", dti->pid);
                     dti->delay_penalty *= 2;
                     dti->delay_timer = dti->delay_timer * dti->delay_penalty;
                     if (dti->delay_timer > MAX_DELAY) {
@@ -1120,45 +1123,36 @@ static int stop_dirty_track(pid_t pid) {
         return -ENOENT;
     }
 
+    bool found = false;
     write_lock(&dirty_track_rwlock);
     list_for_each_entry_safe(dti, tmp, &dirty_track_list, list) {
         if (dti->pid == pid) {
             list_del(&dti->list);
-            write_unlock(&dirty_track_rwlock);
-
-            // 优先停止clear-soft-dirty循环并将dirty-map写入文件
-
-            // start_time = ktime_get();  // 获取开始时间
-            dti->stop_requested = true;
-            wake_up_interruptible(&dti->stop_wq); // 唤醒内核线程
-            wait_for_completion(&dti->stop_completed);
-            // end_time = ktime_get();  // 获取结束时间
-            // delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-            // printk(KERN_INFO "wait_for_completion executed in %lld ns\n", delta_ns);
-
-            // 剩余的清理任务委托给异步工作队列
-            sw = kzalloc(sizeof(*sw), GFP_KERNEL);
-            if (!sw) {
-                return -ENOMEM;
-            }
-            sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
-            sw->dti = dti;
-            // start_time = ktime_get();  // 获取开始时间
-            INIT_WORK(&sw->work, nbstop_kthread_fn);
-            queue_work(nbstop_kthread_wq, &sw->work);
-            // end_time = ktime_get();  // 获取结束时间
-            // delta_ns = ktime_to_ns(ktime_sub(end_time, start_time));
-            // printk(KERN_INFO "queue_work executed in %lld ns\n", delta_ns);
-
-            // 减少跟踪进程计数
-            atomic_dec(&tracked_processes);
-            printk(KERN_INFO "PID %d's dirty_track is stopped\n", pid);
+            found = true;
             break;
         }
     }
-    // 如果没有找到匹配的PID，仍需释放自旋锁
-    if (!dti) {
-        write_unlock(&dirty_track_rwlock);
+    write_unlock(&dirty_track_rwlock);
+
+    if (found) {
+        // 优先停止clear-soft-dirty循环并将dirty-map写入文件
+        dti->stop_requested = true;
+        wake_up_interruptible(&dti->stop_wq);
+        wait_for_completion(&dti->stop_completed);
+
+        // 剩余的清理任务委托给异步工作队列
+        sw = kzalloc(sizeof(*sw), GFP_KERNEL);
+        if (!sw) return -ENOMEM;
+        sw->wq_comp = NULL;     // 不需要等待工作队列任务完成
+        sw->dti = dti;
+        INIT_WORK(&sw->work, nbstop_kthread_fn);
+        queue_work(nbstop_kthread_wq, &sw->work);
+        // 减少跟踪进程计数
+        atomic_dec(&tracked_processes);
+        printk(KERN_INFO "PID %d\'s dirty_track is stopped successfully\n", pid);
+    } else {
+        printk(KERN_INFO "PID %d not found in dirty_track_list, likely already stopped\n", pid);
+        return -ENOENT;
     }
 
     return 0;
