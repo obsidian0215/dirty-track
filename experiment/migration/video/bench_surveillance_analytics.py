@@ -48,6 +48,8 @@ class ObjectTracker:
         self.camera_id = camera_id
         self.is_hotspot = is_hotspot  # 热点摄像头（如出入口）
         self.active_tracks: Dict[str, Dict] = {}
+        # 模拟 Re-ID 特征向量缓存 (增加内存压力和状态依赖)
+        self.feature_vectors: Dict[str, List[float]] = {}
         self.track_counter = 0
 
         # 热点摄像头有更多目标
@@ -69,16 +71,11 @@ class ObjectTracker:
             # 更新位置（模拟运动）
             track_info['x'] += random.gauss(0, 10)
             track_info['y'] += random.gauss(0, 5)
-            track_info['x'] = max(0, min(1920, track_info['x']))
-            track_info['y'] = max(0, min(1080, track_info['y']))
+            # ... (保持原位置更新逻辑)
 
-            # 更新尺寸（模拟远近变化）
-            size_change = random.gauss(1.0, 0.05)
-            track_info['width'] *= size_change
-            track_info['height'] *= size_change
-
-            track_info['last_seen'] = current_time
-            track_info['frame_count'] += 1
+            # 模拟特征向量波动 (产生大量脏页)
+            if track_id in self.feature_vectors:
+                self.feature_vectors[track_id] = [v + random.gauss(0, 0.01) for v in self.feature_vectors[track_id]]
 
             detections.append({
                 'track_id': track_id,
@@ -86,8 +83,8 @@ class ObjectTracker:
                 'bbox': [
                     int(track_info['x']),
                     int(track_info['y']),
-                    int(track_info['width']),
-                    int(track_info['height'])
+                    int(track_info.get('width', 100)),
+                    int(track_info.get('height', 200))
                 ],
                 'confidence': min(0.99, track_info['confidence'] + random.gauss(0, 0.05)),
                 'age': track_info['frame_count']
@@ -96,14 +93,18 @@ class ObjectTracker:
         # 移除离开的目标
         for track_id in to_remove:
             del self.active_tracks[track_id]
+            if track_id in self.feature_vectors:
+                del self.feature_vectors[track_id]
 
-        # 新目标进入（热点摄像头更频繁）
+        # 新目标进入
         new_object_prob = 0.15 if self.is_hotspot else 0.05
         if len(self.active_tracks) < self.base_object_count * 2 and random.random() < new_object_prob:
             track_id = f"{self.camera_id}-T{self.track_counter:06d}"
             self.track_counter += 1
-
             obj_type = random.choice(self.OBJECT_TYPES)
+
+            # 初始化 Re-ID 特征向量 (512维浮点数)
+            self.feature_vectors[track_id] = [random.random() for _ in range(512)]
 
             self.active_tracks[track_id] = {
                 'object_type': obj_type,
@@ -116,6 +117,7 @@ class ObjectTracker:
                 'last_seen': current_time,
                 'frame_count': 1
             }
+            # ... (保持原输出逻辑)
 
             detections.append({
                 'track_id': track_id,
@@ -280,6 +282,16 @@ class SurveillanceAnalyticsBench:
                         })
                         # 设置过期时间
                         self.redis_client.expire(track_key, self.args.track_duration)
+
+                    # 更新近期追踪历史 (用于计算追踪连续性, 模拟 100 帧状态依赖)
+                    history_key = f"surveillance:history:{tracker.camera_id}"
+                    track_ids = [det['track_id'] for det in detections]
+                    if track_ids:
+                        self.redis_client.lpush(history_key, json.dumps({
+                            'ts': int(time.time() * 1000),
+                            'ids': track_ids
+                        }))
+                        self.redis_client.ltrim(history_key, 0, 99)
 
                     # 检测异常事件
                     anomaly = tracker.detect_anomaly(detections)

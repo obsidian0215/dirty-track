@@ -20,28 +20,23 @@ BANDWIDTH = "25mbit"
 # 场景配置：Redis的video和sensor场景
 scene_configs = {
     "video": {
-        "bench": "experiment/migration/redis/bench_video_cache.py",
+        "bench": "experiment/migration/video/bench_surveillance_analytics.py",
             "base_args": {
             "--redis-host": "192.168.2.100",
             "--redis-port": "6379",
-            "--duration": "120",  #
-            "--payload-size": "1KB",
-            # '--threads': '4',
-            # '--duration': '10',
-            # '--write-pct': '80',
-            # '--ttl': '60'
+            "--duration": "120",
+            "--cameras": "16",
+            "--fps": "15",
         },
     },
     "sensor": {
-        "bench": "experiment/migration/redis/bench_sensoragg.py",
+        "bench": "experiment/migration/industrial/bench_predictive_maintenance.py",
             "base_args": {
             "--redis-host": "192.168.37.150",
             "--redis-port": "6379",
-            "--payload-size": "2KB",
-            "--sensors-per-device": "10",
-            "--read-pct": "0",
-            "--duration": "90",  # 90s
-            "--target-db-size-mb": "120",
+            "--devices": "50",
+            "--sampling-rate": "10",
+            "--duration": "120",
         },
     },
     "vehicle": {
@@ -49,16 +44,7 @@ scene_configs = {
             "base_args": {
             "--redis-host": "192.168.37.150",
             "--redis-port": "6379",
-            # '--token': 'token',
-            # '--org': 'org',
-            # '--bucket': 'vehicle-data',
-            # '--threads': '4',
-            "--payload-size": "2KB",
-            # '--size-distribution':'normal',
-            # '--vehicle-pattern': 'highway',
-            "--duration": "90",
-            "--target-db-size-mb": "1000",
-            # '--read-pct': '0'
+            "--duration": "120",
         },
     },
 }

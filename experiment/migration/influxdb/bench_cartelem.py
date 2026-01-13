@@ -176,7 +176,20 @@ class VehicleInfluxBench:
         state = self._get_vehicle_state(vehicle_id)
         curr_time = time.time()
         time_delta = curr_time - state["last_update"]
+        # Update geographic coordinates based on heading and speed
+        if "heading" not in state:
+            state["heading"] = random.uniform(0, 360)
+        else:
+            state["heading"] += random.uniform(-10, 10) # Random slight turn
 
+        dist_km = (new_speed * time_delta) / 3600.0
+        rad = math.radians(state["heading"])
+        # 1 degree lat is ~111km, 1 degree lon is ~111km * cos(lat)
+        d_lat = dist_km * math.cos(rad) / 111.0
+        d_lon = dist_km * math.sin(rad) / (111.0 * math.cos(math.radians(state.get("lat", 31.0))))
+
+        state["lat"] += d_lat
+        state["lon"] += d_lon
         # Fuel consumption calculation (L/100km)
         fuel_consumption = (abs(new_speed - state["speed"]) * time_delta + new_speed * time_delta) * 0.001
         state["fuel"] = max(0, state["fuel"] - fuel_consumption)

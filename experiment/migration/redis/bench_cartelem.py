@@ -39,6 +39,7 @@ import os
 import base64
 import redis
 import re
+import math
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -195,6 +196,21 @@ class CarTelematicsBench:
         state = self._get_vehicle_state(vehicle_id)
         curr_time = time.time()
         time_delta = curr_time - state["last_update"]
+
+        # 更新地理位置基于航向角和速度
+        if "heading" not in state:
+            state["heading"] = random.uniform(0, 360)
+        else:
+            state["heading"] += random.uniform(-10, 10) # 随机摆动
+
+        dist_km = (new_speed * time_delta) / 3600.0
+        rad = math.radians(state["heading"])
+        # 1度纬度约111km，1度经度约111km * cos(lat)
+        d_lat = dist_km * math.cos(rad) / 111.0
+        d_lon = dist_km * math.sin(rad) / (111.0 * math.cos(math.radians(state.get("lat", 31.0))))
+
+        state["lat"] += d_lat
+        state["lon"] += d_lon
 
         # 燃油消耗计算 (L/100km)
         fuel_consumption = (abs(new_speed - state["speed"]) * time_delta + new_speed * time_delta) * 0.001
@@ -383,7 +399,18 @@ class CarTelematicsBench:
 
             op_start_time = time.perf_counter()
             try:
+                # 1. 写入实时遥测流 (XADD)
                 r.xadd(self.stream_name, {"data": data_str})
+
+                # 2. 地理位置协同 (真实边缘计算 V2X)
+                state = self._get_vehicle_state(vehicle_id)
+                geo_key = "v2x:positions"
+                r.geoadd(geo_key, (state["lon"], state["lat"], vehicle_id))
+
+                # 模拟 V2X 场景：10% 概率查询周边 500m 车辆进行碰撞风险计算
+                if random.random() < 0.1:
+                    r.georadius(geo_key, state["lon"], state["lat"], 500, unit='m')
+
                 lat = (time.perf_counter() - op_start_time) * 1000.0
                 with self.lock:
                     self.latencies_ms.append(lat)

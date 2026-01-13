@@ -50,14 +50,19 @@ experiments = {
 
 # 场景配置：InfluxDB的video, sensor, vehicle场景
 scene_configs = {
+    "video": {
+        "bench": "experiment/migration/influxdb/bench_video_cache.py",
+        "base_args": {
+            "--influx-url": "http://192.168.2.100:8181",
+            "--camera-count": "16",
+            "--payload-size": "5KB",
+            "--duration": "120",
+        },
+    },
     "sensor": {
         "bench": "experiment/migration/influxdb/bench_sensoragg.py",
         "base_args": {
             "--influx-url": "http://192.168.2.100:8181",
-            # '--token': 'token',
-            # '--org': 'org',
-            # '--bucket': 'sensor-data',
-            # '--threads': '4',
             "--payload-size": "2KB",
             "--sensors-per-device": "10",
             "--read-pct": "0",
@@ -68,16 +73,9 @@ scene_configs = {
         "bench": "experiment/migration/influxdb/bench_cartelem.py",
             "base_args": {
             "--influx-url": "http://192.168.2.100:8181",
-            # '--token': 'token',
-            # '--org': 'org',
-            # '--bucket': 'vehicle-data',
-            # '--threads': '4',
             "--payload-size": "2KB",
-            # '--size-distribution':'normal',
-            # '--vehicle-pattern': 'highway',
             "--duration": "120",
             "--read-pct": "0",
-            # '--target-db-size-mb':'120'
             "--retention-policy": "60s",
         },
     },

@@ -179,6 +179,48 @@ class SensorSimulator:
 class PredictiveMaintenanceBench:
     """预测性维护基准测试"""
 
+    # LUA 脚本：计算滑动窗口内的健康得分 (均值 + 标准差)
+    # 这模拟了复杂的内存计算状态，迁移时状态丢失会导致得分“跳变”
+    HEALTH_ANALYSIS_LUA = """
+    local hist_key = KEYS[1]
+    local status_key = KEYS[2]
+    local val = tonumber(ARGV[1])
+    local max_hist = tonumber(ARGV[2])
+
+    -- 1. 推入新值并保持窗口大小
+    redis.call('LPUSH', hist_key, val)
+    redis.call('LTRIM', hist_key, 0, max_hist - 1)
+
+    -- 2. 获取历史并计算统计量
+    local history = redis.call('LRANGE', hist_key, 0, -1)
+    local sum = 0
+    local count = #history
+    if count == 0 then return 100 end
+
+    for i=1, count do
+        sum = sum + tonumber(history[i])
+    end
+    local avg = sum / count
+
+    local sq_diff_sum = 0
+    for i=1, count do
+        local diff = tonumber(history[i]) - avg
+        sq_diff_sum = sq_diff_sum + (diff * diff)
+    end
+    local std = math.sqrt(sq_diff_sum / count)
+
+    -- 3. 计算健康分 (受波动率 std 和 均值 avg 共同影响)
+    local health = 100 - (std * 2) - (math.abs(avg - 5) * 0.5)
+    health = math.max(0, math.min(100, health))
+
+    redis.call('HSET', status_key,
+        'health_score', string.format("%.2f", health),
+        'avg_vibration', string.format("%.2f", avg),
+        'std_dev', string.format("%.2f", std)
+    )
+    return tostring(health)
+    """
+
     def __init__(self, args):
         self.args = args
         self.redis_client = redis.Redis(
@@ -188,6 +230,8 @@ class PredictiveMaintenanceBench:
             socket_timeout=5,
             socket_connect_timeout=5
         )
+        # 注册 LUA 脚本
+        self.health_script = self.redis_client.register_script(self.HEALTH_ANALYSIS_LUA)
 
         self.devices = [
             SensorSimulator(f"device-{i:03d}", args.anomaly_rate)
@@ -266,6 +310,13 @@ class PredictiveMaintenanceBench:
                         'temperature': f"{sensor_data.get('temperature', 0):.2f}",
                         'vibration_max': f"{max(sensor_data.get('vibration_x', 0), sensor_data.get('vibration_y', 0), sensor_data.get('vibration_z', 0)):.2f}"
                     })
+
+                    # 执行 LUA 聚合分析 (状态依赖逻辑)
+                    history_key = f"maintenance:history:{device.device_id}"
+                    vibration = max(sensor_data.get('vibration_x', 0),
+                                  sensor_data.get('vibration_y', 0),
+                                  sensor_data.get('vibration_z', 0))
+                    self.health_script(keys=[history_key, status_key], args=[vibration, 20])
 
                     latency = (time.perf_counter() - start) * 1000
                     local_stats['latencies'].append(latency)
