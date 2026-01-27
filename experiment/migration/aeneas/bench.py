@@ -6,6 +6,7 @@ import argparse
 import csv
 import os
 import random
+import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,8 +45,9 @@ else:
 parser.add_argument('--url', required=True, help='Endpoint URL (e.g., http://localhost:8080/align)')
 parser.add_argument('--audio', default=None, help='Audio file to upload (relative to --dataset if not absolute)')
 parser.add_argument('--text', default=None, help='Text file to upload (relative to --dataset if not absolute)')
+parser.add_argument('--pairs', default=None, help='Comma-separated audio:text pairs to cycle through (filenames relative to --dataset if not absolute)')
 if not bench_common:
-    parser.add_argument('--dataset', default=None, help='Path to datasets directory (default: repo datasets/)')
+    parser.add_argument('--dataset', default='/runc/datasets', help='Path to datasets directory (default: /runc/datasets)')
     parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
     parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--iters', type=int, default=10, help='Fallback iterations when --duration is not used')
@@ -59,7 +61,7 @@ else:
     if not args.dataset:
         args.dataset = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
 
-# Resolve audio/text
+# Resolve audio/text (support --pairs)
 
 def _resolve_path(p, subdir_hint=None):
     if p:
@@ -85,8 +87,29 @@ def _resolve_path(p, subdir_hint=None):
             raise SystemExit(f'no files found in dataset dir: {args.dataset}')
         return random.choice(candidates)
 
-args.audio = _resolve_path(args.audio, subdir_hint='audio')
-args.text = _resolve_path(args.text, subdir_hint='ocr')
+pairs_list = []
+if args.pairs:
+    for item in [p.strip() for p in args.pairs.split(',') if p.strip()]:
+        if ':' not in item:
+            raise SystemExit(f'bad pair spec: {item} (expected audio:text)')
+        audio_s, text_s = item.split(':', 1)
+        a_path = _resolve_path(audio_s.strip(), subdir_hint='audio')
+        t_path = _resolve_path(text_s.strip(), subdir_hint='ocr')
+        pairs_list.append((a_path, t_path))
+else:
+    a = _resolve_path(args.audio, subdir_hint='audio')
+    t = _resolve_path(args.text, subdir_hint='ocr')
+    pairs_list = [(a, t)]
+
+pair_idx = 0
+pair_lock = threading.Lock()
+
+def get_next_pair():
+    global pair_idx
+    with pair_lock:
+        idx = pair_idx
+        pair_idx = (pair_idx + 1) % len(pairs_list)
+    return pairs_list[idx]
 
 results = []
 results_lock = threading.Lock()
@@ -139,8 +162,9 @@ if bench_common and metrics:
 def do_request_once(idx=None):
     start = time.time()
     try:
-        with open(args.audio, 'rb') as a, open(args.text, 'rb') as t:
-            files = {'audio': (os.path.basename(args.audio), a), 'text': (os.path.basename(args.text), t)}
+        a_path, t_path = get_next_pair()
+        with open(a_path, 'rb') as a, open(t_path, 'rb') as t:
+            files = {'audio': (os.path.basename(a_path), a), 'text': (os.path.basename(t_path), t)}
             r = requests.post(args.url, files=files, timeout=120)
             status = r.status_code
             preview = r.text[:200]
@@ -160,8 +184,9 @@ def worker_duration(url, end_time):
         rl.acquire()
         start = time.time()
         try:
-            with open(args.audio, 'rb') as a, open(args.text, 'rb') as t:
-                files = {'audio': (os.path.basename(args.audio), a), 'text': (os.path.basename(args.text), t)}
+            a_path, t_path = get_next_pair()
+            with open(a_path, 'rb') as a, open(t_path, 'rb') as t:
+                files = {'audio': (os.path.basename(a_path), a), 'text': (os.path.basename(t_path), t)}
                 r = sess.post(args.url, files=files, timeout=120)
                 status = r.status_code
                 preview = r.text[:200]
@@ -208,4 +233,15 @@ with open(outf, 'w', newline='') as csvf:
     with results_lock:
         for r in results:
             writer.writerow(r)
+
+# Compute and print summary metrics for fog_test capture
+lat_list = [r[2]*1000.0 for r in results if r[1] is not None and 200 <= int(r[1]) < 300]
+ops = len(lat_list)
+avg = statistics.mean(lat_list) if lat_list else 0.0
+p50 = statistics.median(lat_list) if lat_list else 0.0
+p95 = (sorted(lat_list)[int(len(lat_list)*0.95)-1] if lat_list and len(lat_list)>=1 else 0.0)
+duration_secs = sum(lat_list)/1000.0 if ops else 0.0
+ops_per_sec = ops/duration_secs if duration_secs>0 else 0.0
 print('Wrote', outf)
+print("METRIC_HEADER\tavg_latency_ms\tp50_ms\tp95_ms\tops_per_sec\ttotal_success")
+print(f"METRIC_VALUES\t{avg:.3f}\t{p50:.3f}\t{p95:.3f}\t{ops_per_sec:.3f}\t{ops}")

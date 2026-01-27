@@ -183,11 +183,11 @@ import atexit
 
 # override SCENES with explicit scene-to-bundle/endpoint/asset/bench mapping
 SCENE_INFO = {
-    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/images/0001.png", "bench": "python3 /runc/bench_clients/run_bench.py --url http://127.0.0.1:PORT/ocr --file /runc/datasets/ocr/images/0001.png --iters 50 --concurrency 4", "persistent": False},
-    "gzip": {"bundle": "gzip", "endpoint": "/compress", "asset": "/runc/datasets/compress/sample.bin", "bench": "python3 /runc/bench_clients/bench_gzip.py --url http://127.0.0.1:PORT/compress --file /runc/datasets/compress/sample.bin --iters 50 --concurrency 4", "persistent": True},
-    "yolo": {"bundle": "yolo", "endpoint": "/detect", "asset": "/runc/datasets/images/dog.jpg", "bench": "python3 /runc/bench_clients/run_bench.py --url http://127.0.0.1:PORT/detect --file /runc/datasets/images/dog.jpg --iters 50 --concurrency 3", "persistent": False},
-    "pocketsphinx": {"bundle": "pocketsphinx", "endpoint": "/transcribe", "asset": "/runc/datasets/audio/sample.wav", "bench": "python3 /runc/bench_clients/run_bench.py --url http://127.0.0.1:PORT/transcribe --file /runc/datasets/audio/sample.wav --iters 20 --concurrency 2", "persistent": False},
-    "aeneas": {"bundle": "aeneas", "endpoint": "/align", "asset": "/runc/datasets/audio/sample.mp3,/runc/datasets/ocr/sample.xhtml", "bench": "python3 /runc/bench_clients/bench_aeneas.py --url http://127.0.0.1:PORT/align --audio /runc/datasets/audio/sample.mp3 --text /runc/datasets/ocr/sample.xhtml --iters 20 --concurrency 2", "persistent": False},
+    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/images/0001.png", "bench": None, "persistent": False},
+    "gzip": {"bundle": "gzip", "endpoint": "/compress", "asset": "/runc/datasets/compress/sample.bin", "bench": None, "persistent": False},  # gzip 为无状态；默认不需要文件锁/持久化
+    "yolo": {"bundle": "yolo", "endpoint": "/detect", "asset": "/runc/datasets/images/dog.jpg", "bench": None, "persistent": False},
+    "pocketsphinx": {"bundle": "pocketsphinx", "endpoint": "/transcribe", "asset": "/runc/datasets/audio/sample.wav", "bench": None, "persistent": False},
+    "aeneas": {"bundle": "aeneas", "endpoint": "/align", "asset": "/runc/datasets/audio/sample.mp3,/runc/datasets/ocr/sample.xhtml", "bench": None, "persistent": False},
 
     # Service-level scenes
     "sensoragg": {"bundle": "sensoragg", "endpoint": "/health", "asset": None, "bench": None, "default_port": 8181, "persistent": False},
@@ -1537,7 +1537,8 @@ def run_smoke(container: str, scene: str, port: int):
 
 
 def find_local_bench_for_bundle(bundle: str):
-    # Search the migration tree for a canonical `bench.py` first, then fall back to `bench_*.py`
+    # Search the migration tree for a canonical `bench.py` first, then fall back to `bench_*.py`.
+    # Finally, accept any file with 'bench' in its name (e.g., client_bench.py).
     roots = [
         os.path.join('/runc/dirty-track/experiment/migration', bundle),
         os.path.join('/runc/dirty-track/experiment/migration', bundle.lower()),
@@ -1549,10 +1550,15 @@ def find_local_bench_for_bundle(bundle: str):
         for r, _, files in os.walk(root):
             if 'bench.py' in files:
                 return os.path.join(r, 'bench.py')
-        # Fallback to legacy bench_*.py
+        # Fallback to bench_*.py
         for r, _, files in os.walk(root):
             for f in files:
                 if f.startswith('bench_') and f.endswith('.py'):
+                    return os.path.join(r, f)
+        # Broad fallback: any python file that contains 'bench' in its name (client_bench.py etc.)
+        for r, _, files in os.walk(root):
+            for f in files:
+                if 'bench' in f.lower() and f.endswith('.py'):
                     return os.path.join(r, f)
     return None
 
@@ -1595,6 +1601,8 @@ def ensure_service_bundle(service_name: str, backend: str) -> None:
     print(f"[warn] cannot find base bundle for {backend} to create {service_name}")
 
 
+# If SCENE_INFO[scene]['asset'] exists, fog_test passes these to local benches as
+# `--files` (comma-separated basenames) or `--pairs` (audio:text pairs for aeneas).
 def run_bench(scene: str, port: int):
     py = shlex.quote(sys.executable)
     info = SCENE_INFO.get(scene, {})
@@ -1612,6 +1620,22 @@ def run_bench(scene: str, port: int):
 
     if local_bench:
         backend = detect_backend_from_bench(local_bench)
+        asset = info.get('asset')
+        files_arg = ''
+        if asset:
+            if scene == 'aeneas' and ',' in asset:
+                parts = [p.strip() for p in asset.split(',') if p.strip()]
+                pairs = []
+                for i in range(0, len(parts)-1, 2):
+                    a = parts[i]
+                    t = parts[i+1]
+                    pairs.append(f"{os.path.basename(a)}:{os.path.basename(t)}")
+                if pairs:
+                    files_arg = f" --pairs {shlex.quote(','.join(pairs))}"
+            else:
+                parts = [p.strip() for p in asset.split(',') if p.strip()]
+                basenames = ','.join([os.path.basename(p) for p in parts])
+                files_arg = f" --files {shlex.quote(basenames)}"
         if backend == 'redis':
             cmd = f"{py} {shlex.quote(local_bench)} --redis-host 127.0.0.1 --redis-port {int(port)} --threads 4 --duration 30 --dataset /runc/datasets"
         elif backend == 'influxdb':
@@ -1620,7 +1644,7 @@ def run_bench(scene: str, port: int):
             cmd = f"{py} {shlex.quote(local_bench)} --es-host 127.0.0.1 --es-port {int(port)} --threads 4 --rps 100 --duration 30"
         elif backend == 'http':
             url = f"http://127.0.0.1:{int(port)}{info.get('endpoint','/')}"
-            cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets"
+            cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets{files_arg}"
         else:
             # Legacy fallback based on path
             if os.path.sep + 'redis' + os.path.sep in local_bench:
@@ -1631,7 +1655,7 @@ def run_bench(scene: str, port: int):
                 cmd = f"{py} {shlex.quote(local_bench)} --es-host 127.0.0.1 --es-port {int(port)} --threads 4 --rps 100 --duration 30"
             else:
                 url = f"http://127.0.0.1:{int(port)}{info.get('endpoint','/')}"
-                cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets"
+                cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets{files_arg}"
         if backend in ('http', 'jmeter'):
             cmd_full = f"{cmd} --out {shlex.quote(outf)}{metrics_args}"
         else:
@@ -1682,7 +1706,23 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
             return f"{py} {shlex.quote(local_bench)} --es-host {host} --es-port {int(port)} --threads {int(threads)} --rps 100 --duration {int(duration)}{metrics_args}"
         if backend == 'http':
             url = f"http://{host}:{int(port)}{endpoint}"
-            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)} --dataset /runc/datasets --out {shlex.quote(out_path)}{metrics_args}"
+            files_args = ''
+            asset = info.get('asset')
+            if asset:
+                if scene == 'aeneas' and ',' in asset:
+                    parts = [p.strip() for p in asset.split(',') if p.strip()]
+                    pairs = []
+                    for i in range(0, len(parts)-1, 2):
+                        a = parts[i]
+                        t = parts[i+1]
+                        pairs.append(f"{os.path.basename(a)}:{os.path.basename(t)}")
+                    if pairs:
+                        files_args = f" --pairs {shlex.quote(','.join(pairs))}"
+                else:
+                    parts = [p.strip() for p in asset.split(',') if p.strip()]
+                    basenames = ','.join([os.path.basename(p) for p in parts])
+                    files_args = f" --files {shlex.quote(basenames)}"
+            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)} --dataset /runc/datasets --out {shlex.quote(out_path)}{files_args}{metrics_args}"
         if backend == 'jmeter':
             return f"{py} {shlex.quote(local_bench)} --host {host} --port {int(port)} --duration {int(duration)} --threads {int(threads)} --out {shlex.quote(out_path)}{metrics_args}"
     elif bench:

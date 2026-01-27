@@ -45,6 +45,7 @@ else:
     parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
     parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--url', required=True, help='Server base URL (e.g., http://127.0.0.1:8080)')
+parser.add_argument('--files', default=None, help='Comma-separated list of image filenames to cycle through (relative to --dataset if not absolute)')
 parser.add_argument('--requests', '--iters', dest='requests', type=int, default=100, help='Total requests when not using --duration')
 parser.add_argument('--out', default='bench_gocr.csv')
 args = parser.parse_args()
@@ -54,15 +55,57 @@ if bench_common:
     bench_common.configure_logging()
 else:
     if not args.dataset:
-        args.dataset = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
+        args.dataset = '/runc/datasets'
 
 # prepare inputs
+file_paths = []
+if args.files:
+    for part in [p.strip() for p in args.files.split(',') if p.strip()]:
+        if os.path.isabs(part) and os.path.exists(part):
+            file_paths.append(part)
+            continue
+        candidate = os.path.join(args.dataset, part) if args.dataset else part
+        if os.path.exists(candidate):
+            file_paths.append(candidate)
+            continue
+        found = None
+        if args.dataset and os.path.isdir(args.dataset):
+            for root, _, files in os.walk(args.dataset):
+                if part in files:
+                    found = os.path.join(root, part)
+                    break
+        if found:
+            file_paths.append(found)
+        else:
+            raise SystemExit(f'file not found from --files: {part}')
+elif args.dataset and os.path.isdir(args.dataset):
+    for root, _, files in os.walk(args.dataset):
+        for fn in files:
+            if fn.lower().endswith(('.png', '.jpg', '.jpeg')):
+                file_paths.append(os.path.join(root, fn))
+
 inputs = []
-if args.dataset and os.path.isdir(args.dataset):
-    for fn in os.listdir(args.dataset):
-        if fn.lower().endswith(('.png', '.jpg', '.jpeg')):
-            with open(os.path.join(args.dataset, fn), 'rb') as f:
+if file_paths:
+    for p in file_paths:
+        try:
+            with open(p, 'rb') as f:
                 inputs.append(f.read())
+        except Exception:
+            raise SystemExit(f'failed to read file: {p}')
+else:
+    for i in range(20):
+        # generate a tiny synthetic png via a minimal PNG header placeholder
+        inputs.append(b'\x89PNG\r\n\x1a\n' + bytes(str(i), 'utf-8'))
+
+file_idx = 0
+file_lock = threading.Lock()
+
+def get_next_payload():
+    global file_idx
+    with file_lock:
+        idx = file_idx
+        file_idx = (file_idx + 1) % len(inputs)
+    return inputs[idx]
 if not inputs:
     for i in range(20):
         # generate a tiny synthetic png via a minimal PNG header placeholder
@@ -120,7 +163,7 @@ def worker_duration(url, end_time):
     sess = requests.Session()
     while time.time() < end_time:
         rl.acquire()
-        payload = random.choice(inputs)
+        payload = get_next_payload()
         start = time.monotonic()
         try:
             files = {'file': ('img.png', payload, 'image/png')}

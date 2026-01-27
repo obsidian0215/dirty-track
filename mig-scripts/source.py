@@ -687,73 +687,6 @@ def container_may_dump_size(container_pids, dirtymap_path):
     return total_transfer_size
 
 
-def read_warmlist(file_path):
-    """
-    读取warmlist文件，返回其中选择次数(uchar)最大的脏页地址(ulong)和选择次数
-    """
-    try:
-        with open(file_path, "rb") as f:
-            data = f.read()
-
-            # 每个条目的大小
-            entry_size = 9  # sizeof(unsigned long) + sizeof(unsigned char)
-
-            # 验证文件长度是否有效
-            if len(data) % entry_size != 0:
-                print(f"Invalid warmlist file size: {len(data)} bytes")
-                return None, None
-
-            count = len(data) // entry_size
-            max_address = None
-            max_s_count = 0  # 初始化最大选择次数
-
-            for i in range(count):
-                # 解析单个条目
-                entry = data[i * entry_size: (i + 1) * entry_size]
-                address, s_count = struct.unpack("<QB", entry)  # Q: unsigned long, B: unsigned char
-
-                # 更新最大值
-                if s_count > max_s_count:
-                    max_address = address
-                    max_s_count = s_count
-
-            return max_address, max_s_count
-    except Exception as e:
-        print(f"Error reading warmlist file {file_path}: {e}")
-        return None, None
-
-
-def read_max_scount(container_pids, dirtymap_path):
-    """
-    遍历container_pids, 遍历每个pid的温页列表, 找到其中最大的选择次数
-
-    参数:
-    - container_pids: 包含容器的 PID 列表
-    - dirtymap_path: 存放 warm_list.pid 文件的目录路径
-
-    返回:
-    - max_scount: 所有温页列表中最大的选择次数
-    """
-    max_scount = 0  # 初始化最大选择次数
-
-    for pid in container_pids:
-        # 拼接文件路径
-        warm_list_file = os.path.join(dirtymap_path, f"warm_list.{pid}")
-
-        # 调用 read_warmlist 函数读取温页列表
-        max_address, max_scount_pid = read_warmlist(warm_list_file)
-
-        if max_address is None or max_scount_pid is None:
-            print(f"No valid data found for pid {pid}. Skipping.")
-            continue
-
-        # 更新全局最大选择次数
-        if max_scount_pid > max_scount:
-            max_scount = max_scount_pid
-
-    return max_scount
-
-
 # 准备好迁移所需的镜像目录，同时要清除之前的迁移残留的镜像
 # 需要先尝试删除image和parent的整个目录树
 def prepare(base_path, image_path, parent_path, work_path):
@@ -1282,33 +1215,111 @@ def xfer_final(image_path, dest, compress, session, control_sock):
 
 # Run the pre-dump iteration and transfer it to the destination
 
-def read_convergence_metrics(container_pids, dirtymap_path):
+def parse_pred_stats_from_log(dump_log):
+    """Parse ObsidianPred stats from a dump.log file.
+
+    Returns: (pred_total, pred_hit, pred_miss, pred_acc)
     """
-    Read convergence metrics from dirtymap_path for the given container PIDs.
-    Returns (overlap_ratio, max_scount)
+    pred_total = 0
+    pred_hit = 0
+    pred_miss = 0
+    pred_acc = 0.0
+    if not dump_log or not os.path.exists(dump_log):
+        return pred_total, pred_hit, pred_miss, pred_acc
+
+    try:
+        with open(dump_log, "r", errors="ignore") as f:
+            for line in f:
+                if "[ObsidianPred]" not in line:
+                    continue
+                for token in line.strip().split():
+                    if token.startswith("predicted_total="):
+                        pred_total = int(token.split("=", 1)[1])
+                    elif token.startswith("predicted_hit="):
+                        pred_hit = int(token.split("=", 1)[1])
+                    elif token.startswith("predicted_miss="):
+                        pred_miss = int(token.split("=", 1)[1])
+                    elif token.startswith("predicted_accuracy="):
+                        pred_acc = float(token.split("=", 1)[1])
+    except Exception:
+        return 0, 0, 0, 0.0
+
+    if pred_total > 0 and pred_acc == 0.0:
+        pred_acc = (pred_hit * 100.0) / float(pred_total)
+    return pred_total, pred_hit, pred_miss, pred_acc
+
+
+def parse_def_total_from_log(dump_log):
+    """Parse ObsidianDef deferred_total from a dump.log file (last value)."""
+    def_total = 0
+    if not dump_log or not os.path.exists(dump_log):
+        return def_total
+
+    try:
+        with open(dump_log, "r", errors="ignore") as f:
+            for line in f:
+                if "[ObsidianDef]" not in line:
+                    continue
+                for token in line.strip().split():
+                    if token.startswith("deferred_total="):
+                        def_total = int(token.split("=", 1)[1])
+    except Exception:
+        return 0
+
+    return def_total
+
+
+def get_dm_stop_params():
+    """Return DM adaptive stop parameters (aligned with checkpoint_run_impl.sh).
+
+    DM-based stopping is enabled when dirtymap is active. The default stop policy is
+    `balanced`. Environment variables are only used to micro-tune thresholds:
+    `PREDUMP_STOP_POLICY` and `PREDUMP_DM_*` (e.g., `PREDUMP_DM_MIN_PRED_TOTAL`).
     """
-    for pid in container_pids:
-        metrics_file = os.path.join(dirtymap_path, f"convergence_metrics.{pid}")
-        if os.path.exists(metrics_file):
-            try:
-                overlap_ratio = 0.0
-                max_scount = 0
-                with open(metrics_file, 'r') as f:
-                    for line in f:
-                        if line.startswith('warm_set_overlap_ratio='):
-                            overlap_ratio = float(line.split('=')[1].strip())
-                        elif line.startswith('max_consecutive_scount='):
-                            max_scount = int(line.split('=')[1].strip())
-                return overlap_ratio, max_scount
-            except (ValueError, IndexError, IOError):
-                pass
-    return 0.0, 0
+    policy = os.getenv("PREDUMP_STOP_POLICY", "balanced").lower()
+    if policy == "aggressive":
+        min_pred_total = 128
+        acc_converge = 60
+        acc_diverge = 50
+        def_growth_converge = 0.15
+        def_growth_diverge = 0.25
+    elif policy == "conservative":
+        min_pred_total = 512
+        acc_converge = 70
+        acc_diverge = 55
+        def_growth_converge = 0.08
+        def_growth_diverge = 0.25
+    else:
+        min_pred_total = 256
+        acc_converge = 65
+        acc_diverge = 55
+        def_growth_converge = 0.12
+        def_growth_diverge = 0.25
+
+    min_pred_total = int(os.getenv("PREDUMP_DM_MIN_PRED_TOTAL", min_pred_total))
+    acc_converge = float(os.getenv("PREDUMP_DM_ACC_CONVERGE", acc_converge))
+    acc_diverge = float(os.getenv("PREDUMP_DM_ACC_DIVERGE", acc_diverge))
+    def_growth_converge = float(os.getenv("PREDUMP_DM_DEF_GROWTH_CONVERGE", def_growth_converge))
+    def_growth_diverge = float(os.getenv("PREDUMP_DM_DEF_GROWTH_DIVERGE", def_growth_diverge))
+    stop_consec = int(os.getenv("PREDUMP_DM_STOP_CONSEC", 2))
+
+    return {
+        "min_pred_total": min_pred_total,
+        "acc_converge": acc_converge,
+        "acc_diverge": acc_diverge,
+        "def_growth_converge": def_growth_converge,
+        "def_growth_diverge": def_growth_diverge,
+        "stop_consec": stop_consec,
+    }
 
 def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_session):
     iter_terminate = False
     last_iter = 1
-    prev_overlap = None
-    low_gain_count = 0
+    # DM-based stopping is automatically active when dirtymap is enabled; environment variables only tune thresholds.
+    dm_params = get_dm_stop_params() if dirtymap else None
+    prev_def_total = 0
+    dm_converge_count = 0
+    dm_diverge_count = 0
     if dirtymap:
         # 在pre-copy开启前先启动对容器的dirty-track
         get_runc_container_pidtree(container)
@@ -1338,30 +1349,39 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
                 iter_terminate = True
 
         if dirtymap:
-            overlap, max_scount = read_convergence_metrics(container_pids, dirtymap_path)
-            print(f"Iteration {last_iter}: overlap={overlap:.4f}, max_scount={max_scount}")
+            dump_log = os.path.join(mig_base, f"pd_log_{last_iter}", "dump.log")
+            pred_total, pred_hit, pred_miss, pred_acc = parse_pred_stats_from_log(dump_log)
+            def_total = parse_def_total_from_log(dump_log)
+            def_growth = (def_total - prev_def_total) / float(prev_def_total) if prev_def_total > 0 else 0.0
+            dm_pred_valid = (pred_total >= dm_params["min_pred_total"]) and (prev_def_total > 0)
 
-            # 1. Reach 95% overlap
-            if overlap >= 0.95:
-                print(f"Converged at iteration {last_iter} (overlap >= 95%)")
-                iter_terminate = True
+            print(
+                f"Iteration {last_iter}: pred_total={pred_total} pred_acc={pred_acc:.2f}% "
+                f"def_total={def_total} def_growth={def_growth:.4f} dm_valid={dm_pred_valid}"
+            )
 
-            # 2. Gradient stop
-            if prev_overlap is not None:
-                gain = overlap - prev_overlap
-                if gain < 0.005:
-                    low_gain_count += 1
-                    if low_gain_count >= 2:
-                        print(f"Diminishing returns at iteration {last_iter} (gain {gain:.4f} < 0.5% for 2 rounds)")
-                        iter_terminate = True
+            if dm_pred_valid:
+                if pred_acc >= dm_params["acc_converge"] and def_growth <= dm_params["def_growth_converge"]:
+                    dm_converge_count += 1
                 else:
-                    low_gain_count = 0
-            prev_overlap = overlap
+                    dm_converge_count = 0
 
-            # 3. Safety break
-            if max_scount >= 7:
-                print(f"Safety break at iteration {last_iter} (max_scount >= 7)")
-                iter_terminate = True
+                if pred_acc <= dm_params["acc_diverge"] and def_growth >= dm_params["def_growth_diverge"]:
+                    dm_diverge_count += 1
+                else:
+                    dm_diverge_count = 0
+
+                if dm_converge_count >= dm_params["stop_consec"]:
+                    print(f"Converged by dirtymap at iter {last_iter} (dm_converge_count={dm_converge_count})")
+                    iter_terminate = True
+                if dm_diverge_count >= dm_params["stop_consec"]:
+                    print(f"Diverged by dirtymap at iter {last_iter} (dm_diverge_count={dm_diverge_count})")
+                    iter_terminate = True
+            else:
+                dm_converge_count = 0
+                dm_diverge_count = 0
+
+            prev_def_total = def_total
 
         session = resolve_session(last_iter, last_path)
         if not session:
