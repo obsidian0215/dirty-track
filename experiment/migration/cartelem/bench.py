@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+bench_vehicle_influx.py - Vehicle Telematics Benchmark for InfluxDB
+
+Advanced Car Telematics Benchmark adapted for InfluxDB
+Enhanced with realistic data generation, scalable payload sizes, and robust operations
+Similar to Redis bench_cartelem.py but using InfluxDB time series storage
+
+FEATURES:
+   - 数据规模扩展: Configurable payload sizes and distribution patterns
+   - 数据类型真实性: Vehicle behavior patterns, physical constraints simulation
+   - 实时分析: Continuous location tracking and diagnostics
+
+USAGE:
+    python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 8 --duration 30 --vehicle-pattern highway --payload-size 5KB
+   python3 bench_cartelem.py --influx-url http://localhost:8181 --threads 4 --duration 60 --size-distribution normal
+    python3 bench_cartelem.py --influx-url http://localhost:8181 --payload-size 2KB --connect-timeout 5
+
+EXTENDED USAGE:
+   --vehicle-pattern: normal_city/highway/stop_go (default: normal_city)
+    --payload-size: Target payload size with units (default: 1KB). Examples: 256B, 16KB, 1MB
+   --size-distribution: uniform/normal/zipf (default: uniform)
+"""
+
+import argparse
+import json
+import logging
+import random
+import threading
+import time
+import statistics
+import math
+import os
+import base64
+from typing import Dict, Any, Optional
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS, ASYNCHRONOUS
+from influxdb_client.client.query_api import QueryApi
+import re
+
+# Dynamic bench_common import (searches up the tree for common/bench_common.py)
+try:
+    import importlib.util as _importlib_util, os as _os
+    _cur = _os.path.abspath(_os.path.dirname(__file__))
+    _bench_common = None
+    for _ in range(6):
+        _candidate = _os.path.join(_cur, 'common', 'bench_common.py')
+        if _os.path.exists(_candidate):
+            spec = _importlib_util.spec_from_file_location('bench_common', _candidate)
+            _bench_common = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(_bench_common)
+            break
+        _cur = _os.path.dirname(_cur)
+    bench_common = _bench_common
+except Exception:
+    bench_common = None
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+
+class RateLimiter:
+    """Thread-safe token bucket to enforce a global RPS cap."""
+
+    def __init__(self, rate: Optional[int]):
+        self.rate = rate
+        if rate:
+            self._capacity = float(rate)
+            self._tokens = float(rate)
+            self._last_refill = time.monotonic()
+            self._lock = threading.Lock()
+
+    def acquire(self):
+        if not self.rate:
+            return
+
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                if elapsed > 0:
+                    refill = elapsed * self._capacity
+                    self._tokens = min(self._capacity, self._tokens + refill)
+                    self._last_refill = now
+
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+
+                deficit = 1.0 - self._tokens
+                wait_time = deficit / self._capacity
+
+            time.sleep(wait_time)
+
+
+class VehicleInfluxBench:
+    """Vehicle Telematics InfluxDB Benchmark"""
+    def __init__(self, influx_url: str, token: str, org: str, bucket: str = "vehicle-data",
+                 # Data scale extension (bytes)
+                 payload_size_bytes: int = 1024, size_distribution: str = "uniform",
+                # Data type realism
+                vehicle_pattern: str = "normal_city",
+                # 数据生命周期管理
+                retention_policy: str = "1h",
+                # 消息速率控制
+                max_requests_per_second: Optional[int] = None,
+                # Realism extensions
+                device_count: int = 0,
+                pacing: bool = False,
+                payload_mixture: bool = False,
+                report_realism: bool = False):
+
+        self.influx_url = influx_url
+        self.token = token
+        self.org = org
+        self.bucket = bucket
+        self._stop = threading.Event()
+
+        # Realism config
+        self.device_count = device_count
+        self.pacing = pacing
+        self.payload_mixture = payload_mixture
+        self.report_realism = report_realism
+        self.device_counter = {}
+        self.interarrivals = []
+        self.payload_sizes_tracked = []
+        self._realism_profile = None
+
+        # Data scale extension config (bytes)
+        self.payload_size_bytes = int(payload_size_bytes)
+        self.size_distribution = size_distribution
+
+        # Data type realism config
+        self.vehicle_pattern = vehicle_pattern  # normal_city, highway, stop_go
+        self.vehicle_states: Dict[str, Dict[str, Any]] = {}
+
+        # 数据生命周期管理
+        self.retention_policy = retention_policy
+
+        # Monitoring config
+        self.monitor_interval = 1.0
+        self.last_report_time = 0
+        self.last_success_count = 0
+
+        # Statistics
+        self.latencies_ms = []
+        self.success = 0
+        self.fail = 0
+        self.lock = threading.Lock()
+
+        # track payload sizes (bytes) for metrics
+        self.payload_sizes = []
+        # payload mode: 'json' or 'binary'
+        self.payload_mode = "json"
+
+        # 速率控制参数
+        self.max_requests_per_second = max_requests_per_second
+        self._rate_limiter = RateLimiter(max_requests_per_second)
+
+        # Retention配置跟踪
+        self._retention_configured = False
+
+
+        # InfluxDB client initialization
+        self.client = InfluxDBClient(url=influx_url, token=token, org=org)
+        self.write_api = self.client.write_api(write_options=SYNCHRONOUS)
+        self.query_api = self.client.query_api()
+
+        # Bucket management client
+        from influxdb_client.client.bucket_api import BucketsApi
+        self.buckets_api = self.client.buckets_api()
+        self.org_api = self.client.organizations_api()
+
+
+    def _get_vehicle_state(self, vehicle_id: str) -> Dict[str, Any]:
+        """Get or initialize vehicle state for realistic simulation"""
+        if vehicle_id not in self.vehicle_states:
+            self.vehicle_states[vehicle_id] = {
+                "speed": random.uniform(10, 30),  # Initial speed
+                "fuel": 100 - random.random() * 20,  # Fuel level
+                "lat": 31.0 + random.random() * 0.1,
+                "lon": 121.0 + random.random() * 0.1,
+                "engine_temp": 85 + random.random() * 15,
+                "last_update": time.time()
+            }
+        return self.vehicle_states[vehicle_id]
+
+    def _update_vehicle_state(self, vehicle_id: str, new_speed: float):
+        """Update vehicle state based on physical characteristics"""
+        state = self._get_vehicle_state(vehicle_id)
+        curr_time = time.time()
+        time_delta = curr_time - state["last_update"]
+        # Update geographic coordinates based on heading and speed
+        if "heading" not in state:
+            state["heading"] = random.uniform(0, 360)
+        else:
+            state["heading"] += random.uniform(-10, 10) # Random slight turn
+
+        dist_km = (new_speed * time_delta) / 3600.0
+        rad = math.radians(state["heading"])
+        # 1 degree lat is ~111km, 1 degree lon is ~111km * cos(lat)
+        d_lat = dist_km * math.cos(rad) / 111.0
+        d_lon = dist_km * math.sin(rad) / (111.0 * math.cos(math.radians(state.get("lat", 31.0))))
+
+        state["lat"] += d_lat
+        state["lon"] += d_lon
+        # Fuel consumption calculation (L/100km)
+        fuel_consumption = (abs(new_speed - state["speed"]) * time_delta + new_speed * time_delta) * 0.001
+        state["fuel"] = max(0, state["fuel"] - fuel_consumption)
+
+        # Engine temperature calculation
+        if new_speed > 80:
+            state["engine_temp"] = min(120, state["engine_temp"] + (new_speed * time_delta * 0.1))
+        else:
+            state["engine_temp"] = max(60, state["engine_temp"] - (time_delta * 5))
+
+        state["speed"] = new_speed
+        state["last_update"] = curr_time
+
+    def _generate_diagnostics(self) -> Dict[str, Any]:
+        """Generate OBD diagnostic codes"""
+        obd_codes = ["P0100", "P0101", "P0200", "P0300", "P0400", "P0500", "P0600"]
+        codes = random.sample(obd_codes, random.randint(0, min(3, len(obd_codes))))
+
+        return {
+            "obd_codes": codes,
+            "check_engine_light": random.random() < 0.1,
+            "battery_voltage": round(12.6 + (random.random() - 0.5) * 0.5, 2),
+            "transmission_temp": round(85 + (random.random() - 0.5) * 10, 2),
+            "malfunction_indicator": random.choice(["off", "on", "flashing"])
+        }
+
+    def _calculate_dynamic_speed(self, vehicle_id: str) -> float:
+        """Calculate real-time speed based on driving pattern"""
+        patterns = {
+            "normal_city": {"min": 0, "max": 50, "accel_rate": 0.5},
+            "highway": {"min": 60, "max": 120, "accel_rate": 1.2},
+            "stop_go": {"min": 0, "max": 40, "accel_rate": 2.0}
+        }
+
+        pattern = patterns[self.vehicle_pattern]
+        base_speed = self._get_vehicle_state(vehicle_id)["speed"]
+
+        # Apply acceleration constraints
+        acceleration = pattern["accel_rate"] * (random.random() - 0.5)
+        new_speed = max(0, min(base_speed + acceleration, pattern["max"]))
+
+        # Specific pattern behaviors
+        if self.vehicle_pattern == "stop_go":
+            if random.random() < 0.3:
+                new_speed = random.uniform(20, 40)
+            elif random.random() < 0.2:
+                new_speed = 0
+
+        elif self.vehicle_pattern == "highway":
+            if base_speed < 70 and random.random() < 0.8:
+                new_speed = min(pattern["max"], base_speed + 2)
+
+        return round(new_speed, 2)
+
+    def sample_interarrival(self) -> float:
+        """Sample inter-arrival time (seconds). If pacing is on, use Poisson process."""
+        if not self.pacing:
+            return 0.0
+
+        if self._realism_profile:
+            return self._realism_profile.next_interarrival()
+
+        target_rate = self._rate_limiter.rate if self._rate_limiter.rate else 100.0
+        return -math.log(1.0 - random.random()) / target_rate
+
+    def sample_payload_size_from_mixture(self) -> int:
+        """Sample payload size from a mixture model if enabled."""
+        if self._realism_profile:
+            return self._realism_profile.sample_payload_size()
+
+        if not self.payload_mixture:
+            return self.payload_size_bytes
+
+        if random.random() < 0.8:
+            return self.payload_size_bytes
+        else:
+            return self.payload_size_bytes * 5
+
+    def _generate_vehicle_data(self, vehicle_id: Optional[str] = None, target_size_override: Optional[int] = None) -> list:
+        """Generate enhanced vehicle telemetry data"""
+        if not vehicle_id:
+            vehicle_id = f"veh-{random.randint(1000, 9999)}"
+        base_timestamp = int(time.time() * 1000000000)
+
+        # Get vehicle state
+        state = self._get_vehicle_state(vehicle_id)
+        current_speed = self._calculate_dynamic_speed(vehicle_id)
+
+        # Update vehicle state
+        self._update_vehicle_state(vehicle_id, current_speed)
+
+        points = []
+
+        # Main telemetry point
+        main_point = Point("vehicle_telemetry") \
+            .tag("vehicle_id", vehicle_id) \
+            .tag("pattern", self.vehicle_pattern) \
+            .tag("model", random.choice(["sedan", "suv", "truck", "hatchback"])) \
+            .tag("fuel_type", random.choice(["gasoline", "diesel", "electric"])) \
+            .tag("status", "active" if state["fuel"] > 5 else "low_fuel") \
+            .field("speed_kmh", current_speed) \
+            .field("fuel_level", round(state["fuel"], 2)) \
+            .field("engine_temp", round(state["engine_temp"], 2)) \
+            .field("latitude", round(state["lat"], 6)) \
+            .field("longitude", round(state["lon"], 6)) \
+            .time(base_timestamp, write_precision=WritePrecision.NS)
+
+        points.append(main_point)
+
+        # Diagnostics point
+        diagnostics = self._generate_diagnostics()
+        diag_point = Point("vehicle_diagnostics") \
+            .tag("vehicle_id", vehicle_id) \
+            .tag("check_engine_light", str(diagnostics["check_engine_light"]).lower()) \
+            .tag("malfunction_indicator", diagnostics["malfunction_indicator"]) \
+            .field("battery_voltage", diagnostics["battery_voltage"]) \
+            .field("transmission_temp", diagnostics["transmission_temp"]) \
+            .field("obd_code_count", len(diagnostics["obd_codes"])) \
+            .field("system_status", random.choice(["normal", "warning", "critical"])) \
+            .time(base_timestamp, write_precision=WritePrecision.NS)
+
+        points.append(diag_point)
+
+        # Data scale extension - add sensor data (apply specified distribution)
+        current_size = len(json.dumps({
+            "vehicle_id": vehicle_id, "speed": current_speed,
+            "fuel_level": state["fuel"], "engine_temp": state["engine_temp"],
+            "latitude": state["lat"], "longitude": state["lon"]
+        }))
+
+        if target_size_override:
+            target_size_bytes = target_size_override
+        else:
+            base_target_bytes = int(self.payload_size_bytes)  # 基本目标大小 (bytes)
+
+            # Apply distribution function
+            if self.size_distribution == "uniform":
+                random_multiplier = random.uniform(0.8, 1.2)
+            elif self.size_distribution == "normal":
+                random_multiplier = random.gauss(1.0, 0.1)  # 正态分布，均值1，标准差0.1
+                random_multiplier = max(0.7, min(1.3, random_multiplier))  # 限制在70%-130%
+            elif self.size_distribution == "zipf":
+                random_multiplier = random.betavariate(2, 5) * 0.8 + 0.6  # Zipf-like分布，偏向较小值
+            else:
+                random_multiplier = 1.0  # 默认fallback
+
+            target_size_bytes = int(base_target_bytes * random_multiplier)
+
+        if current_size < target_size_bytes:
+            # Add additional sensor readings
+            sensors = []
+            sensor_types = ["gps_accuracy", "gyroscope", "accelerometer", "magnetometer",
+                          "tire_pressure", "brake_pressure", "throttle_position", "exhaust_sensor"]
+
+            while len(sensors) < 8:
+                sensor = {
+                    "type": random.choice(sensor_types),
+                    "value": random.random() * random.choice([100, 200, 500, 1000]),
+                    "unit": random.choice(["meters", "degrees", "g", "pa", "percentage"]),
+                    "precision": round(random.random() * 0.1, 6),
+                    "calibration_date": f"2023-{random.randint(1,12):02d}"
+                }
+                sensors.append(sensor)
+
+                sensor_point = Point("vehicle_sensor") \
+                    .tag("vehicle_id", vehicle_id) \
+                    .tag("sensor_type", sensor["type"]) \
+                    .tag("unit", sensor["unit"]) \
+                    .tag("quality", random.choice(["good", "excellent", "poor"])) \
+                    .field("value", sensor["value"]) \
+                    .field("precision", sensor["precision"]) \
+                    .field("confidence", round(random.uniform(0.8, 0.99), 3)) \
+                    .time(base_timestamp + len(sensors) * 1000000, write_precision=WritePrecision.NS)  # 1ms offset
+
+                points.append(sensor_point)
+
+                # 检查添加后大小，如果超过则移除最后一个点
+                new_size = len(json.dumps({**{"vehicle_id": vehicle_id, "speed": current_speed}, "sensors": sensors}))
+                if new_size > target_size_bytes:
+                    points.pop()  # 移除添加的点
+                    logger.debug(f"Payload size would exceed target {target_size_bytes} bytes (would be {new_size}), truncated")
+                    break
+
+        if current_size > target_size_bytes:
+            logger.warning(f"Baseline sensor data already exceeds target size: {current_size} > {target_size_bytes} bytes")
+
+        # Estimate payload bytes by reconstructing a representative dict
+        try:
+            payload_est = {
+                "vehicle_id": vehicle_id,
+                "speed": current_speed,
+                "fuel_level": state["fuel"],
+                "engine_temp": state["engine_temp"],
+                "latitude": state["lat"],
+                "longitude": state["lon"]
+            }
+            # if sensors were added, estimate their size too
+            if any(p.measurement == "vehicle_sensor" for p in points):
+                # approximate sensors by serializing a list of simple dicts
+                sensors_approx = []
+                for p in points:
+                    if p.measurement == "vehicle_sensor":
+                        # use tags/fields that are present; field values may be in p._fields (private), but approximate
+                        sensors_approx.append({"sensor_point": 1})
+                payload_est["sensors"] = sensors_approx
+
+            est_bytes = len(json.dumps(payload_est))
+        except Exception:
+            est_bytes = 0
+
+        # If binary payload_mode is requested, attach a base64 blob to the main point
+        if getattr(self, "payload_mode", "json") == "binary":
+            target_bytes = int(self.payload_size_bytes)
+            raw = os.urandom(max(1, target_bytes))
+            b64 = base64.b64encode(raw).decode("ascii")
+            # inject raw blob into first point (main telemetry)
+            try:
+                points[0] = points[0].field("raw_blob", b64)
+                payload_bytes = len(raw)
+            except Exception:
+                payload_bytes = est_bytes
+        else:
+            payload_bytes = est_bytes
+
+        # record payload size for metrics
+        try:
+            self.payload_sizes.append(int(payload_bytes))
+        except Exception:
+            pass
+
+        return points
+
+    def _execute_location_query(self):
+        """Execute location-based query"""
+        query = f"""
+            from(bucket: "{self.bucket}")
+            |> range(start: -1h)
+            |> filter(fn: (r) => r["_measurement"] == "vehicle_telemetry")
+            |> filter(fn: (r) => r["pattern"] == "{self.vehicle_pattern}")
+            |> filter(fn: (r) => r["speed_kmh"] > 10)
+            |> limit(n: 50)
+        """
+
+        start_time = time.perf_counter()
+        result = self.query_api.query(query, self.org)
+        latency = (time.perf_counter() - start_time) * 1000
+
+        with self.lock:
+            self.latencies_ms.append(latency)
+            self.success += 1
+
+        return len(result)
+
+    def _worker(self, duration: float, read_pct: int):
+        """Worker thread for mixed operations"""
+        end_time = time.time() + duration
+
+        while time.time() < end_time and not self._stop.is_set():
+            do_read = random.randint(1, 100) <= read_pct
+            start = time.perf_counter()
+
+            # Pacing
+            interval = self.sample_interarrival()
+            if interval > 0:
+                time.sleep(interval)
+                if self.report_realism:
+                    with self.lock:
+                        self.interarrivals.append(interval)
+
+            # 速率控制检查
+            self._rate_control()
+
+            try:
+                if do_read:
+                    self._execute_location_query()
+                else:
+                    # Write vehicle data
+                    dev = None
+                    if self.device_count > 0:
+                        idx = random.randint(1, self.device_count)
+                        dev = f"veh-{idx:04d}"
+                    elif hasattr(self, '_realism_profile') and self._realism_profile:
+                        dev = self._realism_profile.choose_device_id()
+
+                    if self.report_realism and dev:
+                        with self.lock:
+                            self.device_counter[dev] = self.device_counter.get(dev, 0) + 1
+
+                    size_override = self.sample_payload_size_from_mixture()
+                    if self.report_realism:
+                        with self.lock:
+                            self.payload_sizes_tracked.append(size_override)
+
+                    points = self._generate_vehicle_data(vehicle_id=dev, target_size_override=size_override)
+                    self.write_api.write(bucket=self.bucket, org=self.org, record=points)
+                    lat = (time.perf_counter() - start) * 1000.0
+
+                    with self.lock:
+                        self.latencies_ms.append(lat)
+                        self.success += 1
+            except Exception as e:
+                logger.debug("Operation failed: %s", e)
+                with self.lock:
+                    self.fail += 1
+                time.sleep(0.01)
+
+            # Periodic monitoring
+            self._periodic_monitoring(duration)
+
+    def _periodic_monitoring(self, total_duration: float):
+        """Periodic throughput and latency monitoring"""
+        current_time = time.time()
+        if current_time - self.last_report_time >= self.monitor_interval:
+            # 正确的elapsed时间计算
+            elapsed = current_time - self.start_time
+            success_count = self.success
+            new_operations = success_count - self.last_success_count
+
+            if new_operations >= 0:
+                throughput_ops_sec = new_operations / (current_time - self.last_report_time)
+
+                recent_latencies = []
+                with self.lock:
+                    if self.latencies_ms:
+                        recent_count = min(1000, len(self.latencies_ms))
+                        recent_latencies = self.latencies_ms[-recent_count:]
+
+                if recent_latencies:
+                    recent_latencies.sort()
+                    avg_lat = statistics.mean(recent_latencies)
+                    p95_lat = recent_latencies[int(len(recent_latencies) * 0.95)] if len(recent_latencies) > 1 else recent_latencies[0]
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}, Avg Lat: {avg_lat:.2f}ms, P95: {p95_lat:.2f}ms")
+                else:
+                    logger.info(f"[{elapsed:.1f}s] TPS: {throughput_ops_sec:.1f}")
+
+                self.last_report_time = current_time
+                self.last_success_count = success_count
+
+    def run(self, threads: int = 4, duration: int = 10, read_pct: int = 5):
+        """Run the benchmark"""
+        # 记录测试开始时间，用于计算精确的elapsed时间
+        start_time = time.time()
+
+        # 初始化监控参数
+        self.last_report_time = start_time
+        self.last_success_count = 0
+        self.start_time = start_time
+
+        tlist = []
+        for _ in range(threads):
+            t = threading.Thread(target=self._worker, args=(duration, read_pct), daemon=True)
+            t.start()
+            tlist.append(t)
+
+        logger.info("Started %d threads for %ds (vehicle_pattern=%s, payload_bytes=%d)",
+                    threads, duration, self.vehicle_pattern, self.payload_size_bytes)
+
+        for t in tlist:
+            t.join()
+
+        self._print_summary(duration)
+
+        # Close client connection
+        self.client.close()
+
+
+    def _parse_duration_to_seconds(self, duration_str):
+        """Parse duration string like '1h', '24h', '7d' to seconds"""
+        if not duration_str:
+            return 3600  # Default 1 hour
+
+        duration_str = duration_str.lower()
+        multiplier = {
+            's': 1,
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+            'w': 604800
+        }
+
+        # Parse duration
+        import re
+        match = re.match(r'^(\d+)([smhdw])$', duration_str)
+        if match:
+            value, unit = match.groups()
+            return int(value) * multiplier.get(unit, 1)
+
+        # Default fallback
+        logger.warning(f"Invalid duration format: {duration_str}, using default 1h")
+        return 3600
+
+    def _rate_control(self):
+        """实现精确的速率控制"""
+        self._rate_limiter.acquire()
+
+    def _print_summary(self, duration: int):
+        """Print benchmark summary"""
+        total = self.success + self.fail
+        ops_per_sec = self.success / max(1e-9, duration)
+        logger.info("Total ops: %d success=%d fail=%d ops/sec=%.2f", total, self.success, self.fail, ops_per_sec)
+
+        if self.latencies_ms:
+            lat = sorted(self.latencies_ms)
+            def pct(p): return lat[int(len(lat)*p/100)]
+            logger.info("Latency ms - avg=%.3f p50=%.3f p90=%.3f p99=%.3f max=%.3f",
+                       statistics.mean(lat), pct(50), pct(90), pct(99), lat[-1])
+
+        # Emit structured metrics for downstream parsers
+        try:
+            if self.payload_sizes:
+                avg_payload = int(statistics.mean(self.payload_sizes))
+                median_payload = int(statistics.median(self.payload_sizes))
+            else:
+                avg_payload = 0
+                median_payload = 0
+        except Exception:
+            avg_payload = 0
+            median_payload = 0
+
+        logger.info("METRIC_HEADER\tavg_payload_bytes\tmedian_payload_bytes\ttotal_ops\tops_per_sec")
+        logger.info("METRIC_VALUES\t%d\t%d\t%d\t%.2f", avg_payload, median_payload, total, ops_per_sec)
+
+        if self.report_realism:
+            try:
+                import json
+                report = {
+                    "bench": "influx_cartelem",
+                    "timestamp": time.time(),
+                    "duration": duration,
+                    "total_ops": total,
+                    "ops_per_sec": ops_per_sec,
+                    "interarrivals": self.interarrivals,
+                    "payload_sizes": self.payload_sizes_tracked,
+                    "device_counts": self.device_counter
+                }
+                # Write to config_tests/results/realism_report_influx_cartelem_<ts>.json
+                out_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../config_tests/results'))
+                os.makedirs(out_dir, exist_ok=True)
+                fn = os.path.join(out_dir, f"realism_report_influx_cartelem_{int(time.time())}.json")
+                with open(fn, 'w') as f:
+                    json.dump(report, f)
+                logger.info(f"Wrote realism report to {fn}")
+            except Exception as e:
+                logger.error(f"Failed to write realism report: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Advanced Vehicle Telematics InfluxDB Benchmark")
+
+    # InfluxDB connection
+    parser.add_argument("--influx-url", default="http://localhost:8181", help="InfluxDB URL")
+    parser.add_argument("--token", default="my-super-secret-auth-token", help="InfluxDB token")
+    parser.add_argument("--org", default="my-org", help="InfluxDB org")
+    parser.add_argument("--bucket", default="vehicle-data", help="InfluxDB bucket")
+
+    # Data scale extension
+    parser.add_argument("--payload-size", default="1KB", type=str, help="Target payload size with units (e.g., 256B, 16KB, 1MB). Examples: 512B, 16KB, 1MB")
+    parser.add_argument("--size-distribution", default="uniform", type=str,
+                       choices=["uniform", "normal", "zipf"], help="Distribution type for payload sizes")
+
+    # Data type realism
+    parser.add_argument("--vehicle-pattern", default="normal_city", type=str,
+                       choices=["normal_city", "highway", "stop_go"], help="Vehicle driving pattern")
+
+    # Workload parameters
+    parser.add_argument("--threads", "--concurrency", dest="threads", default=4, type=int, help="Worker threads")
+    parser.add_argument("--duration", default=10, type=int, help="Test duration in seconds")
+    parser.add_argument("--frontend-url", dest="frontend_url", default=None, help="Optional HTTP frontend URL to route requests through")
+    parser.add_argument("--dataset", default=None, help="Path to dataset directory (default: repo datasets/)")
+    parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
+    parser.add_argument("--retention-policy", default="1h", type=str,
+                       help="Bucket retention policy (e.g., 1h, 24h, 7d)")
+
+    # Payload mode
+    parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
+                        help="Payload mode: json (structured points) or binary (embed base64 blob in main point)")
+
+    # 消息速率控制
+    parser.add_argument("--rps", "--qps", "--max-requests-per-second", dest="rps",
+                       type=int, default=0, help="Maximum requests per second (0=no limit)")
+
+    parser.add_argument("--realism", default=None, help="Realism profile name (e.g., edge_basic) or 'edge_bursty')")
+
+    # Realism extensions
+    parser.add_argument("--device-count", default=0, type=int, help="Limit number of unique devices (0=unlimited)")
+    parser.add_argument("--pacing", action="store_true", help="Enable Poisson pacing")
+    parser.add_argument("--payload-mixture", action="store_true", help="Enable payload size mixture")
+    parser.add_argument("--report-realism", action="store_true", help="Write realism report JSON")
+
+    args = parser.parse_args()
+
+    # Common post-parse adjustments and dataset resolution
+    if bench_common:
+        if getattr(args, 'dataset', None) is None:
+            args.dataset = bench_common.DEFAULT_DATASET_DIR
+        args.dataset = bench_common.get_dataset_path(args)
+        bench_common.configure_logging()
+    else:
+        if getattr(args, 'dataset', None) is None:
+            args.dataset = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'datasets'))
+        args.dataset = os.path.abspath(args.dataset)
+
+    # support new unit-aware --payload-size flag
+    def parse_size_token(tok: str) -> int:
+        t = tok.strip()
+        m = re.match(r"^(\d+(?:\.\d+)?)([a-zA-Z]*)$", t)
+        if not m:
+            raise ValueError(f"invalid size token: {tok}")
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if unit in ("b", "byte", "bytes") or unit == "":
+            return int(val)
+        if unit in ("k", "kb", "kib"):
+            return int(val * 1024)
+        if unit in ("m", "mb", "mib"):
+            return int(val * 1024 * 1024)
+        raise ValueError(f"unknown size unit: {unit}")
+
+    # parse canonical --payload-size into bytes
+    payload_bytes = parse_size_token(args.payload_size)
+    payload_size_bytes = int(payload_bytes)
+
+    bench = VehicleInfluxBench(
+        influx_url=args.influx_url,
+        token=args.token,
+        org=args.org,
+        bucket=args.bucket,
+    # Data scale extension (bytes)
+    payload_size_bytes=payload_size_bytes,
+        size_distribution=args.size_distribution,
+        # Data type realism
+        vehicle_pattern=args.vehicle_pattern,
+        # 数据生命周期管理
+        retention_policy=args.retention_policy,
+        # 消息速率控制
+        max_requests_per_second=args.rps,
+        # Realism extensions
+        device_count=args.device_count,
+        pacing=args.pacing,
+        payload_mixture=args.payload_mixture,
+        report_realism=args.report_realism
+    )
+    bench.payload_mode = args.payload_mode
+
+    # optional realism profile (prototype)
+    if args.realism:
+        try:
+            from experiment.migration.realistic import load_profile
+            bench._realism_profile = load_profile(args.realism)
+        except Exception:
+            bench._realism_profile = None
+    else:
+        bench._realism_profile = None
+
+    bench.run(threads=args.threads, duration=args.duration, read_pct=args.read_pct)
+
+
+if __name__ == "__main__":
+    main()

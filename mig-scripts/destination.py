@@ -19,8 +19,21 @@ from typing import Any, Callable, Dict, List, Optional
 import psutil  # type: ignore[import-not-found]
 from script_defaults import get_default_ips
 
+# Import HostResourceMonitor from the centralized monitor module (fallback to file import
+# so the script can still be run directly as a script).
+try:
+    from mig_scripts.monitor import HostResourceMonitor
+except Exception:
+    import importlib.util as _il
+
+    spec = _il.spec_from_file_location("monitor_mod", os.path.join(os.path.dirname(__file__), "monitor.py"))
+    monitor_mod = _il.module_from_spec(spec)
+    spec.loader.exec_module(monitor_mod)
+    HostResourceMonitor = monitor_mod.HostResourceMonitor
+
 compress = False
 restore_info = None
+rst_time = 0.0
 
 # 设置日志记录
 logging.basicConfig(level=logging.INFO)
@@ -142,6 +155,10 @@ class TransferSession:
         self.done.set()
 
 
+# HostResourceMonitor is provided by `mig-scripts/monitor.py` and will be imported where needed.
+# (was previously an inline duplicate here; centralized implementation lives in monitor.py)
+
+
 class TransferManager:
     def __init__(self) -> None:
         self.sessions: Dict[str, TransferSession] = {}
@@ -152,6 +169,8 @@ class TransferManager:
         # keep a short-lived cache of recently completed non-final sessions
         # maps token -> (result_dict, completion_time)
         self._completed_sessions: Dict[str, tuple] = {}
+        # map token -> HostResourceMonitor for sessions we are monitoring (final session typically)
+        self._session_monitors: Dict[str, "HostResourceMonitor"] = {}
 
     def reset(self) -> None:
         with self.lock:
@@ -171,6 +190,19 @@ class TransferManager:
         }
         if session.error:
             result["message"] = session.error
+
+        # If we started a destination monitor for this session, stop it and expose the path
+        mon = None
+        try:
+            mon = self._session_monitors.pop(session.token, None)
+        except Exception:
+            mon = None
+        if mon:
+            try:
+                mon.stop()
+                result["resource_path"] = mon.out_path
+            except Exception:
+                pass
 
         with self.lock:
             # Remove the session if it is still tracked.
@@ -201,6 +233,22 @@ class TransferManager:
                 self.final_token = session.token
                 self.final_info = None
                 self.final_event.clear()
+
+        # If this is the final transfer, start a host-side monitor that will record
+        # destination resource usage during the transfer and save it into d_log
+        if is_final:
+            try:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                parent_dir = os.path.abspath(os.path.join(extract_path, os.pardir))
+                out_dir = os.path.join(parent_dir, "d_log")
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"resource_usage.dest.{ts}.tsv")
+                mon = HostResourceMonitor(out_path, interval=1.0, iface="ens33")
+                mon.start()
+                self._session_monitors[session.token] = mon
+            except Exception as e:
+                logger.warning(f"Failed to start destination resource monitor: {e}")
+
         return session
 
     def complete_session(self, token: str, timeout: float = 180.0) -> Dict[str, object]:
@@ -349,6 +397,8 @@ def handle_prepare(prepare_info):
     path = prepare_info["path"]
     image_path = prepare_info["image_path"]
 
+    local_dest = bool(prepare_info.get("local_dest", False))
+
     parent_paths = prepare_info.get("parent_path", [])
     compress = prepare_info.get("compress", 0)
 
@@ -360,38 +410,82 @@ def handle_prepare(prepare_info):
         prepare(path, image_path, parent_paths)
 
         session_details: List[Dict[str, object]] = []
-        for idx, parent in enumerate(parent_paths):
-            if not parent:
-                continue
-            iter_num: Optional[int] = None
-            match = re.search(r"(\d+)$", parent)
-            if match:
-                try:
-                    iter_num = int(match.group(1))
-                except ValueError:
-                    iter_num = None
 
-            session = transfer_manager.create_session(
-                desc=f"pre-dump-{iter_num if iter_num is not None else idx}",
-                extract_path=parent,
+        if local_dest:
+            # 本机模式：不启动网络传输会话，直接返回本地会话描述
+            for idx, parent in enumerate(parent_paths):
+                if not parent:
+                    continue
+                iter_num: Optional[int] = None
+                match = re.search(r"(\d+)$", parent)
+                if match:
+                    try:
+                        iter_num = int(match.group(1))
+                    except ValueError:
+                        iter_num = None
+
+                session_details.append(
+                    {
+                        "token": "LOCAL",
+                        "port": None,
+                        "path": parent,
+                        "iteration": iter_num if iter_num is not None else idx,
+                        "type": "pre_dump",
+                        "local": True,
+                    }
+                )
+
+            with transfer_manager.lock:
+                transfer_manager.final_token = "LOCAL_FINAL"
+                transfer_manager.final_info = {"status": "N/A"}
+                transfer_manager.final_event.set()
+
+            final_info = {
+                "token": "LOCAL_FINAL",
+                "port": None,
+                "path": image_path,
+                "type": "final",
+                "local": True,
+            }
+        else:
+            for idx, parent in enumerate(parent_paths):
+                if not parent:
+                    continue
+                iter_num: Optional[int] = None
+                match = re.search(r"(\d+)$", parent)
+                if match:
+                    try:
+                        iter_num = int(match.group(1))
+                    except ValueError:
+                        iter_num = None
+
+                session = transfer_manager.create_session(
+                    desc=f"pre-dump-{iter_num if iter_num is not None else idx}",
+                    extract_path=parent,
+                    compress=compress,
+                )
+                session_details.append(
+                    {
+                        "token": session.token,
+                        "port": session.port,
+                        "path": parent,
+                        "iteration": iter_num if iter_num is not None else idx,
+                        "type": "pre_dump",
+                    }
+                )
+
+            final_session = transfer_manager.create_session(
+                desc="final-dump",
+                extract_path=image_path,
                 compress=compress,
+                is_final=True,
             )
-            session_details.append(
-                {
-                    "token": session.token,
-                    "port": session.port,
-                    "path": parent,
-                    "iteration": iter_num if iter_num is not None else idx,
-                    "type": "pre_dump",
-                }
-            )
-
-        final_session = transfer_manager.create_session(
-            desc="final-dump",
-            extract_path=image_path,
-            compress=compress,
-            is_final=True,
-        )
+            final_info = {
+                "token": final_session.token,
+                "port": final_session.port,
+                "path": image_path,
+                "type": "final",
+            }
 
         prep_end = time.perf_counter()
         cpu_prep_end = psutil.cpu_percent(interval=None)
@@ -404,12 +498,7 @@ def handle_prepare(prepare_info):
             "compress": compress,
             "sessions": {
                 "pre_dump": session_details,
-                "final": {
-                    "token": final_session.token,
-                    "port": final_session.port,
-                    "path": image_path,
-                    "type": "final",
-                },
+                "final": final_info,
             },
         }
 
@@ -422,6 +511,9 @@ def handle_transfer_status(request: Dict[str, Any]) -> str:
     token = request.get("token")
     if not token:
         return json.dumps({"status": "ERROR", "message": "missing transfer token"})
+
+    if token in {"LOCAL", "LOCAL_FINAL"}:
+        return json.dumps({"status": "N/A", "bytes": None, "duration_ms": 0})
 
     timeout_ms = request.get("timeout_ms")
     timeout_sec = 180.0
@@ -436,68 +528,25 @@ def handle_transfer_status(request: Dict[str, Any]) -> str:
 
 
 def transfer_vip():
-    """
-    降低源节点的优先级并触发 VIP 迁移到目标节点。
+    """Ask the local side to take over the VIP (set a high priority).
+
+    Delegates to `mig-scripts/vipctl.py` implementation.
     """
     try:
-        # 定义 Keepalived 配置文件路径和备份路径
-        config_path = "/etc/keepalived/keepalived.conf"
-        backup_path = "/etc/keepalived/keepalived.conf.bak"
+        try:
+            # prefer package import
+            import mig_scripts.vipctl as vipctl
+        except Exception:
+            import importlib.util as _il
 
-        # 备份原始配置文件
-        shutil.copy(config_path, backup_path)
-        # print(f"已备份原始Keepalived配置文件到 {backup_path}")
+            spec = _il.spec_from_file_location("vipctl_mod", os.path.join(os.path.dirname(__file__), "vipctl.py"))
+            vipctl = _il.module_from_spec(spec)
+            spec.loader.exec_module(vipctl)
 
-        # 读取原始配置文件内容
-        with open(config_path, "r") as f:
-            config = f.read()
-
-        # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
-        pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
-
-        # 定义替换函数，将 priority 设置为较低的值（例如：50）
-        def repl(match):
-            match.group(2)
-            new_priority = "100"  # 设置新的优先级
-            # print(f"将 VIP 的优先级从 {original_priority} 提高到 {new_priority}")
-            return f"{match.group(1)}{new_priority}{match.group(3)}"
-
-        # 使用正则表达式替换 priority
-        new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
-
-        if count == 0:
-            print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
-            sys.exit(1)
-
-        # 将修改后的配置写回配置文件
-        with open(config_path, "w") as f:
-            f.write(new_config)
-        # print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
-
-        # 重新加载 Keepalived 服务以应用更改
-        result = subprocess.run(
-            ["sudo", "systemctl", "reload", "keepalived"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-
-        if result.returncode != 0:
-            print(f"重新加载 Keepalived 服务失败：{result.stderr}")
-            # 如果重新加载失败，可以选择恢复备份配置
-            shutil.copy(backup_path, config_path)
-            subprocess.run(["sudo", "systemctl", "reload", "keepalived"])
-            print("已恢复原始 Keepalived 配置文件并重新加载服务。")
-            return 1
-        else:
-            # print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
-            return 0
-
-    except PermissionError:
-        print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
-        return 1
-    except FileNotFoundError:
-        print(f"配置文件 {config_path} 未找到，请确保 Keepalived 已正确安装。")
-        return 1
+        rc = vipctl.set_keepalived_priority(100)
+        return 0 if rc == 0 else 1
     except Exception as e:
-        print(f"发生错误：{e}")
+        print(f"transfer_vip failed: {e}")
         return 1
 
 
@@ -628,8 +677,34 @@ def perform_restore(msg):
     os.chdir(msg["restore"]["path"])
     #   input()
     # 构建恢复命令
-    cmd = "time -p runc restore --console-socket " + msg["restore"]["path"]
-    cmd += "/console.sock -d  --image-path " + msg["restore"]["image_path"]
+    cfg_path = os.path.join(msg["restore"]["path"], "config.json")
+    needs_console = False
+    console_sock = os.path.join(msg["restore"]["path"], "console.sock")
+    try:
+        cfg = json.load(open(cfg_path))
+        needs_console = bool(cfg.get("process", {}).get("terminal", False))
+    except Exception:
+        needs_console = False
+
+    if needs_console:
+        # ensure a recvtty listener exists for restore console
+        try:
+            if os.path.exists(console_sock):
+                os.remove(console_sock)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                f"PATH=$PATH:/root/go/bin recvtty -m null {console_sock} > /tmp/recvtty_restore.log 2>&1",
+                shell=True,
+            )
+        except Exception:
+            pass
+
+    cmd = "time -p runc restore"
+    if needs_console:
+        cmd += f" --console-socket {console_sock}"
+    cmd += " -d --image-path " + msg["restore"]["image_path"]
     cmd += " --work-path " + msg["restore"]["path"] + "/migrate/r_log"
 
     # 添加runc_args参数
@@ -858,9 +933,12 @@ def migrate_server():
                     case _:
                         print("Unknown request: " + msg)
                         reply = "unknown request"
-            except Exception:
+            except Exception as exc:
+                print(f"[server] error handling message: {exc}")
                 continue
 
+            if not reply:
+                reply = "OK"
             print(reply)
             conn.sendall(bytes(reply, encoding="utf-8"))
 

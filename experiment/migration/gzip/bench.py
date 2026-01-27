@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+Standardized gzip bench supporting duration/rps/threads and dataset resolution.
+"""
+import argparse
+import csv
+import os
+import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import requests
+except Exception:
+    raise
+
+# dynamic import of bench_common if available
+try:
+    import importlib.util as _importlib_util, os as _os
+    _cur = _os.path.abspath(_os.path.dirname(__file__))
+    _bench_common = None
+    for _ in range(6):
+        _candidate = _os.path.join(_cur, 'common', 'bench_common.py')
+        if _os.path.exists(_candidate):
+            spec = _importlib_util.spec_from_file_location('bench_common', _candidate)
+            _bench_common = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(_bench_common)
+            break
+        _cur = os.path.dirname(_cur)
+    bench_common = _bench_common
+except Exception:
+    bench_common = None
+
+parser = argparse.ArgumentParser()
+if bench_common:
+    bench_common.add_common_args(parser)
+else:
+    parser.add_argument('--duration', type=int, default=60)
+    parser.add_argument('--threads', '--concurrency', dest='threads', type=int, default=1)
+    parser.add_argument('--rps', '--qps', dest='rps', type=int, default=0)
+    parser.add_argument('--dataset', default=None, help='Path to datasets directory (default: repo datasets/)')
+parser.add_argument('--url', required=True, help='Endpoint URL (e.g., http://localhost:8080/compress)')
+parser.add_argument('--file', default=None, help='File to send as raw body (relative to --dataset if not absolute)')
+parser.add_argument('--iters', type=int, default=10, help='Fallback iterations when --duration is not used')
+parser.add_argument('--out', default='bench_gzip.csv')
+args = parser.parse_args()
+
+if bench_common:
+    args.dataset = bench_common.get_dataset_path(args)
+    bench_common.configure_logging()
+else:
+    if not args.dataset:
+        args.dataset = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'datasets'))
+
+# Resolve file
+fn = args.file
+if fn is None:
+    dataset_dir = args.dataset
+    if not os.path.isdir(dataset_dir):
+        raise SystemExit('dataset dir not found: %s' % dataset_dir)
+    candidates = []
+    for root, _, files in os.walk(dataset_dir):
+        for f in files:
+            candidates.append(os.path.join(root, f))
+    if not candidates:
+        raise SystemExit('no files in dataset dir: %s' % dataset_dir)
+    fn = random.choice(candidates)
+else:
+    if not os.path.isabs(fn):
+        candidate = os.path.join(args.dataset, fn)
+        if os.path.exists(candidate):
+            fn = candidate
+
+if not os.path.exists(fn):
+    raise SystemExit('file not found: %s' % fn)
+
+with open(fn, 'rb') as fh:
+    data = fh.read()
+
+results = []
+results_lock = threading.Lock()
+
+class RateLimiter:
+    def __init__(self, rps):
+        self.rps = int(rps) if rps else 0
+        if self.rps > 0:
+            self.capacity = float(self.rps)
+            self.tokens = float(self.rps)
+            self.last = time.monotonic()
+            self.lock = threading.Lock()
+    def acquire(self):
+        if not self.rps:
+            return
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.last
+                if elapsed > 0:
+                    refill = elapsed * self.capacity
+                    self.tokens = min(self.capacity, self.tokens + refill)
+                    self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                deficit = 1.0 - self.tokens
+                wait_time = deficit / self.capacity if self.capacity > 0 else 0.01
+            time.sleep(wait_time)
+
+rl = RateLimiter(getattr(args, 'rps', 0))
+
+def worker_duration(url, end_time):
+    sess = requests.Session()
+    while time.time() < end_time:
+        rl.acquire()
+        start = time.time()
+        try:
+            r = sess.post(args.url, data=data, headers={'Content-Type': 'application/octet-stream'}, timeout=60)
+            status = r.status_code
+            preview = r.text[:200]
+        except Exception as e:
+            status = None
+            preview = str(e)[:200]
+        elapsed = time.time() - start
+        with results_lock:
+            results.append((time.time(), status, elapsed, preview))
+
+def worker_iters(url, idx):
+    start = time.time()
+    try:
+        r = requests.post(args.url, data=data, headers={'Content-Type': 'application/octet-stream'}, timeout=60)
+        status = r.status_code
+        preview = r.text[:200]
+    except Exception as e:
+        status = None
+        preview = str(e)[:200]
+    elapsed = time.time() - start
+    with results_lock:
+        results.append((idx, status, elapsed, preview))
+
+# Run
+if getattr(args, 'duration', 0) and args.duration > 0:
+    end_time = time.time() + args.duration
+    threads = []
+    for _ in range(max(1, args.threads)):
+        t = threading.Thread(target=worker_duration, args=(args.url, end_time))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+else:
+    # fallback to iters mode
+    with ThreadPoolExecutor(max_workers=max(1, args.threads)) as ex:
+        futures = [ex.submit(worker_iters, args.url, i) for i in range(args.iters)]
+        for f in futures:
+            try:
+                f.result()
+            except Exception:
+                pass
+
+# Write CSV
+outf = args.out
+with open(outf, 'w', newline='') as csvf:
+    writer = csv.writer(csvf)
+    writer.writerow(['iter_or_ts', 'status', 'secs', 'preview'])
+    with results_lock:
+        for r in results:
+            writer.writerow(r)
+print('Wrote', outf)

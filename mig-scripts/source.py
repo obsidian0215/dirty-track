@@ -30,6 +30,11 @@ try:
 except Exception:
     psutil = None
 
+import importlib.util
+import datetime
+
+# centralized monitor module will be imported on-demand inside the monitoring start block
+
 # 定义字符设备路径
 DEVICE_PATH = "/dev/dirty-track"
 
@@ -857,65 +862,24 @@ def measure_bandwidth(dest_ip):
 
 # 降低source的优先级以触发VIP迁移到dest
 def transfer_vip(new_prior):
+    """Set the local Keepalived priority to `new_prior` using vipctl.
+
+    Returns 0 on success, non-zero otherwise.
+    """
     try:
-        # 定义 Keepalived 配置文件路径和备份路径
-        config_path = "/etc/keepalived/keepalived.conf"
-        backup_path = "/etc/keepalived/keepalived.conf.bak"
+        try:
+            import mig_scripts.vipctl as vipctl
+        except Exception:
+            import importlib.util as _il
 
-        # 备份原始配置文件
-        shutil.copy(config_path, backup_path)
-        # print(f"已备份原始 Keepalived 配置文件到 {backup_path}")
+            spec = _il.spec_from_file_location("vipctl_mod", os.path.join(os.path.dirname(__file__), "vipctl.py"))
+            vipctl = _il.module_from_spec(spec)
+            spec.loader.exec_module(vipctl)
 
-        # 读取原始配置文件内容
-        with open(config_path, "r") as f:
-            config = f.read()
-
-        # 定义正则表达式模式，匹配 vrrp_instance VI_1 块中的 priority
-        pattern = r"(vrrp_instance\s+VI_1\s*\{[^}]*?priority\s+)(\d+)([^}]*?\})"
-
-        # 定义替换函数，将 priority设置为比目标节点较低的值
-        def repl(match):
-            match.group(2)
-            new_priority = new_prior  # 设置新的优先级
-            # print(f"将 VIP 的优先级从 {original_priority} 更新为 {new_priority}")
-            return f"{match.group(1)}{new_priority}{match.group(3)}"
-
-        # 使用正则表达式替换 priority
-        new_config, count = re.subn(pattern, repl, config, flags=re.DOTALL)
-
-        if count == 0:
-            print("未能找到 vrrp_instance VI_1 中的 priority 配置。请检查配置文件格式。")
-            return 1
-
-        # 将修改后的配置写回配置文件
-        with open(config_path, "w") as f:
-            f.write(new_config)
-        # print(f"已更新 Keepalived 配置文件 {config_path}，降低 VIP 优先级。")
-
-        # 重新加载 Keepalived 服务以应用更改
-        result = subprocess.run(
-            ["sudo", "systemctl", "reload", "keepalived"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-
-        if result.returncode != 0:
-            print(f"重新加载 Keepalived 服务失败：{result.stderr}")
-            # 如果重新加载失败，可以选择恢复备份配置
-            shutil.copy(backup_path, config_path)
-            subprocess.run(["sudo", "systemctl", "reload", "keepalived"])
-            print("已恢复原始 Keepalived 配置文件并重新加载服务。")
-            return 1
-        else:
-            # print("成功重新加载 Keepalived 服务，VIP 迁移已触发。")
-            return 0
-
-    except PermissionError:
-        print("权限错误：请以具有足够权限的用户（如root）运行此脚本。")
-        return 1
-    except FileNotFoundError:
-        print(f"配置文件 {config_path} 未找到，请确保 Keepalived 已正确安装。")
-        return 1
+        rc = vipctl.set_keepalived_priority(new_prior)
+        return 0 if rc == 0 else 1
     except Exception as e:
-        print(f"发生错误：{e}")
+        print(f"transfer_vip failed: {e}")
         return 1
 
 
@@ -1296,6 +1260,14 @@ def xfer_final(image_path, dest, compress, session, control_sock):
     if ack_bytes is not None and ack_duration is not None:
         print("  Destination reported %.0f bytes, %.3f ms" % (float(ack_bytes), float(ack_duration)))
 
+    # If destination provided a resource usage file path, expose it for orchestrators
+    dest_res = ack.get("resource_path") or ack.get("resource_usage") or ack.get("dest_resource_usage")
+    if dest_res:
+        try:
+            print(f"METRIC_PARAM\tdest_resource_usage\t{dest_res}")
+        except Exception:
+            pass
+
     if compress == 0:
         try:
             os.remove(tar_name)
@@ -1368,12 +1340,12 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
         if dirtymap:
             overlap, max_scount = read_convergence_metrics(container_pids, dirtymap_path)
             print(f"Iteration {last_iter}: overlap={overlap:.4f}, max_scount={max_scount}")
-            
+
             # 1. Reach 95% overlap
             if overlap >= 0.95:
                 print(f"Converged at iteration {last_iter} (overlap >= 95%)")
                 iter_terminate = True
-            
+
             # 2. Gradient stop
             if prev_overlap is not None:
                 gain = overlap - prev_overlap
@@ -1793,7 +1765,59 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
                 if post:
                     post = False
 
-    real_dump(mig_base, pre, post, last_iter, dirtymap, replay, cs, inputs, runc_args)
+    # Start resource monitor (auto) and run real_dump
+    resmon = None
+    if getattr(args, "monitor", False):
+        try:
+            # Prefer package import when available (module can be run as package),
+            # but fall back to a file-based import so `python source.py` still works.
+            try:
+                import mig_scripts.monitor as monitor_mod
+            except Exception:
+                spec = importlib.util.spec_from_file_location(
+                    "monitor_mod", os.path.join(os.path.dirname(__file__), "monitor.py")
+                )
+                monitor_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(monitor_mod)
+
+            ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            default_outdir = f"/runc/containers/{container}/migrate/d_log"
+            os.makedirs(default_outdir, exist_ok=True)
+            out_path = args.monitor_out or os.path.join(default_outdir, f"resource_usage.source.{ts}.tsv")
+            resmon = monitor_mod.ContainerResourceMonitor(
+                container,
+                interval=args.monitor_interval,
+                out_path=out_path,
+                include_host=True,
+                enable_net=True,
+                host_iface=args.monitor_host_iface,
+            )
+            resmon.start()
+            try:
+                monitor_mod.set_phase("prepare")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Warning: failed to start resource monitor: {e}")
+            resmon = None
+
+    try:
+        real_dump(mig_base, pre, post, last_iter, dirtymap, replay, cs, inputs, runc_args)
+    finally:
+        if resmon:
+            try:
+                monitor_mod.set_phase("done")
+            except Exception:
+                pass
+            try:
+                resmon.stop()
+            except Exception:
+                pass
+            try:
+                print(f"METRIC_PARAM\tsource_resource_usage\t{resmon.out_path}")
+            except Exception:
+                pass
+
     # 更新 image/parent 符号链接指向最新的 parent_i
     # update_image_parent(mig_base, f"parent_{last_iter+1}")
 
@@ -1859,29 +1883,23 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
     # 等待恢复完成
     print("Wait for destination...")
     max_wait_time = 200 if post else 30  # post-copy使用更长的等待时间
-    time_left = max_wait_time
-    polling_interval = 5  # 每5秒检测一次，防止占用过多CPU
+    answer = None
+    try:
+        cs.settimeout(max_wait_time)
+        data = cs.recv(1024)
+        if data:
+            answer = data.decode("utf-8")
+    except socket.timeout:
+        print(
+            f"Warning: exceed {max_wait_time} seconds without receiving restore confirmation, "
+            "live-migration may encountered issues"
+        )
+    except Exception as exc:
+        print(f"[warn] failed to read restore reply: {exc}")
 
-    while time_left > 0:
-        wait_time = min(polling_interval, time_left)
-        inputready, outputready, exceptready = select.select(inputs, [], [], wait_time)
-
-        if inputready:
-            break  # 收到数据，跳出等待循环
-
-        time_left -= polling_interval
-        print(f"  Remaining {time_left} seconds...")
-
-        if time_left <= 0:
-            msg = (
-                f"Warning: exceed {max_wait_time} seconds without receiving "
-                "restore confirmation, live-migration may encountered issues"
-            )
-            print(msg)
-    # If there is something in input to read (e.g., from the socket), then print it
+    # If there is something to read (e.g., from the socket), then print it
     global total_uffd_copy, rpf_handle_time
-    for s in inputready:
-        answer = s.recv(1024).decode("utf-8")
+    if answer:
         print("answer:", answer)
         if "runc restored" in answer:
             # 使用正则表达式提取数据
@@ -1982,9 +2000,42 @@ parser.add_argument(
     default=0,
     help="compression level: 0=off, 1=fastest(2K), 2=fast(4K), 3=standard(16K), 4=best(32K)",
 )
+parser.add_argument(
+    "--bandwidth",
+    "-b",
+    dest="bandwidth",
+    type=str,
+    default=None,
+    help="(optional) bandwidth limit used by wrappers; ignored by the migration script itself",
+)
 
 # 处理 --tcp-established 和 --shell-job 等criu参数
 # 将这些参数排除在脚本参数解析之外
+parser.add_argument(
+    "--monitor",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable resource monitoring (cpu/mem/net) during migration",
+)
+parser.add_argument(
+    "--monitor-interval",
+    type=float,
+    default=1.0,
+    help="Sampling interval (seconds) for resource monitoring",
+)
+parser.add_argument(
+    "--monitor-host-iface",
+    type=str,
+    default="ens33",
+    help="Host network interface used for bandwidth measurements",
+)
+parser.add_argument(
+    "--monitor-out",
+    type=str,
+    default=None,
+    help="Optional output file path for resource monitor (overrides default)",
+)
+
 args, remaining = parser.parse_known_args()
 
 
@@ -1992,7 +2043,7 @@ def extract_positional_args():
     """从原始命令行中智能提取位置参数(container名和目标IP)"""
 
     # 定义所有已知的可带数值参数
-    value_params = {"-tc", "--time-constraint", "-i", "--iter", "-z", "--compress"}
+    value_params = {"-tc", "--time-constraint", "-i", "--iter", "-z", "--compress", "--bandwidth", "-b"}
 
     i = 1  # 跳过脚本名称
     positional_args = []
@@ -2021,8 +2072,18 @@ positional = extract_positional_args()
 container_name = None
 runc_args = []
 
-# 第一步：从remaining中提取criu参数
+# 第一步：从remaining中提取criu参数（跳过脚本自身的带值参数，如 --bandwidth/-b）
+skip_next = False
 for arg in remaining:
+    if skip_next:
+        skip_next = False
+        continue
+
+    if arg in {"--bandwidth", "-b"}:
+        # 跳过带宽参数本身和随后的数值（如 50mbit），这些不应传给 runc
+        skip_next = True
+        continue
+
     if arg.startswith("--") or arg.startswith("-"):
         # criu/runc 参数
         runc_args.append(arg)

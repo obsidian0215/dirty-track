@@ -17,7 +17,7 @@ SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 YCSB_IP = CLIENT_IP  # 保持向后兼容性
 
 # default bandwidth
-BANDWIDTH = "25mbit"
+BANDWIDTH = "50mbit"
 
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 SEC_MODE = False
@@ -45,7 +45,7 @@ if __name__ == "__main__":
     parser.add_argument("--mt-rand", action="store_true", default=True, help="memtier: use random keys (-R).")
     parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
-    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
+    parser.add_argument("--bandwidth", default="50mbit", help="Network bandwidth limit (e.g. 50mbit). Default: 50mbit")
 
     parsed_args = parser.parse_args()
 
@@ -533,7 +533,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     # 尝试从 stdout 中提取统计行并写入 results
     try:
         stdout = getattr(result, "stdout", "") or ""
-        header, stats = extract_stats_from_output(stdout)
+        header, stats, params = extract_stats_from_output(stdout)
         if stats:
             # 仅在文件首次创建时写入：将 memtier 的 load 与 run 拆成两行
             load_summary = "workload-load: memtier c=5 t=4 ratio=9:1 dsl=32:3,64:4,128:3,512:1,1024:1"
@@ -543,6 +543,9 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
                 + (" rand=on" if MT_RAND else " rand=off")
             )
             params_summary = f"exp: {exp_args}"
+            extra_param_lines = [load_summary, run_summary]
+            if params:
+                extra_param_lines += params
             append_result(
                 exp_name,
                 "redis",
@@ -551,7 +554,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
                 header,
                 params_summary,
                 is_secure=SEC_MODE,
-                extra_param_lines=[load_summary, run_summary],
+                extra_param_lines=extra_param_lines,
                 first_in_run=(run_index == 1),
             )
             print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")

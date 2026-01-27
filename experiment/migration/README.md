@@ -166,27 +166,19 @@ mig-scripts 套件支持源节点和目标节点的分布式迁移。
 
 #### 示例：
 ```bash
-# 启动目标节点监听
-python3 mig-scripts/destination.py  # 在目标节点运行
+# 启动目标节点监听（在目标节点运行）
+python3 mig-scripts/destination.py
 
-# 源节点执行迁移 (Redis)
-python3 mig-scripts/start.py \
-  -c redis \
-  -t ycsb \
-  -s 192.168.1.10 \
-  -d 192.168.1.20
+# 源节点执行迁移（Redis, 使用专用 orchestrator）
+python3 mig-scripts/redis_test.py --scene video --runs 1 --source-ip 192.168.1.10 --dest-ip 192.168.1.20
 
-# 源节点执行迁移 (InfluxDB)
-python3 mig-scripts/start.py \
-  -c influxdb \
-  -s 192.168.1.10 \
-  -d 192.168.1.20
+# 源节点执行迁移（InfluxDB）
+python3 mig-scripts/influxdb_test.py --scene video --runs 1 --source-ip 192.168.1.10 --dest-ip 192.168.1.20
 
-# 源节点执行迁移 (Elasticsearch)
-python3 mig-scripts/start.py \
-  -c elasticsearch \
-  -s 192.168.1.10 \
-  -d 192.168.1.20
+# 源节点执行迁移（Elasticsearch, YCSB 风格）
+python3 mig-scripts/elasticsearch-ycsb.py --runs 1 --source-ip 192.168.1.10 --dest-ip 192.168.1.20
+
+# 说明：原先的 `start.py` 已归档（见 `mig-scripts/archived/`）；建议使用上述更专用的测试入口。
 ```
 
 ## 基准测试执行

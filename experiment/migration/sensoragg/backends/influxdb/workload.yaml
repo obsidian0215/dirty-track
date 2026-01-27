@@ -1,0 +1,14 @@
+# Template workload for sensoragg -> InfluxDB backend
+name: sensoragg-influx-default
+duration: 60
+qps: 500
+concurrency: 4
+payload_size: 1KB
+payload_mode: json
+device_count: 1000
+start_db: true
+db_port: 8086
+use_frontend: false
+frontend_port: 5001
+# extra_args appended to bench
+extra_args: "--size-distribution uniform"

@@ -31,8 +31,11 @@
 #include <asm/tlbflush.h>
 #include <linux/mm_inline.h>
 #include <linux/ftrace.h>
+#include <linux/kprobes.h>
 #include <linux/kallsyms.h>
 #include <linux/hugetlb.h>
+static int start_dirty_track(pid_t pid);
+bool check_dirty_track_for_pid(pid_t pid);
 
 #define DEVICE_NAME "dirty-track"
 #define DIRTY_TRACK_MAGIC 'd'
@@ -872,6 +875,19 @@ static int wp_fault_track(void *data) {
 
         // 检查是否由ioctl请求停止
         if (dti->stop_requested) {
+            // [CRITICAL FIX] 强制执行最后一次完整扫描
+            // 确保不遗漏RO VMA中通过COW变dirty的页面
+            // 背景：正常循环中skip_ro_vmas会周期性设置为true以优化性能，
+            // 但这可能导致某些COW页面（在RO VMA中触发写时复制）未被记录。
+            // 在停止前必须执行一次skip_ro_vmas=false的完整扫描。
+            printk(KERN_INFO "[PID %d] Performing final full scan before stop (skip_ro_vmas=false)\n", dti->pid);
+            dti->skip_ro_vmas = false;
+            ret = clear_soft_dirty_once(dti);
+            if (ret) {
+                printk(KERN_ERR "[PID %d] Final scan failed: %d\n", dti->pid, ret);
+                // 即使失败也继续，至少保存已有的dirty-map
+            }
+            
             // 获取当前时间戳
             dti->end_time = ktime_get();
             // write dirty_map to file
@@ -1235,6 +1251,24 @@ static struct file_operations fops = {
 };
 
 // 模块初始化
+static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs) 
+{ 
+    struct task_struct *child = (struct task_struct *)regs->di; 
+    struct task_struct *parent; 
+    if (!child) return 0; 
+    parent = child->real_parent; 
+    if (parent && check_dirty_track_for_pid(parent->pid)) { 
+        printk(KERN_INFO "dirty-track: Automatically tracking child %d of parent %d via kprobe\n", child->pid, parent->pid); 
+        start_dirty_track(child->pid); 
+    } 
+    return 0; 
+} 
+
+static struct kprobe kp = { 
+    .symbol_name = "wake_up_new_task", 
+    .pre_handler = handler_pre_wake_up_new_task, 
+}; 
+
 static int __init lkm_init(void) {
     int ret;
 
@@ -1286,12 +1320,17 @@ static int __init lkm_init(void) {
         return -ENOMEM;
     }
 
+    {
+        int kp_ret = register_kprobe(&kp);
+        if (kp_ret) printk(KERN_ERR "Failed to register kprobe: %d\n", kp_ret);
+    }
     printk(KERN_INFO "dirty-track LKM initialized\n");
     return 0;
 }
 
 // 模块卸载
 static void __exit lkm_exit(void) {
+    unregister_kprobe(&kp);
     dirty_track_t *dti, *tmp;
     nbstop_kthread_t *sw;
 

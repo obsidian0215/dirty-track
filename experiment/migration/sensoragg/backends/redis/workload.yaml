@@ -1,0 +1,25 @@
+# Template workload for sensoragg -> Redis backend
+# Fields:
+# name: human-friendly workload name
+# duration: seconds
+# qps: requests per second (optional)
+# concurrency: number of worker threads
+# payload_size: e.g., '1KB'
+# payload_mode: 'json' or 'binary'
+# device_count: total devices
+# start_db: whether to start an in-memory DB container before running
+# frontend: whether to start frontend and use it (frontends allow HTTP-based routing)
+
+name: sensoragg-redis-default
+duration: 60
+qps: 500
+concurrency: 4
+payload_size: 1KB
+payload_mode: json
+device_count: 1000
+start_db: true
+db_port: 6379
+use_frontend: true
+frontend_port: 5000
+# extra_args can be appended to the underlying bench invocation
+extra_args: "--read-pct 10"

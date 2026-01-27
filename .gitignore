@@ -19,3 +19,4 @@ __pycache__/
 mig-scripts/results/
 logs/
 results/
+*.cmd

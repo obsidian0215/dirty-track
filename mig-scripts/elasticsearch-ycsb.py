@@ -18,7 +18,7 @@ SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 SEC_MODE = False
 
 # default bandwidth
-BANDWIDTH = "25mbit"
+BANDWIDTH = "50mbit"
 
 # 使用argparse解析命令行参数以动态设置
 if __name__ == "__main__":
@@ -33,7 +33,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recordcount", type=int, default=10000, help="Record count for YCSB (recordcount == operationcount)."
     )
-    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
+    parser.add_argument("--bandwidth", default="50mbit", help="Network bandwidth limit (e.g. 50mbit). Default: 50mbit")
     parser.add_argument("--runs", type=int, default=5, help="Number of experimental runs per experiment type.")
     parsed_args = parser.parse_args()
 
@@ -461,13 +461,15 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
     # 尝试从 stdout 中提取统计行并写入 results
     try:
         stdout = getattr(result, "stdout", "") or ""
-        header, stats = extract_stats_from_output(stdout)
+        header, stats, params = extract_stats_from_output(stdout)
         if stats:
             params_summary = f"exp: {exp_args}"
             extra_lines = [
                 f"workload-load: ycsbA es.hosts.list={VIP}:9200 recordcount={RECORD_COUNT}",
                 f"workload-run: ycsbA es.hosts.list={VIP}:9200 operationcount={OPERATION_COUNT}",
             ]
+            if params:
+                extra_lines += params
             append_result(
                 exp_name,
                 "elasticsearch",

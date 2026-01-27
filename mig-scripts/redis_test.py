@@ -16,7 +16,7 @@ SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 SEC_MODE = False
 # default bandwidth
-BANDWIDTH = "25mbit"
+BANDWIDTH = "50mbit"
 # 场景配置：Redis的video和sensor场景
 scene_configs = {
     "video": {
@@ -332,15 +332,15 @@ def configure_network():
 
 # 定义实验类型
 experiments = {
-    # "post-copy": "-post -d --tcp-established --shell-job",
     "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
-    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
-    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
-    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
-    # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    # "hybrid": "-pre -post -d --tcp-established --shell-job",
-    # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+    # "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    # "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    # "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    # "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
+    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    "post-copy": "-post -d --tcp-established --shell-job",
+    "hybrid": "-pre -post -d --tcp-established --shell-job",
+    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 
@@ -404,7 +404,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
 
     # 尝试从 stdout 中提取统计行并写入 results
     try:
-        header, stats = extract_stats_from_output(stdout)
+        header, stats, params = extract_stats_from_output(stdout)
         if stats:
             # 生成 workload 概览（scene 单独在主行；load/run 各一行）
             def args_to_str(d):
@@ -414,6 +414,8 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
                 f"workload-load: {args_to_str(extra_args)}",
                 f"workload-run: {args_to_str(run_args)}",
             ]
+            if params:
+                extra_lines += params
             append_result(
                 exp_name,
                 "redis",
@@ -470,7 +472,7 @@ def main():
     parser.add_argument("--ttl", type=int, help="TTL (video场景)")
     parser.add_argument("--payload-size", default=None, help="目标负载大小，支持单位后缀（B, KB, MB），示例: 512B, 16KB, 1MB。")
     parser.add_argument("--sensors-per-device", type=int, help="每设备传感器数")
-    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
+    parser.add_argument("--bandwidth", default="50mbit", help="Network bandwidth limit (e.g. 50mbit). Default: 50mbit")
     parser.add_argument("--runs", type=int, default=5, help="每个实验类型的运行次数")
     parser.add_argument(
         "--experiment-types",

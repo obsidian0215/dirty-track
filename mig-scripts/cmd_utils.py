@@ -19,10 +19,18 @@ def run_cmd(
     *,
     ignore_error: bool = False,
     quiet: bool = False,
+    stdin: Optional[int] = subprocess.DEVNULL,
     shell: Optional[bool] = None,
     label: str = "local",
+    timeout: Optional[float] = None,
+    cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    """Run a command and surface stdout/stderr when it fails."""
+    """Run a command and surface stdout/stderr when it fails.
+
+    Added `timeout` (seconds) to avoid indefinite hangs on commands that block.
+    On timeout, exits with code 124 unless `ignore_error=True`, in which case a
+    CompletedProcess with returncode 124 is returned.
+    """
     if shell is None:
         shell = isinstance(cmd, str)
 
@@ -30,13 +38,42 @@ def run_cmd(
     if not quiet:
         print(f"[{label}]$ {display}")
 
-    result = subprocess.run(
-        cmd,
-        shell=shell,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=shell,
+            stdin=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Timeout: report and either exit or return a CompletedProcess-like object
+        if not quiet:
+            print(f"[{label}] command timed out after {timeout}s: {display}")
+            if getattr(e, 'stdout', None):
+                _out = e.stdout
+                if isinstance(_out, (bytes, bytearray)):
+                    _out = _out.decode('utf-8', errors='ignore')
+                print("[stdout]\n" + (_out or '').rstrip())
+            if getattr(e, 'stderr', None):
+                _err = e.stderr
+                if isinstance(_err, (bytes, bytearray)):
+                    _err = _err.decode('utf-8', errors='ignore')
+                print("[stderr]\n" + (_err or '').rstrip())
+        if not ignore_error:
+            # 124 is commonly used for timeout
+            sys.exit(124)
+        # Normalize outputs to strings for CompletedProcess-like return
+        _stdout = e.stdout
+        _stderr = e.stderr if e.stderr is not None else f"Timeout after {timeout}s"
+        if isinstance(_stdout, (bytes, bytearray)):
+            _stdout = _stdout.decode('utf-8', errors='ignore')
+        if isinstance(_stderr, (bytes, bytearray)):
+            _stderr = _stderr.decode('utf-8', errors='ignore')
+        return subprocess.CompletedProcess(cmd, 124, stdout=(_stdout or ''), stderr=(_stderr or f"Timeout after {timeout}s"))
 
     if result.returncode != 0:
         suppress_output = quiet and ignore_error
@@ -93,3 +130,6 @@ def unmount_local_migration_tmpfs(
     for path in candidates:
         if os.path.isdir(path) and os.path.ismount(path):
             run_cmd(["umount", path], ignore_error=ignore_error, quiet=quiet)
+            if os.path.ismount(path):
+                # fallback to lazy sudo umount if still mounted
+                run_cmd(["sudo", "umount", "-l", path], ignore_error=ignore_error, quiet=quiet)

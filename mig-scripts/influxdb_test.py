@@ -29,7 +29,7 @@ from script_defaults import choose_scripts, get_default_ips
 
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 # default bandwidth (can be overridden by --bandwidth)
-BANDWIDTH = "25mbit"
+BANDWIDTH = "50mbit"
 
 # default script to call; can be switched to source-sec.py via --sec
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
@@ -38,14 +38,14 @@ SEC_MODE = False
 # 定义实验类型
 experiments = {
     "pre-copy": "-pre -d --tcp-established --shell-job",
-    "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
-    "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
-    "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
-    "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
-    # "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
-    # "post-copy": "-post -d --tcp-established --shell-job"
-    # "hybrid": "-pre -post -d --tcp-established --shell-job",
-    # "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
+    # "pre-copy-1": "-pre -d --tcp-established --shell-job -z 1",
+    # "pre-copy-2": "-pre -d --tcp-established --shell-job -z 2",
+    # "pre-copy-3": "-pre -d --tcp-established --shell-job -z 3",
+    # "pre-copy-4": "-pre -d --tcp-established --shell-job -z 4",
+    "pre-copy-dirtymap": "-pre -d -dm --tcp-established --shell-job",
+    "post-copy": "-post -d --tcp-established --shell-job",
+    "hybrid": "-pre -post -d --tcp-established --shell-job",
+    "hybrid-dirtymap": "-pre -post -d -dm --tcp-established --shell-job"
 }
 
 # 场景配置：InfluxDB的video, sensor, vehicle场景
@@ -429,7 +429,7 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
     # 尝试从 stdout 中提取统计行并写入 results
     try:
         stdout = getattr(result, "stdout", "") or ""
-        header, stats = extract_stats_from_output(stdout)
+        header, stats, params = extract_stats_from_output(stdout)
         if stats:
             # 生成 workload 概览：拆分为两行（load/run），scene 单独跟在主 params 行
             def args_to_str(d):
@@ -439,6 +439,8 @@ def source_run_migration(exp_args, scene_config, extra_args, scene, run_index=0,
                 f"workload-load: {args_to_str(extra_args)}",
                 f"workload-run: {args_to_str(run_args)}",
             ]
+            if params:
+                extra_lines += params
             append_result(
                 exp_name,
                 "influxdb",
@@ -520,7 +522,7 @@ def main():
         help="要运行的实验类型，默认全部",
     )
     parser.add_argument("--sec", action="store_true", help="use source-sec/destination-sec scripts")
-    parser.add_argument("--bandwidth", default="25mbit", help="Network bandwidth limit (e.g. 25mbit). Default: 25mbit")
+    parser.add_argument("--bandwidth", default="50mbit", help="Network bandwidth limit (e.g. 50mbit). Default: 50mbit")
 
     args = parser.parse_args()
 

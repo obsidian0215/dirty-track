@@ -27,7 +27,7 @@ def choose_scripts(sec=False):
 # Default network addresses used by migration scripts. Edit here to change global defaults.
 DEFAULT_SOURCE_IP = "192.168.2.105"
 DEFAULT_DEST_IP = "192.168.2.225"
-DEFAULT_CLIENT_IP = "192.168.2.139"
+DEFAULT_CLIENT_IP = DEFAULT_DEST_IP
 DEFAULT_VIP = "192.168.2.100"
 
 
