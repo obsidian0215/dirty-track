@@ -32,6 +32,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 parser = argparse.ArgumentParser()
 if bench_common:
     bench_common.add_common_args(parser)
@@ -40,6 +42,8 @@ else:
     parser.add_argument('--threads', '--concurrency', dest='threads', type=int, default=1)
     parser.add_argument('--rps', '--qps', dest='rps', type=int, default=0)
     parser.add_argument('--dataset', default=None, help='Path to datasets directory (default: repo datasets/)')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--url', required=True, help='Endpoint URL (e.g., http://localhost:8080/compress)')
 parser.add_argument('--file', default=None, help='File to send as raw body (relative to --dataset if not absolute)')
 parser.add_argument('--iters', type=int, default=10, help='Fallback iterations when --duration is not used')
@@ -109,6 +113,22 @@ class RateLimiter:
 
 rl = RateLimiter(getattr(args, 'rps', 0))
 
+def _is_success(status):
+    return status is not None and 200 <= int(status) < 400
+
+metrics = None
+if IntervalMetrics:
+    metrics = IntervalMetrics(
+        interval_sec=getattr(args, 'metrics_interval', 1.0),
+        out_path=getattr(args, 'metrics_out', None),
+        label='gzip',
+    )
+if bench_common and metrics:
+    try:
+        bench_common.register_metrics_signal_handlers(metrics)
+    except Exception:
+        pass
+
 def worker_duration(url, end_time):
     sess = requests.Session()
     while time.time() < end_time:
@@ -122,6 +142,8 @@ def worker_duration(url, end_time):
             status = None
             preview = str(e)[:200]
         elapsed = time.time() - start
+        if metrics:
+            metrics.record(_is_success(status), elapsed * 1000.0)
         with results_lock:
             results.append((time.time(), status, elapsed, preview))
 
@@ -135,10 +157,14 @@ def worker_iters(url, idx):
         status = None
         preview = str(e)[:200]
     elapsed = time.time() - start
+    if metrics:
+        metrics.record(_is_success(status), elapsed * 1000.0)
     with results_lock:
         results.append((idx, status, elapsed, preview))
 
 # Run
+if metrics:
+    metrics.start()
 if getattr(args, 'duration', 0) and args.duration > 0:
     end_time = time.time() + args.duration
     threads = []
@@ -157,6 +183,10 @@ else:
                 f.result()
             except Exception:
                 pass
+
+if metrics:
+    metrics.stop()
+    metrics.write()
 
 # Write CSV
 outf = args.out

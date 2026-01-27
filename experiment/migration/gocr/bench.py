@@ -32,6 +32,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 parser = argparse.ArgumentParser()
 if bench_common:
     bench_common.add_common_args(parser)
@@ -40,6 +42,8 @@ else:
     parser.add_argument('--threads', '--concurrency', dest='threads', type=int, default=4)
     parser.add_argument('--rps', '--qps', dest='rps', type=int, default=0)
     parser.add_argument('--dataset', default=None, help='Path to image dataset directory')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--url', required=True, help='Server base URL (e.g., http://127.0.0.1:8080)')
 parser.add_argument('--requests', '--iters', dest='requests', type=int, default=100, help='Total requests when not using --duration')
 parser.add_argument('--out', default='bench_gocr.csv')
@@ -95,6 +99,22 @@ class RateLimiter:
 
 rl = RateLimiter(getattr(args, 'rps', 0))
 
+def _is_success(status):
+    return status is not None and 200 <= int(status) < 400
+
+metrics = None
+if IntervalMetrics:
+    metrics = IntervalMetrics(
+        interval_sec=getattr(args, 'metrics_interval', 1.0),
+        out_path=getattr(args, 'metrics_out', None),
+        label='gocr',
+    )
+if bench_common and metrics:
+    try:
+        bench_common.register_metrics_signal_handlers(metrics)
+    except Exception:
+        pass
+
 
 def worker_duration(url, end_time):
     sess = requests.Session()
@@ -109,6 +129,8 @@ def worker_duration(url, end_time):
         except Exception as e:
             status = None
         latency = (time.monotonic() - start) * 1000.0
+        if metrics:
+            metrics.record(_is_success(status), latency)
         with results_lock:
             results.append((time.time(), status, latency))
 
@@ -125,12 +147,16 @@ def worker_requests(url, total_requests):
         except Exception as e:
             status = None
         latency = (time.monotonic() - start) * 1000.0
+        if metrics:
+            metrics.record(_is_success(status), latency)
         with results_lock:
             results.append((time.time(), status, latency))
 
 # Run
 # Determine effective number of threads (support both --threads and --concurrency)
 nthreads = getattr(args, 'threads', None) or getattr(args, 'concurrency', 1)
+if metrics:
+    metrics.start()
 if getattr(args, 'duration', 0) and args.duration > 0:
     end_time = time.time() + args.duration
     threads = []
@@ -151,6 +177,10 @@ else:
         threads.append(t)
     for t in threads:
         t.join()
+
+if metrics:
+    metrics.stop()
+    metrics.write()
 
 # Write CSV
 outf = args.out

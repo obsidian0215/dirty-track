@@ -14,7 +14,7 @@ exercise the long-running service variants of these workloads during migration e
 """
 
 # (Start by reusing the implementation from the previous defog_test wrapper)
-from typing import Optional
+from typing import Optional, List
 import argparse
 import os
 import shlex
@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import statistics
 from datetime import datetime
 
 from result_writer import extract_stats_from_output, append_result, summarize_results
@@ -35,7 +36,7 @@ SEC_MODE = False
 BANDWIDTH = "50mbit"
 DEFAULT_HOST = "127.0.0.1"
 RUN_LABEL = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-RESULTS_ROOT = '/runc/dirty-track/results/fog_tests'
+RESULTS_ROOT = '/runc/results'
 LOCAL_HOSTS = {None, '127.0.0.1', 'localhost'}
 
 
@@ -207,6 +208,7 @@ def ensure_dirs():
     # Ensure necessary result and containers directories exist
     os.makedirs(RESULTS_ROOT, exist_ok=True)
     os.makedirs(os.path.join(RESULTS_ROOT, RUN_LABEL), exist_ok=True)
+    os.makedirs(os.path.join(RESULTS_ROOT, RUN_LABEL, 'workloads'), exist_ok=True)
     os.makedirs('/runc/containers', exist_ok=True)
     purge_fog_workload_baks()
 
@@ -229,6 +231,24 @@ def purge_fog_workload_baks():
                 pass
     if removed:
         print(f"[bundle] removed deprecated fog_workloads backups: {', '.join(removed)}")
+
+
+def get_run_dir() -> str:
+    return os.path.join(RESULTS_ROOT, RUN_LABEL)
+
+
+def ensure_workload_dir(scene: str) -> str:
+    base = os.path.join(get_run_dir(), 'workloads', scene)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def build_bench_output_paths(scene: str, exp_name: str, run_index: int, backend: Optional[str] = None):
+    base = ensure_workload_dir(scene)
+    ext = 'jtl' if backend == 'jmeter' else 'csv'
+    raw_out = os.path.join(base, f"{scene}_{exp_name}_run{run_index}.{ext}")
+    metrics_out = os.path.join(base, f"{scene}_{exp_name}_run{run_index}_metrics.json")
+    return raw_out, metrics_out
 
 
 def sanitize_profile(bundle_path: str, remote: bool = False, target_ip: Optional[str] = None):
@@ -317,6 +337,36 @@ def write_integrated_table(results: list, mode: str) -> Optional[str]:
             f.write("\t".join(row) + "\n")
 
     print(f"[result] integrated table -> {out_path}")
+    return out_path
+
+
+def append_scene_exp_summary(scene: str, exp_name: str, run_metrics: List[dict]) -> Optional[str]:
+    if not run_metrics:
+        return None
+
+    metric_values: dict[str, list[float]] = {}
+    for m in run_metrics:
+        if not isinstance(m, dict):
+            continue
+        for k, v in m.items():
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            metric_values.setdefault(k, []).append(fv)
+
+    if not metric_values:
+        return None
+
+    out_path = os.path.join(get_run_dir(), f"mig_test_{scene}.csv")
+    is_new = not os.path.exists(out_path)
+    with open(out_path, "a", encoding="utf-8") as f:
+        if is_new:
+            f.write("exp\tmetric\tmean\tstdev\truns\n")
+        for metric, vals in metric_values.items():
+            mean = statistics.mean(vals)
+            stdev = statistics.stdev(vals) if len(vals) > 1 else 0.0
+            f.write(f"{exp_name}\t{metric}\t{mean:.6f}\t{stdev:.6f}\t{len(vals)}\n")
     return out_path
 
 
@@ -1555,7 +1605,10 @@ def run_bench(scene: str, port: int):
     local_bench = find_local_bench_for_bundle(scene) or find_local_bench_for_bundle(bundle)
 
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-    outf = os.path.join('/runc/dirty-track/results/fog_tests', f"{scene}_bench_{ts}.csv")
+    work_dir = ensure_workload_dir(scene)
+    outf = os.path.join(work_dir, f"{scene}_smoke_{ts}.csv")
+    metrics_out = os.path.join(work_dir, f"{scene}_smoke_{ts}_metrics.json")
+    metrics_args = f" --metrics-out {shlex.quote(metrics_out)} --metrics-interval 1.0"
 
     if local_bench:
         backend = detect_backend_from_bench(local_bench)
@@ -1579,7 +1632,10 @@ def run_bench(scene: str, port: int):
             else:
                 url = f"http://127.0.0.1:{int(port)}{info.get('endpoint','/')}"
                 cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets"
-        cmd_full = f"{cmd} --out {shlex.quote(outf)}"
+        if backend in ('http', 'jmeter'):
+            cmd_full = f"{cmd} --out {shlex.quote(outf)}{metrics_args}"
+        else:
+            cmd_full = f"{cmd}{metrics_args}"
         print(f"[bench] running local migration bench: {cmd_full}")
         run_cmd(cmd_full, quiet=False)
     elif bench:
@@ -1599,7 +1655,7 @@ def run_bench(scene: str, port: int):
     return None
 
 
-def build_bench_command(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, out_path: Optional[str] = None) -> Optional[str]:
+def build_bench_command(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, out_path: Optional[str] = None, metrics_out: Optional[str] = None, metrics_interval: float = 1.0, backend: Optional[str] = None) -> Optional[str]:
     py = shlex.quote(sys.executable)
     host = host or SOURCE_IP or DEFAULT_HOST
     info = SCENE_INFO.get(scene, {})
@@ -1608,22 +1664,27 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
     bench = info.get('bench')
     local_bench = find_local_bench_for_bundle(scene) or find_local_bench_for_bundle(bundle)
     out_path = out_path or f"/tmp/{scene}_bench_{int(time.time())}.csv"
+    metrics_args = ""
+    if metrics_out:
+        metrics_args = f" --metrics-out {shlex.quote(metrics_out)} --metrics-interval {float(metrics_interval)}"
+
+    if backend is None:
+        backend = info.get('backend')
+    if backend is None and local_bench:
+        backend = detect_backend_from_bench(local_bench)
 
     if local_bench:
-        backend = detect_backend_from_bench(local_bench)
         if backend == 'redis':
-            return f"{py} {shlex.quote(local_bench)} --redis-host {host} --redis-port {int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets --out {shlex.quote(out_path)}"
+            return f"{py} {shlex.quote(local_bench)} --redis-host {host} --redis-port {int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets{metrics_args}"
         if backend == 'influxdb':
-            return f"{py} {shlex.quote(local_bench)} --influx-url http://{host}:{int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets --out {shlex.quote(out_path)}"
+            return f"{py} {shlex.quote(local_bench)} --influx-url http://{host}:{int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets{metrics_args}"
         if backend == 'elasticsearch':
-            return f"{py} {shlex.quote(local_bench)} --es-host {host} --es-port {int(port)} --threads {int(threads)} --rps 100 --duration {int(duration)} --out {shlex.quote(out_path)}"
+            return f"{py} {shlex.quote(local_bench)} --es-host {host} --es-port {int(port)} --threads {int(threads)} --rps 100 --duration {int(duration)}{metrics_args}"
         if backend == 'http':
             url = f"http://{host}:{int(port)}{endpoint}"
-            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)} --dataset /runc/datasets --out {shlex.quote(out_path)}"
+            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)} --dataset /runc/datasets --out {shlex.quote(out_path)}{metrics_args}"
         if backend == 'jmeter':
-            # JMeter benches (iPokeMon) are harder to run remotely; skip for migration mode for now
-            print(f"[bench] backend jmeter detected for {scene}; skipping background bench command")
-            return None
+            return f"{py} {shlex.quote(local_bench)} --host {host} --port {int(port)} --duration {int(duration)} --threads {int(threads)} --out {shlex.quote(out_path)}{metrics_args}"
     elif bench:
         cmd = bench.replace('PORT', str(port)).replace('127.0.0.1', host)
         if cmd.startswith('python3 '):
@@ -1631,12 +1692,32 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
         elif cmd.startswith('python '):
             cmd = cmd.replace('python', py, 1)
         cmd = f"{cmd} --duration {int(duration)} --threads {int(threads)}"
-        return f"{cmd} --out {shlex.quote(out_path)}"
+        return f"{cmd} --out {shlex.quote(out_path)}{metrics_args}"
     return None
 
 
-def start_bench_background(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, remote: bool = False) -> Optional[str]:
-    cmd = build_bench_command(scene, port, host=host, duration=duration, threads=threads)
+def start_bench_background(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, remote: bool = False, exp_name: str = 'pre-copy', run_index: int = 1) -> Optional[str]:
+    info = SCENE_INFO.get(scene, {})
+    bundle = info.get('bundle', scene)
+    local_bench = find_local_bench_for_bundle(scene) or find_local_bench_for_bundle(bundle)
+    backend = info.get('backend')
+    if backend is None and local_bench:
+        backend = detect_backend_from_bench(local_bench)
+    raw_out, metrics_out = build_bench_output_paths(scene, exp_name, run_index, backend=backend)
+    if backend == 'jmeter' and remote:
+        print(f"[bench] backend jmeter detected for {scene}; skipping background bench on remote")
+        return None
+    cmd = build_bench_command(
+        scene,
+        port,
+        host=host,
+        duration=duration,
+        threads=threads,
+        out_path=raw_out,
+        metrics_out=metrics_out,
+        metrics_interval=1.0,
+        backend=backend,
+    )
     if not cmd:
         print(f"[bench] no bench command for {scene}, skipping background load")
         return None
@@ -1654,7 +1735,10 @@ def stop_bench_background(scene: str, remote: bool = False):
     pidfile = f"/tmp/bench_{scene}.pid"
     stop_cmd = (
         f"if [ -f {pidfile} ]; then PID=$(cat {pidfile}); "
-        "if [ -n \"$PID\" ]; then kill $PID 2>/dev/null || true; sleep 0.5; kill -9 $PID 2>/dev/null || true; fi; "
+        "if [ -n \"$PID\" ]; then kill $PID 2>/dev/null || true; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 0.2; done; "
+        "if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null || true; fi; "
+        "fi; "
         f"rm -f {pidfile}; fi"
     )
     if remote:
@@ -1677,7 +1761,16 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
         return
 
     bench_remote = bool(CLIENT_IP and CLIENT_IP != SOURCE_IP)
-    pidfile = start_bench_background(scene, port, host=bench_host or SOURCE_IP, duration=bench_duration, threads=bench_threads, remote=bench_remote)
+    pidfile = start_bench_background(
+        scene,
+        port,
+        host=bench_host or SOURCE_IP,
+        duration=bench_duration,
+        threads=bench_threads,
+        remote=bench_remote,
+        exp_name=exp_name,
+        run_index=run_index,
+    )
 
     if apply_network:
         try:
@@ -1714,7 +1807,18 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
             metrics_dict = {k: v for k, v in zip(keys, vals)}
         if stats:
             params_summary = f"exp: {exp_args} | scene={scene}"
-            append_result(exp_name, scene, run_index, stats, header, params_summary, is_secure=SEC_MODE, extra_param_lines=params, first_in_run=(run_index == 1))
+            append_result(
+                exp_name,
+                scene,
+                run_index,
+                stats,
+                header,
+                params_summary,
+                is_secure=SEC_MODE,
+                extra_param_lines=params,
+                first_in_run=(run_index == 1),
+                results_dir=get_run_dir(),
+            )
             print(f"[mig] wrote stats for {exp_name} run {run_index}")
     except Exception as e:
         print(f"[mig] failed to write stats: {e}")
@@ -1799,7 +1903,7 @@ def simulate_local_migration(scene: str, bandwidth: str, iterations: int = 3, ba
 
 def collect_results(bundle_path: Optional[str], scene: str, run_idx: int):
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-    outdir = os.path.join('/runc/dirty-track/results/fog_tests', f"{scene}_{ts}_run{run_idx}")
+    outdir = os.path.join(get_run_dir(), f"{scene}_{ts}_run{run_idx}")
     os.makedirs(outdir, exist_ok=True)
     if bundle_path and os.path.isdir(bundle_path):
         run_cmd(f"cp -r {shlex.quote(os.path.join(bundle_path, 'results'))} {shlex.quote(outdir)}", quiet=True, ignore_error=True)
@@ -1990,6 +2094,7 @@ def main():
                 continue
             for scene in scenes:
                 scene_info = SCENE_INFO.get(scene, {})
+                scene_metrics = []
                 for r in range(args.runs):
                     if not KEEP_RUNNING:
                         break
@@ -2012,6 +2117,7 @@ def main():
                     if mig_data:
                         if mig_data.get('metrics'):
                             run_result['metrics'] = mig_data['metrics']
+                            scene_metrics.append(mig_data['metrics'])
                         if mig_data.get('header'):
                             run_result['metrics_header'] = mig_data['header']
                         if mig_data.get('stats'):
@@ -2021,6 +2127,7 @@ def main():
                     results.append(run_result)
                     write_run_record('migration', scene, exp_name, r + 1, run_result)
                     port = run_port + 1
+                append_scene_exp_summary(scene, exp_name, scene_metrics)
                 if not KEEP_RUNNING:
                     break
         ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
@@ -2052,6 +2159,7 @@ def main():
                     continue
                 for scene in scenes:
                     scene_info = SCENE_INFO.get(scene, {})
+                    scene_metrics = []
                     for r in range(args.runs):
                         if not KEEP_RUNNING:
                             break
@@ -2071,6 +2179,7 @@ def main():
                         if mig_data:
                             if mig_data.get('metrics'):
                                 run_result['metrics'] = mig_data['metrics']
+                                scene_metrics.append(mig_data['metrics'])
                             if mig_data.get('header'):
                                 run_result['metrics_header'] = mig_data['header']
                             if mig_data.get('stats'):
@@ -2080,6 +2189,7 @@ def main():
                         results.append(run_result)
                         write_run_record('migration-local', scene, exp_name, r + 1, run_result)
                         port = run_port + 1
+                    append_scene_exp_summary(scene, exp_name, scene_metrics)
                     if not KEEP_RUNNING:
                         break
         finally:

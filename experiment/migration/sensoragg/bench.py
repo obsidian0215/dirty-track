@@ -57,6 +57,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -114,7 +116,9 @@ class SensorInfluxBench:
                  device_count: int = 0,
                  pacing: bool = False,
                  payload_mixture: bool = False,
-                 report_realism: bool = False):
+                 report_realism: bool = False,
+                 metrics_out: Optional[str] = None,
+                 metrics_interval: float = 1.0):
 
         self.influx_url = influx_url
         self.token = token
@@ -155,6 +159,20 @@ class SensorInfluxBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        self.metrics = None
+        if IntervalMetrics:
+            self.metrics = IntervalMetrics(
+                interval_sec=metrics_interval,
+                out_path=metrics_out,
+                label='sensoragg',
+                logger=logger,
+            )
+        if bench_common and self.metrics:
+            try:
+                bench_common.register_metrics_signal_handlers(self.metrics)
+            except Exception:
+                pass
 
         # payload sizing and mode
         self.payload_sizes: List[int] = []
@@ -412,7 +430,7 @@ class SensorInfluxBench:
 
         return points
 
-    def _execute_range_query(self) -> List[Point]:
+    def _execute_range_query(self) -> float:
         """Execute range query similar to Redis ZRANGEBYSCORE"""
         now = int(time.time() * 1000)
         query = f"""
@@ -433,9 +451,9 @@ class SensorInfluxBench:
             self.success += 1
 
         # Return mock points for consistency
-        return [Point("query_result").tag("type", "range").field("count", len(result))]
+        return latency
 
-    def _execute_count_query(self) -> List[Point]:
+    def _execute_count_query(self) -> float:
         """Execute count query similar to Redis ZCOUNT"""
         query = f"""
             from(bucket: "{self.bucket}")
@@ -453,9 +471,9 @@ class SensorInfluxBench:
             self.latencies_ms.append(latency)
             self.success += 1
 
-        return [Point("query_result").tag("type", "count").field("count", len(result))]
+        return latency
 
-    def _execute_minmax_query(self) -> List[Point]:
+    def _execute_minmax_query(self) -> float:
         """Execute min/max query operations"""
         query_type = random.choice(["min", "max"])
         query = f"""
@@ -474,7 +492,7 @@ class SensorInfluxBench:
             self.latencies_ms.append(latency)
             self.success += 1
 
-        return [Point("query_result").tag("type", query_type).field("count", len(result))]
+        return latency
 
     def _rate_control(self):
         """实现精确的速率控制"""
@@ -502,11 +520,13 @@ class SensorInfluxBench:
                     # Execute read operations
                     query_type = random.choice(["range", "count", "minmax"])
                     if query_type == "range":
-                        self._execute_range_query()
+                        lat = self._execute_range_query()
                     elif query_type == "count":
-                        self._execute_count_query()
+                        lat = self._execute_count_query()
                     else:
-                        self._execute_minmax_query()
+                        lat = self._execute_minmax_query()
+                    if self.metrics:
+                        self.metrics.record(True, lat)
                 else:
                     # Write sensor data
                     dev = None
@@ -533,6 +553,9 @@ class SensorInfluxBench:
                         self.latencies_ms.append(lat)
                         self.success += 1
 
+                    if self.metrics:
+                        self.metrics.record(True, lat)
+
                     # Track payload size for stats
                     if not self.report_realism:
                         with self.lock:
@@ -543,6 +566,12 @@ class SensorInfluxBench:
                 logger.debug("Operation failed: %s", e)
                 with self.lock:
                     self.fail += 1
+                if self.metrics:
+                    try:
+                        lat = (time.perf_counter() - start) * 1000.0
+                    except Exception:
+                        lat = None
+                    self.metrics.record(False, lat)
                 time.sleep(0.01)
 
             # Periodic monitoring
@@ -587,6 +616,9 @@ class SensorInfluxBench:
         self.last_success_count = 0
         self.start_time = start_time  # 需要设置start_time属性
 
+        if self.metrics:
+            self.metrics.start()
+
         tlist = []
         for _ in range(threads):
             t = threading.Thread(target=self._worker, args=(duration, read_pct), daemon=True)
@@ -597,6 +629,9 @@ class SensorInfluxBench:
                    threads, duration, read_pct, self.sensors_per_device, self.sensor_types)
         for t in tlist:
             t.join()
+        if self.metrics:
+            self.metrics.stop()
+            self.metrics.write()
         self._print_summary(duration)
 
         # Close client connection
@@ -709,6 +744,8 @@ def main():
     parser.add_argument("--frontend-url", dest="frontend_url", default=None, help="Optional HTTP frontend URL to route requests through")
     parser.add_argument("--dataset", default=None, help="Path to dataset directory (default: repo datasets/)")
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
+    parser.add_argument("--metrics-out", default=None, help="Output path for interval metrics (JSON)")
+    parser.add_argument("--metrics-interval", type=float, default=1.0, help="Sampling interval seconds (default: 1.0)")
     parser.add_argument("--retention-policy", default="1h", type=str,
                        help="Bucket retention policy (e.g., 1h, 24h, 7d)")
 
@@ -781,7 +818,9 @@ def main():
         device_count=args.device_count,
         pacing=args.pacing,
         payload_mixture=args.payload_mixture,
-        report_realism=args.report_realism
+        report_realism=args.report_realism,
+        metrics_out=args.metrics_out,
+        metrics_interval=args.metrics_interval,
     )
 
     bench.payload_mode = args.payload_mode

@@ -14,8 +14,10 @@ Default dataset directory: repo root `datasets/` (computed at runtime).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import signal
 import threading
 import time
 from typing import Optional
@@ -43,6 +45,10 @@ def add_common_args(parser: argparse.ArgumentParser, *, include_dataset: bool = 
                         help='Number of worker threads/concurrency (default: 1)')
     parser.add_argument('--frontend-url', dest='frontend_url', default=None,
                         help='Optional HTTP frontend URL to route requests through')
+    parser.add_argument('--metrics-out', default=None,
+                        help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0,
+                        help='Sampling interval in seconds for metrics (default: 1.0)')
 
     if include_dataset:
         parser.add_argument('--dataset', default=DEFAULT_DATASET_DIR,
@@ -115,6 +121,200 @@ def configure_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(message)s')
 
 
+class IntervalMetrics:
+    """Track interval throughput/latency/loss and persist to a JSON file."""
+
+    def __init__(self, interval_sec: float = 1.0, out_path: Optional[str] = None, label: Optional[str] = None, logger=None):
+        self.interval_sec = float(interval_sec) if interval_sec else 1.0
+        self.out_path = out_path
+        self.label = label or 'bench'
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+        self._start_mono = None
+        self._last_mono = None
+
+        self._total_count = 0
+        self._total_success = 0
+        self._total_latency_sum = 0.0
+        self._total_latency_count = 0
+
+        self._win_count = 0
+        self._win_success = 0
+        self._win_latency_sum = 0.0
+        self._win_latency_count = 0
+
+        self._samples = []
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._start_mono = time.monotonic()
+        self._last_mono = self._start_mono
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def record(self, success: bool, latency_ms: Optional[float]) -> None:
+        with self._lock:
+            self._total_count += 1
+            if success:
+                self._total_success += 1
+            if latency_ms is not None:
+                try:
+                    self._total_latency_sum += float(latency_ms)
+                    self._total_latency_count += 1
+                except Exception:
+                    pass
+
+            self._win_count += 1
+            if success:
+                self._win_success += 1
+            if latency_ms is not None:
+                try:
+                    self._win_latency_sum += float(latency_ms)
+                    self._win_latency_count += 1
+                except Exception:
+                    pass
+
+    def _emit(self, sample: dict) -> None:
+        msg = (
+            f"[sample] {self.label} t={sample['elapsed_end_sec']:.1f}s "
+            f"throughput={sample['throughput_ops_sec']:.2f}ops/s "
+            f"avg_latency={sample['avg_latency_ms']:.3f}ms "
+            f"loss_rate={sample['loss_rate']:.3f}"
+        )
+        if self.logger is not None:
+            try:
+                self.logger.info(msg)
+                return
+            except Exception:
+                pass
+        print(msg)
+
+    def _sample(self, now_mono: Optional[float] = None) -> None:
+        if self._start_mono is None or self._last_mono is None:
+            return
+        now_mono = now_mono or time.monotonic()
+        duration = now_mono - self._last_mono
+        if duration <= 0:
+            return
+
+        with self._lock:
+            count = self._win_count
+            success = self._win_success
+            lat_sum = self._win_latency_sum
+            lat_cnt = self._win_latency_count
+
+            self._win_count = 0
+            self._win_success = 0
+            self._win_latency_sum = 0.0
+            self._win_latency_count = 0
+
+        throughput = count / duration if count > 0 else 0.0
+        avg_latency = lat_sum / lat_cnt if lat_cnt > 0 else 0.0
+        loss_rate = (count - success) / count if count > 0 else 0.0
+
+        sample = {
+            "elapsed_start_sec": self._last_mono - self._start_mono,
+            "elapsed_end_sec": now_mono - self._start_mono,
+            "interval_sec": duration,
+            "total_ops": count,
+            "success_ops": success,
+            "throughput_ops_sec": throughput,
+            "avg_latency_ms": avg_latency,
+            "loss_rate": loss_rate,
+        }
+        self._samples.append(sample)
+        self._emit(sample)
+        self._last_mono = now_mono
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_sec):
+            self._sample()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        try:
+            self._thread.join(timeout=self.interval_sec + 1.0)
+        except Exception:
+            pass
+        self._sample()
+
+    def to_dict(self) -> dict:
+        if self._start_mono is None:
+            total_duration = 0.0
+        else:
+            total_duration = max(0.0, time.monotonic() - self._start_mono)
+
+        with self._lock:
+            total_count = self._total_count
+            total_success = self._total_success
+            total_latency_sum = self._total_latency_sum
+            total_latency_count = self._total_latency_count
+
+        overall_throughput = total_count / total_duration if total_duration > 0 else 0.0
+        overall_avg_latency = total_latency_sum / total_latency_count if total_latency_count > 0 else 0.0
+        overall_loss = (total_count - total_success) / total_count if total_count > 0 else 0.0
+
+        return {
+            "label": self.label,
+            "interval_sec": self.interval_sec,
+            "total_duration_sec": total_duration,
+            "samples": list(self._samples),
+            "overall": {
+                "total_ops": total_count,
+                "success_ops": total_success,
+                "throughput_ops_sec": overall_throughput,
+                "avg_latency_ms": overall_avg_latency,
+                "loss_rate": overall_loss,
+            },
+        }
+
+    def write(self, out_path: Optional[str] = None) -> Optional[str]:
+        path = out_path or self.out_path
+        if not path:
+            return None
+        out_dir = os.path.dirname(path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        data = self.to_dict()
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        return path
+
+
+def install_signal_handlers(cleanup_fn) -> None:
+    def _handler(signum, frame):
+        try:
+            cleanup_fn()
+        finally:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
+
+def register_metrics_signal_handlers(metrics: Optional[IntervalMetrics]) -> None:
+    if not metrics:
+        return
+
+    def _cleanup():
+        try:
+            metrics.stop()
+        except Exception:
+            pass
+        try:
+            metrics.write()
+        except Exception:
+            pass
+
+    install_signal_handlers(_cleanup)
+
+
 __all__ = [
     'add_common_args',
     'RateLimiter',
@@ -122,4 +322,7 @@ __all__ = [
     'get_dataset_path',
     'configure_logging',
     'DEFAULT_DATASET_DIR',
+    'IntervalMetrics',
+    'install_signal_handlers',
+    'register_metrics_signal_handlers',
 ]

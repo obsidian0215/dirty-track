@@ -54,6 +54,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 logger = logging.getLogger(__name__)
 
 
@@ -229,6 +231,20 @@ class SurveillanceAnalyticsBench:
         self.stop_flag = threading.Event()
         self.lock = threading.Lock()
 
+        self.metrics = None
+        if IntervalMetrics:
+            self.metrics = IntervalMetrics(
+                interval_sec=getattr(args, 'metrics_interval', 1.0),
+                out_path=getattr(args, 'metrics_out', None),
+                label='video',
+                logger=logger,
+            )
+        if bench_common and self.metrics:
+            try:
+                bench_common.register_metrics_signal_handlers(self.metrics)
+            except Exception:
+                pass
+
     def _frame_hash(self, camera_id: str, detections: List[Dict]) -> str:
         """计算帧的哈希（用于缓存查询）"""
         # 简化版：基于目标位置和类型
@@ -345,10 +361,14 @@ class SurveillanceAnalyticsBench:
                     local_stats['latencies'].append(latency)
                     local_stats['frames'] += 1
                     local_stats['detections'] += len(detections)
+                    if self.metrics:
+                        self.metrics.record(True, latency)
 
                 except Exception as e:
                     logger.debug(f"线程 {thread_id} 错误: {e}")
                     local_stats['errors'] += 1
+                    if self.metrics:
+                        self.metrics.record(False, None)
 
                 time.sleep(frame_interval)
 
@@ -383,6 +403,9 @@ class SurveillanceAnalyticsBench:
         threads = []
         start_time = time.time()
 
+        if self.metrics:
+            self.metrics.start()
+
         for i in range(self.args.threads):
             t = threading.Thread(target=self.worker, args=(i,))
             t.start()
@@ -412,6 +435,10 @@ class SurveillanceAnalyticsBench:
         self.stop_flag.set()
         for t in threads:
             t.join()
+
+        if self.metrics:
+            self.metrics.stop()
+            self.metrics.write()
 
         # 打印结果
         self.print_results(time.time() - start_time)
@@ -464,6 +491,8 @@ def main():
     parser.add_argument('--hotspot-ratio', type=float, default=0.2, help='热点摄像头比例（0-1）')
     parser.add_argument('--cache-ttl', type=int, default=10, help='缓存TTL（秒）')
     parser.add_argument('--track-duration', type=int, default=10, help='追踪状态保留时长（秒）')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 
     args = parser.parse_args()
 

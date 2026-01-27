@@ -54,6 +54,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 logger = logging.getLogger(__name__)
 
 
@@ -159,6 +161,20 @@ class V2XCommunicationBench:
         self.stop_flag = threading.Event()
         self.lock = threading.Lock()
 
+        self.metrics = None
+        if IntervalMetrics:
+            self.metrics = IntervalMetrics(
+                interval_sec=getattr(args, 'metrics_interval', 1.0),
+                out_path=getattr(args, 'metrics_out', None),
+                label='transportation',
+                logger=logger,
+            )
+        if bench_common and self.metrics:
+            try:
+                bench_common.register_metrics_signal_handlers(self.metrics)
+            except Exception:
+                pass
+
     def pubsub_listener(self):
         """Pub/Sub消息监听线程"""
         logger.info("Pub/Sub监听线程启动")
@@ -219,6 +235,8 @@ class V2XCommunicationBench:
                     update_lat = (time.perf_counter() - start) * 1000
                     local_stats['update_lat'].append(update_lat)
                     local_stats['updates'] += 1
+                    if self.metrics:
+                        self.metrics.record(True, update_lat)
 
                     # 查询附近车辆（周边感知）
                     start = time.perf_counter()
@@ -233,6 +251,8 @@ class V2XCommunicationBench:
                     query_lat = (time.perf_counter() - start) * 1000
                     local_stats['query_lat'].append(query_lat)
                     local_stats['queries'] += 1
+                    if self.metrics:
+                        self.metrics.record(True, query_lat)
 
                     # 碰撞风险检测（距离<50m且相对速度高）
                     for other_id, distance in nearby:
@@ -279,6 +299,8 @@ class V2XCommunicationBench:
                 except Exception as e:
                     logger.debug(f"线程 {thread_id} 错误: {e}")
                     local_stats['errors'] += 1
+                    if self.metrics:
+                        self.metrics.record(False, None)
 
             last_update = current_time
             time.sleep(update_interval)
@@ -317,6 +339,9 @@ class V2XCommunicationBench:
         threads = []
         start_time = time.time()
 
+        if self.metrics:
+            self.metrics.start()
+
         for i in range(self.args.threads):
             t = threading.Thread(target=self.worker, args=(i,))
             t.start()
@@ -344,6 +369,10 @@ class V2XCommunicationBench:
         for t in threads:
             t.join()
         pubsub_thread.join()
+
+        if self.metrics:
+            self.metrics.stop()
+            self.metrics.write()
 
         # 打印结果
         self.print_results(time.time() - start_time)
@@ -401,6 +430,8 @@ def main():
     parser.add_argument('--vehicles', type=int, default=500, help='车辆数量')
     parser.add_argument('--update-freq', type=float, default=10.0, help='位置更新频率（Hz）')
     parser.add_argument('--query-radius', type=int, default=500, help='查询半径（米）')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 
     args = parser.parse_args()
 

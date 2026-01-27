@@ -53,6 +53,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 logger = logging.getLogger(__name__)
 
 
@@ -265,6 +267,20 @@ class PredictiveMaintenanceBench:
         self.stop_flag = threading.Event()
         self.lock = threading.Lock()
 
+        self.metrics = None
+        if IntervalMetrics:
+            self.metrics = IntervalMetrics(
+                interval_sec=getattr(args, 'metrics_interval', 1.0),
+                out_path=getattr(args, 'metrics_out', None),
+                label='industrial',
+                logger=logger,
+            )
+        if bench_common and self.metrics:
+            try:
+                bench_common.register_metrics_signal_handlers(self.metrics)
+            except Exception:
+                pass
+
     def worker(self, thread_id: int):
         """工作线程"""
         local_stats = {'samples': 0, 'anomalies': 0, 'errors': 0, 'latencies': []}
@@ -339,10 +355,14 @@ class PredictiveMaintenanceBench:
                     latency = (time.perf_counter() - start) * 1000
                     local_stats['latencies'].append(latency)
                     local_stats['samples'] += 1
+                    if self.metrics:
+                        self.metrics.record(True, latency)
 
                 except Exception as e:
                     logger.debug(f"线程 {thread_id} 错误: {e}")
                     local_stats['errors'] += 1
+                    if self.metrics:
+                        self.metrics.record(False, None)
 
                 time.sleep(interval)
 
@@ -374,6 +394,9 @@ class PredictiveMaintenanceBench:
         threads = []
         start_time = time.time()
 
+        if self.metrics:
+            self.metrics.start()
+
         for i in range(self.args.threads):
             t = threading.Thread(target=self.worker, args=(i,))
             t.start()
@@ -395,6 +418,10 @@ class PredictiveMaintenanceBench:
         self.stop_flag.set()
         for t in threads:
             t.join()
+
+        if self.metrics:
+            self.metrics.stop()
+            self.metrics.write()
 
         # 打印结果
         self.print_results(time.time() - start_time)
@@ -439,6 +466,8 @@ def main():
     parser.add_argument('--devices', type=int, default=50, help='设备数量')
     parser.add_argument('--sampling-rate', type=float, default=10.0, help='采样率（Hz）')
     parser.add_argument('--anomaly-rate', type=float, default=0.05, help='异常触发概率（0-1）')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 
     args = parser.parse_args()
 

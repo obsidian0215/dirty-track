@@ -32,6 +32,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 parser = argparse.ArgumentParser()
 if bench_common:
     bench_common.add_common_args(parser)
@@ -44,6 +46,8 @@ parser.add_argument('--audio', default=None, help='Audio file to upload (relativ
 parser.add_argument('--text', default=None, help='Text file to upload (relative to --dataset if not absolute)')
 if not bench_common:
     parser.add_argument('--dataset', default=None, help='Path to datasets directory (default: repo datasets/)')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--iters', type=int, default=10, help='Fallback iterations when --duration is not used')
 parser.add_argument('--out', default='bench_aeneas.csv')
 args = parser.parse_args()
@@ -115,6 +119,22 @@ class RateLimiter:
 
 rl = RateLimiter(getattr(args, 'rps', 0))
 
+def _is_success(status):
+    return status is not None and 200 <= int(status) < 400
+
+metrics = None
+if IntervalMetrics:
+    metrics = IntervalMetrics(
+        interval_sec=getattr(args, 'metrics_interval', 1.0),
+        out_path=getattr(args, 'metrics_out', None),
+        label='aeneas',
+    )
+if bench_common and metrics:
+    try:
+        bench_common.register_metrics_signal_handlers(metrics)
+    except Exception:
+        pass
+
 
 def do_request_once(idx=None):
     start = time.time()
@@ -128,6 +148,8 @@ def do_request_once(idx=None):
         status = None
         preview = str(e)[:200]
     elapsed = time.time() - start
+    if metrics:
+        metrics.record(_is_success(status), elapsed * 1000.0)
     with results_lock:
         results.append((idx if idx is not None else time.time(), status, elapsed, preview))
 
@@ -147,10 +169,14 @@ def worker_duration(url, end_time):
             status = None
             preview = str(e)[:200]
         elapsed = time.time() - start
+        if metrics:
+            metrics.record(_is_success(status), elapsed * 1000.0)
         with results_lock:
             results.append((time.time(), status, elapsed, preview))
 
 # Run
+if metrics:
+    metrics.start()
 if getattr(args, 'duration', 0) and args.duration > 0:
     end_time = time.time() + args.duration
     threads = []
@@ -169,6 +195,10 @@ else:
                 f.result()
             except Exception:
                 pass
+
+if metrics:
+    metrics.stop()
+    metrics.write()
 
 # Write CSV
 outf = args.out

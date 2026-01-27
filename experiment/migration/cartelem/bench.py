@@ -56,6 +56,8 @@ try:
 except Exception:
     bench_common = None
 
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -111,7 +113,9 @@ class VehicleInfluxBench:
                 device_count: int = 0,
                 pacing: bool = False,
                 payload_mixture: bool = False,
-                report_realism: bool = False):
+                report_realism: bool = False,
+                metrics_out: Optional[str] = None,
+                metrics_interval: float = 1.0):
 
         self.influx_url = influx_url
         self.token = token
@@ -150,6 +154,20 @@ class VehicleInfluxBench:
         self.success = 0
         self.fail = 0
         self.lock = threading.Lock()
+
+        self.metrics = None
+        if IntervalMetrics:
+            self.metrics = IntervalMetrics(
+                interval_sec=metrics_interval,
+                out_path=metrics_out,
+                label='cartelem',
+                logger=logger,
+            )
+        if bench_common and self.metrics:
+            try:
+                bench_common.register_metrics_signal_handlers(self.metrics)
+            except Exception:
+                pass
 
         # track payload sizes (bytes) for metrics
         self.payload_sizes = []
@@ -439,7 +457,7 @@ class VehicleInfluxBench:
 
         return points
 
-    def _execute_location_query(self):
+    def _execute_location_query(self) -> float:
         """Execute location-based query"""
         query = f"""
             from(bucket: "{self.bucket}")
@@ -458,7 +476,7 @@ class VehicleInfluxBench:
             self.latencies_ms.append(latency)
             self.success += 1
 
-        return len(result)
+        return latency
 
     def _worker(self, duration: float, read_pct: int):
         """Worker thread for mixed operations"""
@@ -481,7 +499,9 @@ class VehicleInfluxBench:
 
             try:
                 if do_read:
-                    self._execute_location_query()
+                    lat = self._execute_location_query()
+                    if self.metrics:
+                        self.metrics.record(True, lat)
                 else:
                     # Write vehicle data
                     dev = None
@@ -507,10 +527,18 @@ class VehicleInfluxBench:
                     with self.lock:
                         self.latencies_ms.append(lat)
                         self.success += 1
+                    if self.metrics:
+                        self.metrics.record(True, lat)
             except Exception as e:
                 logger.debug("Operation failed: %s", e)
                 with self.lock:
                     self.fail += 1
+                if self.metrics:
+                    try:
+                        lat = (time.perf_counter() - start) * 1000.0
+                    except Exception:
+                        lat = None
+                    self.metrics.record(False, lat)
                 time.sleep(0.01)
 
             # Periodic monitoring
@@ -555,6 +583,9 @@ class VehicleInfluxBench:
         self.last_success_count = 0
         self.start_time = start_time
 
+        if self.metrics:
+            self.metrics.start()
+
         tlist = []
         for _ in range(threads):
             t = threading.Thread(target=self._worker, args=(duration, read_pct), daemon=True)
@@ -566,6 +597,10 @@ class VehicleInfluxBench:
 
         for t in tlist:
             t.join()
+
+        if self.metrics:
+            self.metrics.stop()
+            self.metrics.write()
 
         self._print_summary(duration)
 
@@ -679,6 +714,8 @@ def main():
     parser.add_argument("--read-pct", default=10, type=int, help="Read operation percentage")
     parser.add_argument("--retention-policy", default="1h", type=str,
                        help="Bucket retention policy (e.g., 1h, 24h, 7d)")
+    parser.add_argument("--metrics-out", default=None, help="Output path for interval metrics (JSON)")
+    parser.add_argument("--metrics-interval", type=float, default=1.0, help="Sampling interval seconds (default: 1.0)")
 
     # Payload mode
     parser.add_argument("--payload-mode", default="json", choices=["json", "binary"],
@@ -747,7 +784,9 @@ def main():
         device_count=args.device_count,
         pacing=args.pacing,
         payload_mixture=args.payload_mixture,
-        report_realism=args.report_realism
+        report_realism=args.report_realism,
+        metrics_out=args.metrics_out,
+        metrics_interval=args.metrics_interval,
     )
     bench.payload_mode = args.payload_mode
 

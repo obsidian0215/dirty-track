@@ -7,10 +7,30 @@
 import random
 import time
 import string
+import os
 from argparse import ArgumentParser
 import concurrent.futures
 import statistics
 from elasticsearch import Elasticsearch
+
+# Dynamic bench_common import (for IntervalMetrics)
+try:
+    import importlib.util as _importlib_util, os as _os
+    _cur = _os.path.abspath(_os.path.dirname(__file__))
+    _bench_common = None
+    for _ in range(6):
+        _candidate = _os.path.join(_cur, 'common', 'bench_common.py')
+        if _os.path.exists(_candidate):
+            spec = _importlib_util.spec_from_file_location('bench_common', _candidate)
+            _bench_common = _importlib_util.module_from_spec(spec)
+            spec.loader.exec_module(_bench_common)
+            break
+        _cur = _os.path.dirname(_cur)
+    bench_common = _bench_common
+except Exception:
+    bench_common = None
+
+IntervalMetrics = getattr(bench_common, 'IntervalMetrics', None) if bench_common else None
 
 PAYLOAD_SIZE = 512
 
@@ -25,7 +45,7 @@ def random_title():
     words = ['test', 'document', 'index', 'search', 'benchmark', 'performance', 'data', 'query']
     return ' '.join(random.sample(words, 3))
 
-def index_worker(tid, es_client, index_name, documents_per_thread, field_count, latencies):
+def index_worker(tid, es_client, index_name, documents_per_thread, field_count, latencies, metrics=None):
     """索引文档worker：按批次提交并做速率限制。
 
     参数说明：
@@ -83,11 +103,12 @@ def index_worker(tid, es_client, index_name, documents_per_thread, field_count, 
             operations.append({'_index': index_name, '_id': doc_id, '_source': document})
 
         start_time = time.time()
+        success = True
         try:
             bulk(es_client, operations)
         except Exception:
             # ignore individual bulk failures
-            pass
+            success = False
         end_time = time.time()
 
         elapsed = end_time - start_time
@@ -95,6 +116,8 @@ def index_worker(tid, es_client, index_name, documents_per_thread, field_count, 
         total_docs_indexed += len(operations)
         if len(operations) > 0:
             lat_samples.append(elapsed / len(operations))
+        if metrics:
+            metrics.record(success, elapsed * 1000.0)
 
         # Rate limiting: sleep to maintain per-thread request interval (if available)
         if per_thread_interval:
@@ -107,7 +130,7 @@ def index_worker(tid, es_client, index_name, documents_per_thread, field_count, 
     latencies.append(avg_latency)
     return total_docs_indexed, total_time, avg_latency, throughput
 
-def search_worker(tid, es_client, index_name, searches_per_thread, latencies, field_count):
+def search_worker(tid, es_client, index_name, searches_per_thread, latencies, field_count, metrics=None):
     """搜索worker"""
     for i in range(searches_per_thread):
         # 构建随机查询
@@ -146,11 +169,17 @@ def search_worker(tid, es_client, index_name, searches_per_thread, latencies, fi
         }
 
         start_time = time.time()
-        response = es_client.search(index=index_name, body=search_query)
+        success = True
+        try:
+            response = es_client.search(index=index_name, body=search_query)
+        except Exception:
+            success = False
         end_time = time.time()
 
         latency = end_time - start_time
         latencies.append(latency)
+        if metrics:
+            metrics.record(success, latency * 1000.0)
 
 def main():
     parser = ArgumentParser(description='Elasticsearch 基准测试客户端')
@@ -166,6 +195,8 @@ def main():
     parser.add_argument('--index-name', default='benchmark-test', help='索引名称')
     parser.add_argument('--field-count', type=int, default=5, help='每个文档额外字段数')
     parser.add_argument('--test-mode', choices=['index', 'search', 'mixed'], default='index', help='测试模式：index 只索引，search 只搜索，mixed 混合')
+    parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
+    parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 
     args = parser.parse_args()
 
@@ -354,13 +385,27 @@ def main():
     total_operations = 0
     total_time = 0
 
+    metrics = None
+    if IntervalMetrics:
+        metrics = IntervalMetrics(
+            interval_sec=getattr(args, 'metrics_interval', 1.0),
+            out_path=getattr(args, 'metrics_out', None),
+            label='elasticsearch',
+        )
+        if bench_common:
+            try:
+                bench_common.register_metrics_signal_handlers(metrics)
+            except Exception:
+                pass
+        metrics.start()
+
     if args.test_mode in ['index', 'mixed']:
         print("Running index benchmark...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
             futures = []
             for tid in range(args.threads):
                 future = executor.submit(index_worker, tid, es, args.index_name, args.operations,
-                                       args.field_count, latencies)
+                                       args.field_count, latencies, metrics)
                 futures.append(future)
 
             for future in futures:
@@ -381,7 +426,7 @@ def main():
             futures = []
             for tid in range(args.threads):
                 future = executor.submit(search_worker, tid, es, args.index_name, args.operations,
-                                       latencies, args.field_count)
+                                       latencies, args.field_count, metrics)
                 futures.append(future)
 
             for future in futures:
@@ -391,6 +436,10 @@ def main():
                     print(f'Search thread error: {e}')
 
         total_operations += args.operations * args.threads
+
+    if metrics:
+        metrics.stop()
+        metrics.write()
 
     # 计算统计
     if latencies:
