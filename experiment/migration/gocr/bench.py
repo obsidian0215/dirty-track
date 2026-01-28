@@ -46,6 +46,7 @@ else:
     parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 parser.add_argument('--url', required=True, help='Server base URL (e.g., http://127.0.0.1:8080)')
 parser.add_argument('--files', default=None, help='Comma-separated list of image filenames to cycle through (relative to --dataset if not absolute)')
+parser.add_argument('--file', default=None, help='Image file to send (relative to --dataset if not absolute)')
 parser.add_argument('--requests', '--iters', dest='requests', type=int, default=100, help='Total requests when not using --duration')
 parser.add_argument('--out', default='bench_gocr.csv')
 args = parser.parse_args()
@@ -53,9 +54,15 @@ args = parser.parse_args()
 if bench_common:
     args.dataset = bench_common.get_dataset_path(args)
     bench_common.configure_logging()
+    try:
+        if args.dataset == bench_common.DEFAULT_DATASET_DIR or not args.dataset:
+            args.dataset = '/runc/datasets/ocr'
+    except Exception:
+        if not args.dataset:
+            args.dataset = '/runc/datasets/ocr'
 else:
     if not args.dataset:
-        args.dataset = '/runc/datasets'
+        args.dataset = '/runc/datasets/ocr'
 
 # prepare inputs
 file_paths = []
@@ -78,6 +85,25 @@ if args.files:
             file_paths.append(found)
         else:
             raise SystemExit(f'file not found from --files: {part}')
+elif args.file:
+    f = args.file
+    if os.path.isabs(f) and os.path.exists(f):
+        file_paths.append(f)
+    else:
+        candidate = os.path.join(args.dataset, f) if args.dataset else f
+        if os.path.exists(candidate):
+            file_paths.append(candidate)
+        else:
+            found = None
+            if args.dataset and os.path.isdir(args.dataset):
+                for root, _, files in os.walk(args.dataset):
+                    if f in files:
+                        found = os.path.join(root, f)
+                        break
+            if found:
+                file_paths.append(found)
+            else:
+                raise SystemExit(f'file not found: {f}')
 elif args.dataset and os.path.isdir(args.dataset):
     for root, _, files in os.walk(args.dataset):
         for fn in files:

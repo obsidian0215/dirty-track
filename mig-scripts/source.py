@@ -1320,6 +1320,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
     prev_def_total = 0
     dm_converge_count = 0
     dm_diverge_count = 0
+    converge_count = 0
     if dirtymap:
         # 在pre-copy开启前先启动对容器的dirty-track
         get_runc_container_pidtree(container)
@@ -1343,7 +1344,14 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
             less_last_size = float(getdirsize(less_last_path, "pages") or 0) if less_last_path else 0.0
             if (
                 abs(dir_size - less_last_size) < 1024 * 64
+                or (dir_size >= less_last_size * 0.95 and dir_size <= less_last_size * 1.05)
                 or dir_size < 1024 * 64
+            ):
+                converge_count += 1
+            else:
+                converge_count = 0
+            if (
+                converge_count >= 2
                 or last_iter == max_iter
             ):
                 iter_terminate = True
@@ -2338,10 +2346,7 @@ if __name__ == "__main__":
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")
 
-    # 将结果追加写入 results.txt 文件，包含指标与取值
-    with open("results.txt", "a") as f:
-        f.write(metrics_line + "\n")
-        f.write(values_line + "\n")
+    # Legacy: previously appended metrics to results.txt — deprecated. Use /runc/results via the test harness for persistent storage.
 
     if diskless:
         post_process(max_iter)

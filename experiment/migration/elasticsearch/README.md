@@ -10,14 +10,14 @@ pip install elasticsearch
 
 ## 脚本概览
 
-### benchmark.py
+### bench.py
 **ElasticSearch基础基准测试**
 
 支持文档索引和搜索的并发测试，包括批量写入、范围查询和分面搜索。
 
 #### 基本用法
 ```bash
-python benchmark.py --threads 10 --operations 1000 --es-host localhost \
+python bench.py --threads 10 --operations 1000 --es-host localhost \
     --es-port 9200 --index-name benchmark-test --test-mode index
 ```
 
@@ -40,19 +40,19 @@ python benchmark.py --threads 10 --operations 1000 --es-host localhost \
 #### 使用示例
 ```bash
 # 索引性能测试
-python benchmark.py --threads 16 --operations 5000 --es-host localhost \
+python bench.py --threads 16 --operations 5000 --es-host localhost \
     --index-name indexing-test --field-count 10 --test-mode index
 
 # 搜索性能测试
-python benchmark.py --threads 20 --operations 5000 --es-host localhost \
+python bench.py --threads 20 --operations 5000 --es-host localhost \
     --index-name search-test --test-mode search
 
 # 混合负载测试
-python benchmark.py --threads 12 --operations 3000 --es-host localhost \
+python bench.py --threads 12 --operations 3000 --es-host localhost \
     --index-name mixed-test --test-mode mixed --field-count 8
 
 # 大规模文档测试
-python benchmark.py --threads 8 --operations 10000 --es-host localhost \
+python bench.py --threads 8 --operations 10000 --es-host localhost \
     --index-name large-docs --field-count 50 --test-mode index
 ```
 
@@ -165,7 +165,7 @@ export ES_JAVA_OPTS="$ES_JAVA_OPTS -XX:MaxRAMPercentage=75"
 
 ```bash
 # 会询问是否删除测试索引
-python benchmark.py --threads 1 --operations 1
+python bench.py --threads 1 --operations 1
 # 之后回答 'y' 删除索引
 ```
 
@@ -193,7 +193,7 @@ ElasticSearch基准测试也可与容器迁移测试结合：
 ### 单一节点迁移测试
 ```bash
 # 在后台运行ES基准测试
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 10 \
     --operations 10000 \
     --es-host localhost \
@@ -208,7 +208,7 @@ python3 chk_restore.py elasticsearch [options]
 ### 分布式迁移测试
 ```bash
 # 源节点 - 索引负载测试
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 16 \
     --operations 5000 \
     --es-host source-node \
@@ -216,7 +216,7 @@ python3 ./experiment/migration/elasticsearch/benchmark.py \
     --field-count 20
 
 # 目标节点 - 搜索验证
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 8 \
     --operations 2000 \
     --es-host dest-node \
@@ -269,13 +269,13 @@ runc run --console-socket elasticsearch/console.sock -d -b elasticsearch elastic
 curl -f http://localhost:9200/_cluster/health?pretty
 
 # 3. 运行快速索引测试
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 4 \
     --operations 100 \
     --test-mode index
 
 # 4. 运行混合负载测试
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 8 \
     --operations 1000 \
     --test-mode mixed \
@@ -283,7 +283,7 @@ python3 ./experiment/migration/elasticsearch/benchmark.py \
     --duration 30
 
 # 5. 清理测试索引 (可选)
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
     --threads 1 \
     --operations 1
 # 然后输入 'y' 确认删除

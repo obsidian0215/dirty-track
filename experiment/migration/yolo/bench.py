@@ -62,9 +62,16 @@ if not server:
 # Resolve dataset
 if bench_common:
     args.dataset = bench_common.get_dataset_path(args)
+    bench_common.configure_logging()
+    try:
+        if args.dataset == bench_common.DEFAULT_DATASET_DIR or not args.dataset:
+            args.dataset = '/runc/datasets/images'
+    except Exception:
+        if not args.dataset:
+            args.dataset = '/runc/datasets/images'
 else:
     if not args.dataset:
-        args.dataset = '/runc/datasets'
+        args.dataset = '/runc/datasets/images'
 
 # Resolve files (support --files comma-separated, or --file single). Build rotating payloads.
 file_paths = []

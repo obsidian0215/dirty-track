@@ -25,7 +25,7 @@ try:
         _candidate = _os.path.join(_cur, 'common', 'bench_common.py')
         if _os.path.exists(_candidate):
             spec = _importlib_util.spec_from_file_location('bench_common', _candidate)
-            _bench_common = _importlib.util.module_from_spec(spec)
+            _bench_common = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(_bench_common)
             break
         _cur = os.path.dirname(_cur)
@@ -62,9 +62,16 @@ if not server:
 # Resolve dataset
 if bench_common:
     args.dataset = bench_common.get_dataset_path(args)
+    bench_common.configure_logging()
+    try:
+        if args.dataset == bench_common.DEFAULT_DATASET_DIR or not args.dataset:
+            args.dataset = '/runc/datasets/audio'
+    except Exception:
+        if not args.dataset:
+            args.dataset = '/runc/datasets/audio'
 else:
     if not args.dataset:
-        args.dataset = '/runc/datasets'
+        args.dataset = '/runc/datasets/audio'
 
 # Resolve files (support --files comma-separated, or --file single). Build rotating payloads.
 file_paths = []
@@ -211,36 +218,44 @@ def worker_duration(end_time):
         do_one_request()
 
 # Run
-if metrics:
-    metrics.start()
+try:
+    if metrics:
+        metrics.start()
 
-if getattr(args, 'duration', 0) and args.duration > 0:
-    end_time = time.time() + args.duration
-    threads = []
-    for _ in range(max(1, args.threads)):
-        t = threading.Thread(target=worker_duration, args=(end_time,))
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-else:
-    # fallback to request count
-    concurrency = getattr(args, 'concurrency', None) or getattr(args, 'threads', 1)
-    per_thread = max(1, args.requests // max(1, int(concurrency)))
-    threads = []
-    def worker_count(n):
-        for _ in range(n):
-            do_one_request()
-    for _ in range(max(1, int(concurrency))):
-        t = threading.Thread(target=worker_count, args=(per_thread,))
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-
-if metrics:
-    metrics.stop()
-    metrics.write()
+    if getattr(args, 'duration', 0) and args.duration > 0:
+        end_time = time.time() + args.duration
+        threads = []
+        for _ in range(max(1, args.threads)):
+            t = threading.Thread(target=worker_duration, args=(end_time,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+    else:
+        # fallback to request count
+        concurrency = getattr(args, 'concurrency', None) or getattr(args, 'threads', 1)
+        per_thread = max(1, args.requests // max(1, int(concurrency)))
+        threads = []
+        def worker_count(n):
+            for _ in range(n):
+                do_one_request()
+        for _ in range(max(1, int(concurrency))):
+            t = threading.Thread(target=worker_count, args=(per_thread,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+finally:
+    # Ensure metrics are flushed even on exceptions
+    if metrics:
+        try:
+            metrics.stop()
+        except Exception:
+            pass
+        try:
+            metrics.write()
+        except Exception:
+            pass
 
 ops = len(latencies)
 avg = statistics.mean(latencies) if latencies else 0.0

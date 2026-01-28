@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+import shlex
 from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
@@ -687,19 +688,18 @@ def perform_restore(msg):
         needs_console = False
 
     if needs_console:
-        # ensure a recvtty listener exists for restore console
-        try:
+        # recvtty 的生命周期应由 fog_test 管理；此处不再启动 recvtty。
+        # 等待短时（最多 6s）以便 fog_test 创建 console.sock；若超时则返回明确错误以便上游处理。
+        timeout_sec = 6.0
+        check_interval = 0.1
+        end_t = time.time() + timeout_sec
+        while time.time() < end_t:
             if os.path.exists(console_sock):
-                os.remove(console_sock)
-        except Exception:
-            pass
-        try:
-            subprocess.Popen(
-                f"PATH=$PATH:/root/go/bin recvtty -m null {console_sock} > /tmp/recvtty_restore.log 2>&1",
-                shell=True,
-            )
-        except Exception:
-            pass
+                break
+            time.sleep(check_interval)
+        else:
+            logger.warning("console socket %s not present after %.1f seconds; expecting fog_test to start recvtty", console_sock, timeout_sec)
+            return f"missing console socket {console_sock} - recvtty not started on destination"
 
     cmd = "time -p runc restore"
     if needs_console:
@@ -733,14 +733,26 @@ def perform_restore(msg):
     logger.info("Running restore command...")
     start_time = time.perf_counter()
     cpu_start = psutil.cpu_percent(interval=None)
-    p = subprocess.Popen(cmd, shell=True)
-    ret = p.wait()
+    # Run restore and capture stdout/stderr for diagnostics
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        out, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+    ret = p.returncode
     end_time = time.perf_counter()
     cpu_end = psutil.cpu_percent(interval=None)
     # 计算并记录恢复期间的 wall-clock 耗时（毫秒）和 CPU 使用变化。
     cpu_delta = cpu_end - cpu_start
     elapsed_ms = (end_time - start_time) * 1000
     logger.info(f"restore elapsed {elapsed_ms:.3f} ms, CPU change {cpu_delta:.2f}%")
+
+    # Log stdout/stderr for debugging
+    if out:
+        logger.info(f"restore stdout:\n{out[:8192]}")
+    if err:
+        logger.info(f"restore stderr:\n{err[:8192]}")
 
     if lazy:
         # 等待 lazy-pages 守护进程结束
@@ -749,14 +761,11 @@ def perform_restore(msg):
     if ret == 0:
         restore_log_path = msg["restore"]["path"] + "/migrate/r_log"
         get_restore_time(restore_log_path)
-        # print(123)
         if lazy:
-            # print(456)
             lp_log_file = msg["restore"]["path"] + "/migrate/r_log/lp.log"
 
             total_uffd_copy = calculate_uffd_copy(lp_log_file)
             rpf_handle_time = get_rpf_handle_time(lp_log_file)
-            # 将 total_uffd_copy 从字节转换为 KB，保留两位小数
             total_uffd_copy_kb = total_uffd_copy / 1024.0
 
             reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, rpf_handle_time: %.2f ms" % (
@@ -768,7 +777,9 @@ def perform_restore(msg):
         else:
             reply = "runc restored %s successfully with %.3f ms" % (msg["restore"]["name"], rst_time)
     else:
-        reply = "runc failed(%d)" % ret
+        # Include brief stderr in reply to aid debugging
+        brief_err = (err or "")[:1024].replace("\n", "\\n")
+        reply = f"runc failed({ret}) stderr={brief_err}"
 
     os.chdir(old_cwd)
     return reply
@@ -839,8 +850,72 @@ def handle_restore(msg):
             else:
                 logger.error("VIP迁移失败")
 
+    # Write pre-restore diagnostics to FOG_TMP_DIR (or /tmp if unset) to aid debugging
+    # try:
+    #     tmp_dir = os.environ.get('FOG_TMP_DIR', '/tmp')
+    #     try:
+    #         os.makedirs(tmp_dir, exist_ok=True)
+    #     except Exception:
+    #         pass
+    #     ts = int(time.time())
+    #     pre_path = os.path.join(tmp_dir, f"destination_pre_restore_{ts}.log")
+    #     try:
+    #         with open(pre_path, 'w', encoding='utf-8') as fo:
+    #             fo.write(f"image_path: {image_path}\n")
+    #             fo.write(f"desc: {desc}\n\n=== ip addr show ===\n")
+    #             try:
+    #                 p = subprocess.run("ip addr show", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    #                 fo.write(p.stdout or '')
+    #             except Exception:
+    #                 fo.write("ip addr show failed\n")
+    #             fo.write("\n=== ss -tnp ===\n")
+    #             try:
+    #                 p = subprocess.run("ss -tnp", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    #                 fo.write(p.stdout or '')
+    #             except Exception:
+    #                 fo.write("ss -tnp failed\n")
+    #             fo.write("\n=== descriptors.json snippet ===\n")
+    #             try:
+    #                 with open(desc, 'r', encoding='utf-8', errors='ignore') as df:
+    #                     fo.write((df.read(4096) or '')[:4096])
+    #             except Exception as e:
+    #                 fo.write(f"read descriptors failed: {e}\n")
+    #             fo.write("\n\n=== tail restore.log ===\n")
+    #             rlog = os.path.join(image_path, 'r_log', 'restore.log')
+    #             if os.path.exists(rlog):
+    #                 try:
+    #                     p = subprocess.run(f"tail -n 200 {shlex.quote(rlog)}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    #                     fo.write(p.stdout or '')
+    #                 except Exception:
+    #                     fo.write(f"tail {rlog} failed\n")
+    #             else:
+    #                 fo.write(f"restore.log not found: {rlog}\n")
+    #         logger.info("pre-restore diagnostics written to %s", pre_path)
+    #     except Exception as _e:
+    #         logger.warning("failed to write pre-restore diagnostics: %s", _e)
+    # except Exception:
+    #     pass
+
     # logger.info("开始执行恢复操作")
     reply = perform_restore(msg)
+
+    # Persist reply to FOG_TMP_DIR for auditing
+    # try:
+    #     tmp_dir = os.environ.get('FOG_TMP_DIR', '/tmp')
+    #     try:
+    #         os.makedirs(tmp_dir, exist_ok=True)
+    #     except Exception:
+    #         pass
+    #     ts = int(time.time())
+    #     reply_path = os.path.join(tmp_dir, f"destination_reply_{msg['restore']['name']}_{ts}.txt")
+    #     try:
+    #         with open(reply_path, 'w', encoding='utf-8') as rf:
+    #             rf.write(reply)
+    #         logger.info("persisted reply to %s", reply_path)
+    #     except Exception as _e:
+    #         logger.warning("failed to persist reply: %s", _e)
+    # except Exception:
+    #     pass
 
     # 异步启动进程清理任务，让主线程快速响应
     def _cleanup_worker():

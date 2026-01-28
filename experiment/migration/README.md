@@ -42,7 +42,7 @@
 
 ### 传统基准测试
 - **Redis Benchmark (redis-benchmark)**: Redis内置基准测试工具
-- **Elasticsearch Benchmark (benchmark.py)**: ES索引和搜索性能测试
+- **Elasticsearch Benchmark (bench.py)**: ES索引和搜索性能测试
 - **内存工作负载 (simple-mem)**: 多线程内存访问模式模拟
 
 ## 服务启动流程
@@ -317,7 +317,7 @@ redis-benchmark -h localhost -p 6379 -c 50 -n 10000 -t SET,GET
 
 #### Elasticsearch 基准测试
 ```bash
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
   --threads 10 \
   --operations 1000 \
   --es-host localhost \
@@ -442,7 +442,7 @@ python3 ./experiment/migration/redis/bench_sensoragg.py \
 #### 大数据分析迁移
 ```bash
 # Elasticsearch负载测试
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
   --threads 20 \
   --operations 2000 \
   --test-mode mixed
@@ -451,7 +451,7 @@ python3 ./experiment/migration/elasticsearch/benchmark.py \
 python3 chk_restore.py elasticsearch -pre -post -dm -i 5
 
 # 索引重建验证
-python3 ./experiment/migration/elasticsearch/benchmark.py \
+python3 ./experiment/migration/elasticsearch/bench.py \
   --test-mode index \
   --threads 20
 ```

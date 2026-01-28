@@ -1457,7 +1457,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap):
     if dirtymap:
         # 在pre-copy开启前先启动对容器的dirty-track
         get_runc_container_pidtree(container)
-        start_dirty_track(device_fd) 
+        start_dirty_track(device_fd)
     while last_iter <= max_iter:
         last_path = parent_path[last_iter - 1]
         # if diskless:
@@ -2369,10 +2369,7 @@ if __name__ == "__main__":
     if pre:
         print(f"Pre-dump iterations: {pre_dump_iters}")
 
-    # 将结果追加写入 results.txt 文件
-    with open("results.txt", "a") as f:
-        f.write(metrics_line + "\n")
-        f.write(values_line + "\n")
+    # Legacy: previously appended metrics to results.txt — deprecated. Use /runc/results via the test harness for persistent storage.
 
     if diskless:
         post_process(max_iter)

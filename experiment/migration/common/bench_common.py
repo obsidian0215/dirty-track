@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import signal
+import atexit
+import sys
 import threading
 import time
 from typing import Optional
@@ -279,12 +281,23 @@ class IntervalMetrics:
         if not path:
             return None
         out_dir = os.path.dirname(path)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        data = self.to_dict()
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
-        return path
+        try:
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            data = self.to_dict()
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            return path
+        except Exception as e:
+            # Best-effort logging; avoid raising from metrics write
+            try:
+                if self.logger:
+                    self.logger.warning("IntervalMetrics write failed for %s: %s", path, e)
+                else:
+                    logger.warning("IntervalMetrics write failed for %s: %s", path, e)
+            except Exception:
+                pass
+            return None
 
 
 def install_signal_handlers(cleanup_fn) -> None:
@@ -312,7 +325,31 @@ def register_metrics_signal_handlers(metrics: Optional[IntervalMetrics]) -> None
         except Exception:
             pass
 
-    install_signal_handlers(_cleanup)
+    # Ensure metrics are flushed on signals (SIGINT/SIGTERM), on normal exit, and on uncaught exceptions
+    try:
+        install_signal_handlers(_cleanup)
+    except Exception:
+        # best-effort only
+        pass
+
+    try:
+        atexit.register(_cleanup)
+    except Exception:
+        pass
+
+    # Ensure uncaught exceptions trigger cleanup as well (best-effort)
+    try:
+        _old_exch = sys.excepthook
+
+        def _excepthook(exc_type, exc_value, exc_tb):
+            try:
+                _cleanup()
+            finally:
+                _old_exch(exc_type, exc_value, exc_tb)
+
+        sys.excepthook = _excepthook
+    except Exception:
+        pass
 
 
 __all__ = [

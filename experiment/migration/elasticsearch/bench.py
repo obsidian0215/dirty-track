@@ -183,10 +183,10 @@ def search_worker(tid, es_client, index_name, searches_per_thread, latencies, fi
 
 def main():
     parser = ArgumentParser(description='Elasticsearch 基准测试客户端')
-    parser.add_argument('--threads', type=int, default=10, help='并发线程数')
+    parser.add_argument('--threads', type=int, default=4, help='并发线程数')
     parser.add_argument('--operations', type=int, default=1000, help='每个线程操作数')
     # Compatibility flags used by the matrix harness
-    parser.add_argument('--rps', type=int, default=None, help='目标 HTTP 请求数/秒（全局, optional; 与 --duration 一起使用）')
+    parser.add_argument('--rps', type=int, default=20, help='目标 HTTP 请求数/秒（全局, optional; 与 --duration 一起使用）')
     parser.add_argument('--duration', type=int, default=None, help='运行时长（秒），与 --rps 一起使用以计算请求总数）')
     parser.add_argument('--payload-size', dest='payload_size', default=None, help='每个文档的 payload 大小（字节，兼容调用）')
     parser.add_argument('--bulk-size', dest='bulk_size', type=int, default=100, help='索引时每个 bulk 请求包含的文档数')
@@ -194,7 +194,7 @@ def main():
     parser.add_argument('--es-port', type=int, default=9200, help='Elasticsearch端口')
     parser.add_argument('--index-name', default='benchmark-test', help='索引名称')
     parser.add_argument('--field-count', type=int, default=5, help='每个文档额外字段数')
-    parser.add_argument('--test-mode', choices=['index', 'search', 'mixed'], default='index', help='测试模式：index 只索引，search 只搜索，mixed 混合')
+    parser.add_argument('--test-mode', choices=['index', 'search', 'mixed'], default='mixed', help='测试模式：index 只索引，search 只搜索，mixed 混合')
     parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
     parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 

@@ -24,6 +24,8 @@ import sys
 import time
 import statistics
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import random
 
 from result_writer import extract_stats_from_output, append_result, summarize_results
 from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
@@ -34,8 +36,18 @@ SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
 SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(False)
 SEC_MODE = False
 BANDWIDTH = "50mbit"
+# Number of attempts to try applying remote/local network commands before falling back
+NETWORK_CMD_RETRIES = 3
+NETWORK_CMD_BACKOFF_BASE = 1  # seconds, exponential backoff base
 DEFAULT_HOST = "127.0.0.1"
 RUN_LABEL = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+# TMP_ROOT organizes all transient fog_test logs and pidfiles to avoid littering /tmp
+TMP_ROOT = os.path.join('/tmp', 'fog_test', RUN_LABEL)
+TMP_LOGS = os.path.join(TMP_ROOT, 'logs')
+TMP_DEST_LOGS = os.path.join(TMP_LOGS, 'destination')
+TMP_BENCH_LOGS = os.path.join(TMP_LOGS, 'bench')
+TMP_RECVTTY_LOGS = os.path.join(TMP_LOGS, 'recvtty')
+TMP_PIDS = os.path.join(TMP_ROOT, 'pids')
 RESULTS_ROOT = '/runc/results'
 LOCAL_HOSTS = {None, '127.0.0.1', 'localhost'}
 
@@ -46,62 +58,154 @@ def clean_configure_network():
     client_iface = "enp2s0" if CLIENT_IP == DEST_IP else "ens33"
 
     def _clear_local(iface: str):
-        run_cmd(f"sudo tc qdisc del dev {iface} root", ignore_error=True, quiet=True)
+        # remove root qdisc and any ingress qdisc to ensure full cleanup; re-enable offloads
+        cmds = [
+            f"sudo tc qdisc del dev {iface} root || true",
+            f"sudo tc qdisc del dev {iface} ingress || true",
+            f"sudo ethtool -K {iface} gso on gro on tso on || true",
+        ]
+        run_cmd("; ".join(cmds), ignore_error=True, quiet=True)
 
+    # cleanup local primary interface first
     _clear_local(primary_iface)
+
+    # Build a mapping of remote target -> set(of interfaces) to clean to avoid duplicate SSH calls
+    remote_targets = {}
     if DEST_IP and DEST_IP != SOURCE_IP:
-        run_remote_cmd(f"sudo tc qdisc del dev {primary_iface} root", DEST_IP, ignore_error=True, quiet=True)
+        remote_targets.setdefault(DEST_IP, set()).add(primary_iface)
 
     if CLIENT_IP:
         target = CLIENT_IP
         iface = client_iface
-        if target == SOURCE_IP:
+        if target == SOURCE_IP or target in (None, '127.0.0.1', 'localhost'):
+            # client is local: clean locally
             _clear_local(iface)
         else:
-            run_remote_cmd(f"sudo tc qdisc del dev {iface} root", target, ignore_error=True, quiet=True)
+            remote_targets.setdefault(target, set()).add(iface)
+
+    # Execute batched cleanup commands per remote target (concurrently per host)
+    def _run_remote_cleanup(target, ifaces):
+        cmds = []
+        for iface in sorted(ifaces):
+            cmds.extend([
+                f"sudo tc qdisc del dev {iface} root || true",
+                f"sudo tc qdisc del dev {iface} ingress || true",
+                f"sudo ethtool -K {iface} gso on gro on tso on || true",
+            ])
+        combined = " ; ".join(cmds)
+        try:
+            run_remote_cmd(combined, target, ignore_error=True, quiet=True)
+        except Exception as e:
+            print(f"[net] remote cleanup failed for {target}: {e}")
+
+    if remote_targets:
+        # Try concurrent cleanup per-host; if executor cannot be used (e.g., interpreter shutdown), fall back to serial
+        try:
+            max_workers = min(8, max(1, len(remote_targets)))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(_run_remote_cleanup, target, ifaces): target for target, ifaces in remote_targets.items()}
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"[net] remote cleanup failed for {futures[fut]}: {e}")
+        except RuntimeError as e:
+            # Likely interpreter shutdown or thread subsystem unavailable; perform serially
+            print(f"[net] executor unavailable for cleanup, falling back to serial: {e}")
+            for target, ifaces in remote_targets.items():
+                try:
+                    _run_remote_cleanup(target, ifaces)
+                except Exception as ee:
+                    print(f"[net] remote cleanup failed for {target}: {ee}")
+        except Exception as e:
+            print(f"[net] unexpected error using executor for cleanup: {e}")
+            for target, ifaces in remote_targets.items():
+                try:
+                    _run_remote_cleanup(target, ifaces)
+                except Exception as ee:
+                    print(f"[net] remote cleanup failed for {target}: {ee}")
 
 
 def configure_network_do(interface, rules, is_remote=False, target_ip=None, ignore_error=False):
+    """Simplified network shaping: apply CAKE root qdisc with bandwidth limit and disable NIC offloads.
+
+    This implementation is intentionally simple and robust: it applies a single CAKE qdisc per
+    interface using the first rule's rate (or the global BANDWIDTH). It then attempts to disable
+    GSO/GRO/TSO using ethtool synchronously (the user has installed ethtool per request).
+    """
     if is_remote and not target_ip:
         raise ValueError("Target IP must be provided for remote execution.")
 
-    cleanup_cmd = f"sudo tc qdisc del dev {interface} root"
-    init_cmd = f"sudo tc qdisc add dev {interface} root handle 1: htb"
     remote_ip = str(target_ip) if target_ip else None
     remote_mode = bool(is_remote and remote_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP))
+    location = f"remote:{remote_ip}" if remote_mode else "local"
 
-    if remote_mode:
-        assert remote_ip is not None
-        print(f"[net] clearing rules on remote:{remote_ip} {interface}")
-        run_remote_cmd(cleanup_cmd, remote_ip, ignore_error=True, quiet=True)
-        run_remote_cmd(init_cmd, remote_ip, ignore_error=ignore_error, quiet=True)
+    # Deduplicate rules and pick bandwidth
+    unique_rules = []
+    seen = set()
+    for rule in rules:
+        key = (rule.get('dst'), rule.get('rate'), rule.get('delay'))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rules.append(rule)
+
+    bw = unique_rules[0]['rate'] if unique_rules else BANDWIDTH
+    print(f"[net] applying CAKE on {location} {interface} bw={bw}")
+
+    cake_cmd = f"sudo tc qdisc del dev {interface} root || true ; sudo tc qdisc add dev {interface} root cake bandwidth {bw} || true"
+
+    def _exec_with_retries(cmd, remote=False, target=None, attempts=NETWORK_CMD_RETRIES):
+        for attempt in range(1, attempts + 1):
+            try:
+                if remote:
+                    res = run_remote_cmd(cmd, target, ignore_error=True, quiet=True)
+                else:
+                    res = run_cmd(cmd, ignore_error=True, quiet=True)
+                if getattr(res, 'returncode', 0) == 0:
+                    return res
+            except SystemExit:
+                pass
+            except Exception as e:
+                if attempt == attempts:
+                    print(f"[net] command failed after {attempts} attempts on {(target if remote else 'local')}: {e}")
+                    return None
+            time.sleep(NETWORK_CMD_BACKOFF_BASE * (2 ** (attempt - 1)))
+        return None
+
+    res = _exec_with_retries(cake_cmd, remote=remote_mode, target=remote_ip)
+    if res is None or getattr(res, 'returncode', 0) != 0:
+        print(f"[net] warning: failed to apply CAKE on {location} {interface}")
+        return
+
+    # Disable offloads synchronously (user installed ethtool); this should help enforce limits on short bursts
+    offload_cmd = f"sudo ethtool -K {interface} gso off gro off tso off"
+    off_r = _exec_with_retries(offload_cmd, remote=remote_mode, target=remote_ip)
+    if off_r is None or getattr(off_r, 'returncode', 0) != 0:
+        print(f"[net] warning: ethtool offload disable failed on {location} {interface}")
     else:
-        location = f"local ({remote_ip})" if remote_ip else "local"
-        print(f"[net] clearing rules on {location} {interface}")
-        run_cmd(cleanup_cmd, ignore_error=True, quiet=True)
-        run_cmd(init_cmd, ignore_error=ignore_error, quiet=True)
-
-    for idx, rule in enumerate(rules, start=1):
-        classid = f"1:{idx}"
-        handle = f"{10 * idx}:"
-        rate = rule["rate"]
-        delay = rule["delay"]
-        dst = rule["dst"]
-        location = f"remote:{remote_ip}" if remote_mode else "local"
-        print(f"[net] rule#{idx} on {location}: dst={dst} rate={rate} delay={delay}")
-
-        cmds = [
-            f"sudo tc class add dev {interface} parent 1: classid {classid} htb rate {rate}",
-            f"sudo tc filter add dev {interface} protocol ip parent 1:0 prio 1 u32 match ip dst {dst} flowid {classid}",
-            f"sudo tc qdisc add dev {interface} parent {classid} handle {handle} netem delay {delay}",
-        ]
-
-        for cmd in cmds:
-            if remote_mode:
-                assert remote_ip is not None
-                run_remote_cmd(cmd, remote_ip, ignore_error=ignore_error, quiet=True)
+        # Verify offloads state (best-effort)
+        try:
+            check_cmd = f"sudo ethtool -k {interface} | egrep 'gso|gro|tso' || true"
+            chk = _exec_with_retries(check_cmd, remote=remote_mode, target=remote_ip)
+            out = (getattr(chk, 'stdout', '') or '').lower() if chk is not None else ''
+            if 'off' in out or 'disabled' in out:
+                print(f"[net] offloads appear disabled on {location} {interface}")
             else:
-                run_cmd(cmd, ignore_error=ignore_error, quiet=True)
+                print(f"[net] offloads verification inconclusive on {location} {interface}; output: {(out or '')[:200]}")
+        except Exception:
+            pass
+
+    # Report qdisc status for visibility
+    try:
+        qc = f"tc -s qdisc show dev {interface} | sed -n '1,120p'"
+        qc_res = _exec_with_retries(qc, remote=remote_mode, target=remote_ip)
+        out_qc = (getattr(qc_res, 'stdout', '') or '') if qc_res is not None else ''
+        print(f"[net] qdisc status on {location} {interface}:\n{out_qc[:400]}")
+    except Exception:
+        pass
+
+    return
 
 
 def configure_network(bandwidth: Optional[str] = None):
@@ -116,13 +220,345 @@ def configure_network(bandwidth: Optional[str] = None):
         {"rate": bw, "delay": "0.05ms", "dst": DEST_IP},
     ]
 
-    configure_network_do(interface=primary_iface, rules=source_rules, is_remote=False)
-    configure_network_do(interface=primary_iface, rules=dest_rules, is_remote=True, target_ip=DEST_IP)
-    if CLIENT_IP:
-        if CLIENT_IP == SOURCE_IP:
-            configure_network_do(interface=client_iface, rules=client_rules, is_remote=False)
+    # Aggregate tasks keyed by (is_remote, target_ip, interface) to avoid duplicate work
+    tasks = {}
+    # local source iface
+    tasks.setdefault((False, None, primary_iface), []).extend(source_rules)
+
+    # dest rules: remote or local depending on DEST_IP
+    if DEST_IP:
+        if DEST_IP == SOURCE_IP or DEST_IP in (None, '127.0.0.1', 'localhost'):
+            tasks.setdefault((False, None, primary_iface), []).extend(dest_rules)
         else:
-            configure_network_do(interface=client_iface, rules=client_rules, is_remote=True, target_ip=CLIENT_IP)
+            tasks.setdefault((True, DEST_IP, primary_iface), []).extend(dest_rules)
+
+    # client rules: may be local or remote
+    if CLIENT_IP:
+        if CLIENT_IP == SOURCE_IP or CLIENT_IP in (None, '127.0.0.1', 'localhost'):
+            tasks.setdefault((False, None, client_iface), []).extend(client_rules)
+        else:
+            tasks.setdefault((True, CLIENT_IP, client_iface), []).extend(client_rules)
+
+    # apply tasks (one call per unique host/interface) — parallelize across hosts
+    def _apply_task(is_remote, target_ip, iface, rules):
+        try:
+            configure_network_do(interface=iface, rules=rules, is_remote=is_remote, target_ip=target_ip)
+        except Exception as e:
+            t = f"remote:{target_ip}" if is_remote else "local"
+            print(f"[net] configure_network: failed to apply rules on {t} {iface}: {e}")
+
+    if tasks:
+        try:
+            max_workers = min(8, max(1, len(tasks)))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = []
+                for (is_remote, target_ip, iface), rules in tasks.items():
+                    futures.append(ex.submit(_apply_task, is_remote, target_ip, iface, rules))
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"[net] configure_network: unexpected error in task: {e}")
+        except RuntimeError as e:
+            # fall back to serial application if executor cannot be used
+            print(f"[net] executor unavailable for configure_network, falling back to serial: {e}")
+            for (is_remote, target_ip, iface), rules in tasks.items():
+                _apply_task(is_remote, target_ip, iface, rules)
+        except Exception as e:
+            print(f"[net] unexpected error using executor for configure_network: {e}")
+            for (is_remote, target_ip, iface), rules in tasks.items():
+                _apply_task(is_remote, target_ip, iface, rules)
+
+# --- VIP helpers (ensure VIP is present on source and optionally restore using keepalived) ---
+
+def _vip_present(vip: str | None) -> bool:
+    """Return True if `vip` is configured on any local IPv4 address."""
+    if not vip:
+        return False
+    try:
+        # Use ip command to detect IPv4 address presence (grepping the vip string)
+        # Use grep -F for literal match (IP includes dots/slashes which may not be word characters for -w)
+        cmd = f"ip -4 addr show | grep -F {shlex.quote(vip)}"
+        r = run_cmd(cmd, quiet=True, ignore_error=True, timeout=2)
+        out = (getattr(r, 'stdout', '') or '').strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def _find_primary_iface() -> str | None:
+    """Best-effort discover a primary non-loopback interface (from default route or ip output)."""
+    try:
+        r = run_cmd('ip route show default', quiet=True, ignore_error=True, timeout=2)
+        out = (getattr(r, 'stdout', '') or '')
+        import re as _re
+
+        m = _re.search(r"dev\s+(\S+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
+    # Fallback: parse first interface from ip -4 addr show
+    try:
+        r2 = run_cmd('ip -4 addr show', quiet=True, ignore_error=True, timeout=2)
+        out = (getattr(r2, 'stdout', '') or '')
+        import re as _re
+
+        m2 = _re.search(r"^\d+:\s+(\S+?):", out, _re.M)
+        if m2:
+            iface = m2.group(1)
+            if iface and iface != 'lo':
+                return iface
+    except Exception:
+        pass
+    return None
+
+
+# --- Remote VIP helpers ---
+def _remote_vip_present(target_ip: str | None) -> bool:
+    """Return True if `VIP` appears configured on remote `target_ip`."""
+    if not target_ip or target_ip in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        return False
+    try:
+        res = run_remote_cmd(f"ip -4 addr show | grep -F {shlex.quote(VIP)}", target_ip, ignore_error=True, quiet=True)
+        out = (getattr(res, 'stdout', '') or '').strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def _remote_find_primary_iface(target_ip: str | None) -> str | None:
+    if not target_ip or target_ip in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        return None
+    try:
+        r = run_remote_cmd('ip route show default', target_ip, ignore_error=True, quiet=True)
+        out = (getattr(r, 'stdout', '') or '')
+        import re as _re
+        m = _re.search(r"dev\s+(\S+)", out)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    try:
+        r2 = run_remote_cmd('ip -4 addr show', target_ip, ignore_error=True, quiet=True)
+        out = (getattr(r2, 'stdout', '') or '')
+        import re as _re
+        m2 = _re.search(r"^\d+:\s+(\S+?):", out, _re.M)
+        if m2:
+            iface = m2.group(1)
+            if iface and iface != 'lo':
+                return iface
+    except Exception:
+        pass
+    return None
+
+
+def _remote_remove_vip(target_ip: str | None) -> bool:
+    """Attempt to remove VIP from remote host (uses sudo ip addr del). Returns True when remote no longer has VIP."""
+    if not target_ip or target_ip in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        return False
+    try:
+        iface = _remote_find_primary_iface(target_ip)
+        if iface:
+            cmd = f"sudo ip addr del {shlex.quote(VIP)}/32 dev {shlex.quote(iface)} || true"
+        else:
+            cmd = f"sudo ip addr del {shlex.quote(VIP)}/32 || true"
+        run_remote_cmd(cmd, target_ip, ignore_error=True, quiet=True)
+        # give it a brief moment
+        time.sleep(0.5)
+        return not _remote_vip_present(target_ip)
+    except Exception:
+        return False
+
+
+def _set_local_keepalived_priority(priority: str | int) -> bool:
+    """Set local keepalived priority via vipctl (returns True on success)."""
+    try:
+        try:
+            import mig_scripts.vipctl as vipctl
+        except Exception:
+            import importlib.util as _il
+
+            spec = _il.spec_from_file_location("vipctl_mod", os.path.join(os.path.dirname(__file__), "vipctl.py"))
+            vipctl = _il.module_from_spec(spec)
+            spec.loader.exec_module(vipctl)
+        rc = vipctl.set_keepalived_priority(priority)
+        if rc == 0:
+            print(f"[vip] local keepalived priority set to {priority}")
+            return True
+        print(f"[vip] local set_keepalived_priority returned {rc}")
+        return False
+    except Exception as e:
+        print(f"[vip] failed to set local keepalived priority: {e}")
+        return False
+
+
+def _set_remote_keepalived_priority(target_ip: str | None, priority: str | int, attempts: int = 3, backoff: float = 1.0) -> bool:
+    """Set keepalived priority on remote host by invoking vipctl via sudo SSH. Returns True on success."""
+    if not target_ip or target_ip in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        return False
+    cmd = f"sudo python3 /runc/dirty-track/mig-scripts/vipctl.py set-priority --priority {shlex.quote(str(priority))}"
+    for attempt in range(1, attempts + 1):
+        try:
+            res = run_remote_cmd(cmd, target_ip, ignore_error=True, quiet=True)
+            rc = getattr(res, 'returncode', 1)
+            if rc == 0:
+                print(f"[vip] remote {target_ip} keepalived priority set to {priority} (attempt {attempt})")
+                return True
+            else:
+                print(f"[vip] remote set-priority returned rc={rc} on attempt {attempt}")
+        except Exception as e:
+            print(f"[vip] remote set-priority attempt {attempt} failed: {e}")
+        time.sleep(backoff * (2 ** (attempt - 1)))
+    print(f"[vip] remote set-priority failed for {target_ip} after {attempts} attempts")
+    return False
+
+
+def _coordinate_keepalived_takeover(dest_ip: str | None, source_priority: str | int = "100", dest_priority: str | int = "30", timeout: float = 20.0) -> bool:
+    """Try to make the source win the VIP by coordinating keepalived priorities.
+
+    Steps:
+    1. Try to lower destination priority (best-effort).
+    2. Raise local priority.
+    3. Wait briefly for election and for VIP to appear locally.
+    4. Retry a small number of times before giving up.
+    """
+    print(f"[vip] coordinate takeover: source_prio={source_priority} dest_prio={dest_priority} dest={dest_ip}")
+    deadline = time.time() + float(timeout)
+    for attempt in range(1, 4):
+        print(f"[vip] takeover attempt {attempt}")
+        # Lower destination priority first (if reachable)
+        if dest_ip and dest_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+            try:
+                _ = _set_remote_keepalived_priority(dest_ip, dest_priority, attempts=2)
+            except Exception as e:
+                print(f"[vip] remote priority set error: {e}")
+        # Set local priority high
+        try:
+            _ = _set_local_keepalived_priority(source_priority)
+        except Exception as e:
+            print(f"[vip] local priority set error: {e}")
+        # Wait briefly for leader election
+        inner_deadline = min(time.time() + 5.0, deadline)
+        while time.time() < inner_deadline:
+            if _vip_present(VIP):
+                print(f"[vip] VIP {VIP} acquired by source after attempt {attempt}")
+                try:
+                    iface = _find_primary_iface()
+                    if iface:
+                        try:
+                            import mig_scripts.vipctl as vipctl
+
+                            _ = vipctl.arping_announce(iface, VIP, count=2)
+                            print(f"[vip] sent gratuitous ARP for {VIP} on {iface}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return True
+            time.sleep(0.5)
+        # small back-off before next attempt
+        time.sleep(0.5 * attempt)
+    print(f"[vip] coordinate takeover failed after attempts")
+    return False
+
+
+def ensure_vip_on_source(timeout: float = 20.0, priority: str = "100") -> bool:
+    """Ensure the configured VIP is present on the local (source) host using keepalived coordination.
+
+    Uses coordinated priority changes between source and destination instead of removing remote IPs.
+    Returns True on success, False otherwise.
+    """
+    if not VIP:
+        print("[vip] no VIP configured; cannot ensure vip on source")
+        return False
+
+    local_has = _vip_present(VIP)
+    dest_has = _remote_vip_present(DEST_IP) if DEST_IP else False
+
+    # If local already has VIP but destination also has it, attempt to resolve via priorities
+    if local_has:
+        print(f"[vip] VIP {VIP} already present on source")
+        if dest_has:
+            print(f"[vip] conflict: destination {DEST_IP} also reports {VIP}; attempting keepalived coordination")
+            if _coordinate_keepalived_takeover(DEST_IP, source_priority=priority, dest_priority="30", timeout=timeout):
+                return True
+            print("[vip] failed to resolve conflict by priority coordination; aborting to avoid split-brain")
+            return False
+        return True
+
+    # If destination holds VIP, attempt coordinated takeover
+    if dest_has:
+        print(f"[vip] VIP {VIP} present on destination {DEST_IP}; attempting coordinated takeover")
+        if _coordinate_keepalived_takeover(DEST_IP, source_priority=priority, dest_priority="30", timeout=timeout):
+            return True
+        print("[vip] coordinated takeover failed; not modifying remote IPs to avoid split-brain")
+        return False
+
+    # Neither host claims VIP: try to claim via keepalived priority locally
+    print(f"[vip] VIP {VIP} not present anywhere; trying to set local keepalived priority {priority}")
+    try:
+        if _set_local_keepalived_priority(priority):
+            deadline = time.time() + float(timeout)
+            try:
+                import mig_scripts.vipctl as vipctl
+            except Exception:
+                import importlib.util as _il
+
+                spec = _il.spec_from_file_location("vipctl_mod", os.path.join(os.path.dirname(__file__), "vipctl.py"))
+                vipctl = _il.module_from_spec(spec)
+                spec.loader.exec_module(vipctl)
+            while time.time() < deadline:
+                if _vip_present(VIP):
+                    print(f"[vip] VIP {VIP} restored to source by keepalived priority")
+                    try:
+                        iface = _find_primary_iface()
+                        if iface:
+                            try:
+                                _ = vipctl.arping_announce(iface, VIP, count=2)
+                                print(f"[vip] sent gratuitous ARP for {VIP} on {iface}")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    return True
+                time.sleep(0.5)
+    except Exception as e:
+        print(f"[vip] setting local priority failed: {e}")
+
+    # Fallback to local ip add only if remote does not hold VIP
+    try:
+        if DEST_IP and _remote_vip_present(DEST_IP):
+            print(f"[vip] destination {DEST_IP} still holds VIP; refusing fallback ip-add to avoid split-brain")
+            return False
+        iface = _find_primary_iface()
+        if iface:
+            try:
+                import mig_scripts.vipctl as vipctl
+            except Exception:
+                import importlib.util as _il
+
+                spec = _il.spec_from_file_location("vipctl_mod", os.path.join(os.path.dirname(__file__), "vipctl.py"))
+                vipctl = _il.module_from_spec(spec)
+                spec.loader.exec_module(vipctl)
+            print(f"[vip] fallback: adding IP {VIP} on {iface} and sending ARP")
+            try:
+                rc2 = vipctl.switch_local_add_then_announce(iface, VIP, dry_run=False)
+                if rc2 == 0:
+                    deadline2 = time.time() + 5
+                    while time.time() < deadline2:
+                        if _vip_present(VIP):
+                            print(f"[vip] VIP {VIP} added and present on {iface}")
+                            return True
+                        time.sleep(0.5)
+            except Exception as e:
+                print(f"[vip] switch_local_add_then_announce failed: {e}")
+    except Exception:
+        pass
+
+    print(f"[vip] failed to ensure VIP {VIP} on source")
+    return False
 
 
 def parse_bandwidth(bw: str) -> float:
@@ -197,11 +633,15 @@ SCENE_INFO = {
     "transportation": {"bundle": "transportation", "endpoint": "redis", "asset": None, "bench": None, "default_port": 6379, "persistent": False, "backend": "redis"},
     "industrial": {"bundle": "industrial", "endpoint": "redis", "asset": None, "bench": None, "default_port": 6379, "persistent": False, "backend": "redis"},
     # "foglamp": {"bundle": "foglamp", "endpoint": "/health", "asset": None, "bench": None, "default_port": 8080, "persistent": False},
-    "elasticsearch": {"bundle": "elasticsearch", "endpoint": "/_cluster/health", "asset": None, "bench": "python3 /runc/dirty-track/experiment/migration/elasticsearch/benchmark.py --es-host 127.0.0.1 --es-port PORT --threads 4 --rps 100 --duration 30 --test-mode index", "default_port": 9200, "persistent": True},
+    "elasticsearch": {"bundle": "elasticsearch", "endpoint": "/_cluster/health", "asset": None, "bench": None, "default_port": 9200, "persistent": True},
 }
 
 KEEP_RUNNING = True
 CURRENT_RUNNING = []
+# Optional bench override flags (if set, fog_test will pass these to bench scripts). By default we do not
+# pass --dataset or --file(s) so benches can use their own defaults.
+BENCH_DATASET: Optional[str] = None
+BENCH_FILES: Optional[str] = None
 
 
 def ensure_dirs():
@@ -210,6 +650,16 @@ def ensure_dirs():
     os.makedirs(os.path.join(RESULTS_ROOT, RUN_LABEL), exist_ok=True)
     os.makedirs(os.path.join(RESULTS_ROOT, RUN_LABEL, 'workloads'), exist_ok=True)
     os.makedirs('/runc/containers', exist_ok=True)
+
+    # Prepare structured tmp area for fog_test logs/pids to keep /tmp tidy
+    try:
+        os.makedirs(TMP_DEST_LOGS, exist_ok=True)
+        os.makedirs(TMP_BENCH_LOGS, exist_ok=True)
+        os.makedirs(TMP_RECVTTY_LOGS, exist_ok=True)
+        os.makedirs(TMP_PIDS, exist_ok=True)
+    except Exception:
+        pass
+
     purge_fog_workload_baks()
 
 
@@ -340,6 +790,313 @@ def write_integrated_table(results: list, mode: str) -> Optional[str]:
     return out_path
 
 
+# --- Diagnostics & error recording helpers ---
+import traceback as _traceback
+import tarfile as _tarfile
+from collections import deque as _deque
+
+
+def _tail_file_to_path(src: str, dst: str, lines: int = 500) -> Optional[str]:
+    try:
+        if not os.path.exists(src):
+            return None
+        with open(src, 'r', errors='ignore') as fi:
+            dq = _deque(fi, maxlen=lines)
+        with open(dst, 'w', encoding='utf-8') as fo:
+            fo.writelines(dq)
+        return dst
+    except Exception:
+        try:
+            shutil.copy2(src, dst)
+            return dst
+        except Exception:
+            return None
+
+
+def _safe_copy_to_dst(src: str, dst: str, tail_lines: int = 500) -> str | None:
+    if not os.path.exists(src):
+        return None
+    if tail_lines:
+        return _tail_file_to_path(src, dst, lines=tail_lines)
+    try:
+        shutil.copy2(src, dst)
+        return dst
+    except Exception:
+        return None
+
+
+def _fetch_remote_files(remote_ip: str, patterns: list, dest_dir: str, tail_lines: int = 500) -> list:
+    saved = []
+    import shlex as _shlex
+    for pat in patterns:
+        # list matching files on remote (best-effort)
+        list_cmd = f"sh -c 'ls -1 {pat} 2>/dev/null || true'"
+        try:
+            res = run_remote_cmd(list_cmd, remote_ip, ignore_error=True, quiet=True)
+        except Exception:
+            continue
+        out = getattr(res, 'stdout', '') or ''
+        files = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        for remote_file in files:
+            base = os.path.basename(remote_file)
+            local_path = os.path.join(dest_dir, f"remote_{base}")
+            tail_cmd = f"tail -n {int(tail_lines)} {_shlex.quote(remote_file)} || true"
+            try:
+                r2 = run_remote_cmd(tail_cmd, remote_ip, ignore_error=True, quiet=True)
+                content = getattr(r2, 'stdout', '') or ''
+                with open(local_path, 'w', encoding='utf-8') as fo:
+                    fo.write(content)
+                saved.append(local_path)
+            except Exception:
+                pass
+    return saved
+
+
+def collect_run_diagnostics(scene: str, run_idx: int, exp_name: str, dest_ip: Optional[str] = None, client_ip: Optional[str] = None, tail_lines: int = 500) -> list:
+    """Collect a set of useful logs (local + remote when available) and package them for later inspection.
+
+    Returns a list of saved file paths (including the created tarball if successful).
+    """
+    diag_base = os.path.join(get_run_dir(), 'diagnostics')
+    os.makedirs(diag_base, exist_ok=True)
+    ts = int(time.time())
+    diag_dir = os.path.join(diag_base, f"{scene}_{exp_name}_run{run_idx}_{ts}")
+    os.makedirs(diag_dir, exist_ok=True)
+    saved = []
+
+    # Local patterns (prefer structured TMP_ROOT but include legacy /tmp fallbacks)
+    local_patterns = [
+        os.path.join(TMP_RECVTTY_LOGS, f"recvtty_{scene}.log"),
+        os.path.join(TMP_RECVTTY_LOGS, f"recvtty_{scene}*.log"),
+        os.path.join(TMP_BENCH_LOGS, f"bench_{scene}.log"),
+        os.path.join(TMP_DEST_LOGS, f"{DEST_SCRIPT.replace('.', '_')}_{scene}_*.log"),
+        os.path.join(TMP_ROOT, f"destination_pre_restore_*.log"),
+        os.path.join(TMP_ROOT, f"destination_reply*"),
+        f"/tmp/recvtty_{scene}.log",
+        f"/tmp/recvtty_{scene}*.log",
+        f"/tmp/bench_{scene}.log",
+        f"/tmp/destination_py_{scene}_*.log",
+        f"/tmp/destination_pre_restore_*.log",
+        f"/tmp/destination_reply*",
+    ]
+
+    for pat in local_patterns:
+        for f in glob.glob(pat):
+            try:
+                dst = os.path.join(diag_dir, os.path.basename(f))
+                sp = _safe_copy_to_dst(f, dst, tail_lines=tail_lines)
+                if sp:
+                    saved.append(sp)
+            except Exception:
+                pass
+
+    # local CRIU restore log
+    local_restore = os.path.join('/runc/containers', scene, 'migrate', 'image', 'r_log', 'restore.log')
+    if os.path.exists(local_restore):
+        try:
+            dst = os.path.join(diag_dir, 'restore.log')
+            _safe_copy_to_dst(local_restore, dst, tail_lines=tail_lines)
+            saved.append(dst)
+        except Exception:
+            pass
+
+    # Fetch remote logs if dest is remote
+    if dest_ip and dest_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_patterns = [
+            os.path.join(remote_tmp, 'logs', 'destination', f"{DEST_SCRIPT.replace('.', '_')}_{scene}_*.log"),
+            os.path.join(remote_tmp, f"destination_pre_restore_*.log"),
+            os.path.join(remote_tmp, f"destination_reply*"),
+            os.path.join('/runc/containers', scene, 'migrate', 'image', 'r_log', 'restore.log'),
+            f"/tmp/destination_py_{scene}_*.log",
+            f"/tmp/destination_pre_restore_*.log",
+            f"/tmp/destination_reply*",
+        ]
+        try:
+            saved_remote = _fetch_remote_files(dest_ip, remote_patterns, diag_dir, tail_lines=tail_lines)
+            saved.extend(saved_remote)
+        except Exception:
+            pass
+
+        # capture remote ss and runc state
+        try:
+            ss = run_remote_cmd('ss -tnp || true', dest_ip, ignore_error=True, quiet=True)
+            p = os.path.join(diag_dir, f"remote_ss_{dest_ip}.txt")
+            with open(p, 'w', encoding='utf-8') as fo:
+                fo.write(getattr(ss, 'stdout', '') or '')
+            saved.append(p)
+        except Exception:
+            pass
+        try:
+            st = run_remote_cmd(f"runc state {shlex.quote(scene)} || true", dest_ip, ignore_error=True, quiet=True)
+            p = os.path.join(diag_dir, f"remote_runc_state_{dest_ip}.txt")
+            with open(p, 'w', encoding='utf-8') as fo:
+                fo.write((getattr(st, 'stdout', '') or '') + (getattr(st, 'stderr', '') or ''))
+            saved.append(p)
+        except Exception:
+            pass
+
+    # capture local network/process state
+    try:
+        ss = run_cmd('ss -tnp || true', quiet=True, ignore_error=True)
+        p = os.path.join(diag_dir, 'local_ss.txt')
+        with open(p, 'w', encoding='utf-8') as fo:
+            fo.write(getattr(ss, 'stdout', '') or '')
+        saved.append(p)
+    except Exception:
+        pass
+    try:
+        st = run_cmd(f"runc state {shlex.quote(scene)} || true", quiet=True, ignore_error=True)
+        p = os.path.join(diag_dir, 'local_runc_state.txt')
+        with open(p, 'w', encoding='utf-8') as fo:
+            fo.write((getattr(st, 'stdout', '') or '') + (getattr(st, 'stderr', '') or ''))
+        saved.append(p)
+    except Exception:
+        pass
+
+    # Capture local IP addresses and routes for VIP verification
+    try:
+        ipaddr = run_cmd('ip -4 addr show', quiet=True, ignore_error=True)
+        p = os.path.join(diag_dir, 'local_ip_addrs.txt')
+        with open(p, 'w', encoding='utf-8') as fo:
+            fo.write(getattr(ipaddr, 'stdout', '') or '')
+        saved.append(p)
+    except Exception:
+        pass
+    try:
+        iprt = run_cmd('ip route show', quiet=True, ignore_error=True)
+        p = os.path.join(diag_dir, 'local_ip_route.txt')
+        with open(p, 'w', encoding='utf-8') as fo:
+            fo.write(getattr(iprt, 'stdout', '') or '')
+        saved.append(p)
+    except Exception:
+        pass
+
+    # Fetch remote IP information if dest is remote
+    if dest_ip and dest_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        try:
+            rip = run_remote_cmd('ip -4 addr show', dest_ip, ignore_error=True, quiet=True)
+            p = os.path.join(diag_dir, f'remote_ip_addrs_{dest_ip}.txt')
+            with open(p, 'w', encoding='utf-8') as fo:
+                fo.write(getattr(rip, 'stdout', '') or '')
+            saved.append(p)
+        except Exception:
+            pass
+        try:
+            rrt = run_remote_cmd('ip route show', dest_ip, ignore_error=True, quiet=True)
+            p = os.path.join(diag_dir, f'remote_ip_route_{dest_ip}.txt')
+            with open(p, 'w', encoding='utf-8') as fo:
+                fo.write(getattr(rrt, 'stdout', '') or '')
+            saved.append(p)
+        except Exception:
+            pass
+
+    # create tarball
+    tarball = os.path.join(diag_base, f"{scene}_{exp_name}_run{run_idx}_diagnostics_{ts}.tar.gz")
+    try:
+        with _tarfile.open(tarball, 'w:gz') as tf:
+            for f in saved:
+                try:
+                    tf.add(f, arcname=os.path.basename(f))
+                except Exception:
+                    pass
+        saved.append(tarball)
+    except Exception:
+        pass
+
+    return saved
+
+
+def fetch_remote_workload_metrics(scene: str, exp_name: str, run_idx: int, remote_host: str | None = None, tail_lines: int = 500, remove_remote: bool = False) -> list:
+    """Fetch bench outputs (metrics JSON and raw) from remote client host into local workload dir.
+
+    This is best-effort and will try several candidate locations on the remote host. Returns a
+    list of local file paths successfully fetched (empty list on none).
+    """
+    saved = []
+    if not remote_host or remote_host in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        return saved
+    try:
+        raw_out, metrics_out = build_bench_output_paths(scene, exp_name, run_idx)
+        local_dir = os.path.dirname(metrics_out)
+        os.makedirs(local_dir, exist_ok=True)
+    except Exception as e:
+        print(f"[bench-fetch] failed to compute local output paths: {e}")
+        return saved
+
+    candidates = []
+    candidates.append(metrics_out)
+    candidates.append(raw_out)
+    candidates.append(os.path.join(f"/tmp/fog_test/{RUN_LABEL}/workloads/{scene}", os.path.basename(metrics_out)))
+    candidates.append(os.path.join(f"/tmp/fog_test/{RUN_LABEL}/workloads/{scene}", os.path.basename(raw_out)))
+    candidates.append(os.path.join("/tmp", os.path.basename(metrics_out)))
+    candidates.append(os.path.join("/tmp", os.path.basename(raw_out)))
+
+    for remote_path in candidates:
+        try:
+            if not remote_path:
+                continue
+            check = run_remote_cmd(f"test -f {shlex.quote(remote_path)} && echo EXISTS || echo MISSING", remote_host, ignore_error=True, quiet=True)
+            out = (getattr(check, 'stdout', '') or '').strip()
+            if not out or out.splitlines()[0].strip() != 'EXISTS':
+                continue
+            cat = run_remote_cmd(f"cat {shlex.quote(remote_path)}", remote_host, ignore_error=True, quiet=True)
+            content = getattr(cat, 'stdout', '') or ''
+            if not content:
+                continue
+            local_name = os.path.basename(remote_path)
+            local_path = os.path.join(local_dir, local_name)
+            try:
+                with open(local_path, 'w', encoding='utf-8') as fo:
+                    fo.write(content)
+                saved.append(local_path)
+                print(f"[bench-fetch] fetched {remote_path} from {remote_host} -> {local_path}")
+                # optionally remove remote copy
+                if remove_remote:
+                    try:
+                        run_remote_cmd(f"rm -f {shlex.quote(remote_path)}", remote_host, ignore_error=True, quiet=True)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[bench-fetch] failed to write fetched file {local_path}: {e}")
+
+            # also try to grab remote bench log tail
+            try:
+                remote_log = f"/tmp/fog_test/{RUN_LABEL}/logs/bench/bench_{scene}.log"
+                rlog = run_remote_cmd(f"tail -n {int(tail_lines)} {shlex.quote(remote_log)} || true", remote_host, ignore_error=True, quiet=True)
+                logcontent = getattr(rlog, 'stdout', '') or ''
+                if logcontent:
+                    local_log = os.path.join(TMP_BENCH_LOGS, f"remote_bench_{scene}.log")
+                    os.makedirs(os.path.dirname(local_log), exist_ok=True)
+                    with open(local_log, 'w', encoding='utf-8') as lf:
+                        lf.write(logcontent)
+                    saved.append(local_log)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[bench-fetch] error checking remote file {remote_path} on {remote_host}: {e}")
+            continue
+
+    if not saved:
+        print(f"[bench-fetch] no remote bench metrics found on {remote_host} for {scene} run {run_idx}")
+    else:
+        print(f"[bench-fetch] fetched files: {saved}")
+    return saved
+
+
+def write_run_error_file(run_result: dict, scene: str, run_idx: int, exp_name: str) -> str | None:
+    errors_dir = os.path.join(get_run_dir(), 'errors')
+    os.makedirs(errors_dir, exist_ok=True)
+    fname = f"{scene}_run-{run_idx}_{exp_name}_error.json"
+    path = os.path.join(errors_dir, fname)
+    try:
+        with open(path, 'w', encoding='utf-8') as fo:
+            json.dump(run_result, fo, indent=2)
+        return path
+    except Exception:
+        return None
+
+
 def append_scene_exp_summary(scene: str, exp_name: str, run_metrics: List[dict]) -> Optional[str]:
     if not run_metrics:
         return None
@@ -465,6 +1222,24 @@ def stage_bundle_from_fog_to_containers(scene: str, remote: bool = False, target
     if remote and target not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
         run_remote_cmd(cmd, target, ignore_error=False)
         sanitize_profile(dest, remote=True, target_ip=target)
+        # Force container bundle to request a terminal for migration (so recvtty will be used)
+        try:
+            term_cmd = (
+                "python3 - <<'PY'\n"
+                f"import json, os\ncfg='{dest}/config.json'\n"
+                "try:\n"
+                "    if os.path.exists(cfg):\n"
+                "        data=json.load(open(cfg))\n"
+                "        data.setdefault('process', {})\n"
+                "        data['process']['terminal']=True\n"
+                "        json.dump(data, open(cfg,'w'))\n"
+                "except Exception as e:\n"
+                "    print('term-patch-failed', e)\n"
+                "PY"
+            )
+            run_remote_cmd(term_cmd, target, ignore_error=True, quiet=True)
+        except Exception:
+            pass
     else:
         run_cmd(cmd, ignore_error=False)
         try:
@@ -472,19 +1247,48 @@ def stage_bundle_from_fog_to_containers(scene: str, remote: bool = False, target
         except Exception:
             pass
         sanitize_profile(dest, remote=False)
+        # Force local staged bundle to request a terminal for migration
+        try:
+            cfg_path_local = os.path.join(dest, 'config.json')
+            if os.path.exists(cfg_path_local):
+                try:
+                    j = json.load(open(cfg_path_local))
+                    j.setdefault('process', {})
+                    j['process']['terminal'] = True
+                    with open(cfg_path_local, 'w') as _cfh:
+                        json.dump(j, _cfh)
+                    print(f"[stage] forced process.terminal=true in {cfg_path_local}")
+                except Exception as e:
+                    print(f"[stage] failed to set terminal true: {e}")
+        except Exception:
+            pass
     return dest
 
 
 def start_recvtty_for_bundle(bundle_path: str, scene: str, remote: bool = False, target_ip: Optional[str] = None, mode: str = 'null'):
     console_sock = os.path.join(bundle_path, 'console.sock')
-    pidfile = f"/tmp/recvtty_{scene}_{'remote' if remote else 'local'}.pid"
-    cmd = f"PATH=$PATH:/root/go/bin recvtty -m {mode} {shlex.quote(console_sock)} > /tmp/recvtty_{scene}.log 2>&1 & echo $! > {shlex.quote(pidfile)}"
+    # local paths
+    local_pidfile = os.path.join(TMP_PIDS, f"recvtty_{scene}_{'remote' if remote else 'local'}.pid")
+    local_log = os.path.join(TMP_RECVTTY_LOGS, f"recvtty_{scene}.log")
     target = target_ip or DEST_IP
+
     if remote and target not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_pidfile = os.path.join(remote_tmp, 'pids', f"recvtty_{scene}_remote.pid")
+        remote_log = os.path.join(remote_tmp, 'logs', 'recvtty', f"recvtty_{scene}.log")
+        cmd = f"mkdir -p {shlex.quote(os.path.dirname(remote_log))} {shlex.quote(os.path.dirname(remote_pidfile))} ; PATH=$PATH:/root/go/bin recvtty -m {mode} {shlex.quote(console_sock)} > {shlex.quote(remote_log)} 2>&1 & echo $! > {shlex.quote(remote_pidfile)}"
         run_remote_cmd(cmd, target, ignore_error=True, quiet=True)
+        return console_sock, remote_pidfile
     else:
+        cmd = f"PATH=$PATH:/root/go/bin recvtty -m {mode} {shlex.quote(console_sock)} > {shlex.quote(local_log)} 2>&1 & echo $! > {shlex.quote(local_pidfile)}"
+        # ensure local dirs exist
+        try:
+            os.makedirs(os.path.dirname(local_log), exist_ok=True)
+            os.makedirs(os.path.dirname(local_pidfile), exist_ok=True)
+        except Exception:
+            pass
         run_cmd(cmd, ignore_error=True, quiet=True)
-    return console_sock, pidfile
+        return console_sock, local_pidfile
 
 
 def start_container_for_migration(scene: str, port: int) -> str:
@@ -493,17 +1297,32 @@ def start_container_for_migration(scene: str, port: int) -> str:
     bundle_path = os.path.join('/runc/containers', scene)
     patch_bundle_port(bundle_path, port)
     console_opt = ''
+    # Force the staged bundle to request a terminal so migration runs use recvtty
     try:
+        cfg_path_local = os.path.join(bundle_path, 'config.json')
+        if os.path.exists(cfg_path_local):
+            try:
+                cfg_j = json.load(open(cfg_path_local))
+                cfg_j.setdefault('process', {})
+                if not cfg_j['process'].get('terminal'):
+                    cfg_j['process']['terminal'] = True
+                    with open(cfg_path_local, 'w') as _cfh:
+                        json.dump(cfg_j, _cfh)
+                    print(f"[start] forced process.terminal=true in {cfg_path_local}")
+            except Exception as e:
+                print(f"[start] failed to force terminal in {cfg_path_local}: {e}")
+        # re-evaluate needs_console from the (possibly modified) config
         cfgj = json.load(open(os.path.join(bundle_path, 'config.json')))
         needs_console = bool(cfgj.get('process', {}).get('terminal', False))
     except Exception:
         needs_console = False
     if needs_console:
-        console_sock, _ = start_recvtty_for_bundle(bundle_path, scene, remote=False)
+        console_sock, pidfile = start_recvtty_for_bundle(bundle_path, scene, remote=False)
+        print(f"[start] recvtty started for migration bundle {scene} on {console_sock} (pidfile {pidfile})")
         console_opt = f"--console-socket {shlex.quote(console_sock)}"
 
     # ensure no stale container
-    run_cmd(f"runc kill {shlex.quote(scene)}", ignore_error=True, quiet=True)
+    run_cmd(f"runc kill {shlex.quote(scene)} KILL", ignore_error=True, quiet=True)
     run_cmd(f"runc delete {shlex.quote(scene)}", ignore_error=True, quiet=True)
     try:
         ensure_deleted(scene)
@@ -554,7 +1373,6 @@ def destination_prepare_migration(scene: str, port: int):
             "        return\n"
             "    data=json.load(open(cfg))\n"
             "    data.setdefault('process', {})\n"
-            "    data['process']['terminal']=True\n"
             "    args=data.get('process',{}).get('args',[])\n"
             "    for i,a in enumerate(args):\n"
             "        if '--port' in str(a):\n"
@@ -569,45 +1387,123 @@ def destination_prepare_migration(scene: str, port: int):
             run_cmd(patch_cmd, ignore_error=True, quiet=True)
         else:
             run_remote_cmd(patch_cmd, DEST_IP, ignore_error=True, quiet=True)
+        # Ensure the bundle requests a terminal on destination so recvtty will be used
+        term_cmd = (
+            "python3 - <<'PY'\n"
+            f"import json, os\ncfg='{bundle}/config.json'\n"
+            "try:\n"
+            "    if os.path.exists(cfg):\n"
+            "        data=json.load(open(cfg))\n"
+            "        data.setdefault('process', {})\n"
+            "        data['process']['terminal']=True\n"
+            "        json.dump(data, open(cfg,'w'))\n"
+            "except Exception as e:\n"
+            "    print('term-patch-failed', e)\n"
+            "PY"
+        )
+        if DEST_IP in ('127.0.0.1', 'localhost', SOURCE_IP):
+            run_cmd(term_cmd, ignore_error=True, quiet=True)
+        else:
+            run_remote_cmd(term_cmd, DEST_IP, ignore_error=True, quiet=True)
     except Exception:
         pass
-    start_recvtty_for_bundle(bundle, scene, remote=True, target_ip=DEST_IP)
+    # Start recvtty on destination only if the bundle requests a console
+    needs_console = False
+    try:
+        cfg_remote = os.path.join(bundle, 'config.json')
+        if DEST_IP in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+            if os.path.exists(cfg_remote):
+                cfg = json.load(open(cfg_remote))
+                needs_console = bool(cfg.get('process', {}).get('terminal', False))
+        else:
+            probe_cmd = (
+                "python3 - <<'PY'\n"
+                "import json\n"
+                f"cfg='{cfg_remote}'\n"
+                "try:\n"
+                "    data=json.load(open(cfg))\n"
+                "    print(bool(data.get('process', {}).get('terminal', False)))\n"
+                "except Exception:\n"
+                "    print(False)\n"
+                "PY"
+            )
+            try:
+                res = run_remote_cmd(probe_cmd, DEST_IP, ignore_error=True, quiet=True)
+                out = (getattr(res, 'stdout', '') or '').strip().lower()
+                needs_console = out.startswith('true')
+            except Exception:
+                needs_console = False
+    except Exception:
+        needs_console = False
+
+    if needs_console:
+        start_recvtty_for_bundle(bundle, scene, remote=True, target_ip=DEST_IP)
+
     ts = int(time.time())
-    dest_log = f"/tmp/{DEST_SCRIPT.replace('.', '_')}_{scene}_{ts}.log"
-    dest_pidfile = f"/tmp/destination_{scene}.pid"
+    # local structured tmp paths
+    dest_log = os.path.join(TMP_DEST_LOGS, f"{DEST_SCRIPT.replace('.', '_')}_{scene}_{ts}.log")
+    dest_pidfile = os.path.join(TMP_PIDS, f"destination_{scene}.pid")
+    python_bin_remote = sys.executable if DEST_IP in (None, '127.0.0.1', 'localhost', SOURCE_IP) else 'python3'
+    # Ensure local dirs exist
+    try:
+        os.makedirs(os.path.dirname(dest_log), exist_ok=True)
+        os.makedirs(os.path.dirname(dest_pidfile), exist_ok=True)
+    except Exception:
+        pass
     start_dest_cmd = (
-        f"nohup {shlex.quote(sys.executable)} /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {dest_log} 2>&1 "
-        f"& echo $! > {dest_pidfile}"
+        f"FOG_TMP_DIR={shlex.quote(TMP_ROOT)} nohup {shlex.quote(python_bin_remote)} /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {shlex.quote(dest_log)} 2>&1 & echo $! > {shlex.quote(dest_pidfile)}"
     )
     if DEST_IP in ('127.0.0.1', 'localhost', SOURCE_IP):
         run_cmd(start_dest_cmd, ignore_error=False)
     else:
-        run_remote_cmd(start_dest_cmd, DEST_IP, ignore_error=False)
+        # remote structured tmp paths
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_dest_log = os.path.join(remote_tmp, 'logs', 'destination', f"{DEST_SCRIPT.replace('.', '_')}_{scene}_{ts}.log")
+        remote_dest_pid = os.path.join(remote_tmp, 'pids', f"destination_{scene}.pid")
+        remote_cmd = (
+            f"mkdir -p {shlex.quote(os.path.dirname(remote_dest_log))} {shlex.quote(os.path.dirname(remote_dest_pid))} ; FOG_TMP_DIR={shlex.quote(remote_tmp)} nohup python3 /runc/dirty-track/mig-scripts/{DEST_SCRIPT} > {shlex.quote(remote_dest_log)} 2>&1 & echo $! > {shlex.quote(remote_dest_pid)}"
+        )
+        run_remote_cmd(remote_cmd, DEST_IP, ignore_error=False)
 
 
 def destination_clean_migration(scene: str):
     kill_destination_listener(DEST_IP)
     cmds = [
-        (f"runc kill {scene}", True),
+        (f"runc kill {scene} KILL", True),
         (f"runc delete {scene}", True),
-        ("kill -9 $(cat /tmp/recvtty_destination.pid) 2>/dev/null", True),
+        (f"sh -c 'for f in {shlex.quote(os.path.join(TMP_PIDS, f'recvtty_{scene}_*.pid'))}; do if [ -f \"$f\" ]; then kill -TERM $(cat \"$f\") 2>/dev/null || true; rm -f \"$f\"; fi; done'", True),
     ]
+
     if DEST_IP in ('127.0.0.1', 'localhost', SOURCE_IP):
         for c, ign in cmds:
             run_cmd(c, ignore_error=ign, quiet=True)
         run_cmd("ps aux | grep 'recvtty' | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True, quiet=True)
-        run_cmd(f"if [ -f /tmp/destination_{scene}.pid ]; then kill -TERM $(cat /tmp/destination_{scene}.pid) 2>/dev/null || true; rm -f /tmp/destination_{scene}.pid; fi", ignore_error=True, quiet=True)
+        run_cmd(f"if [ -f {shlex.quote(os.path.join(TMP_PIDS, f'destination_{scene}.pid'))} ]; then kill -TERM $(cat {shlex.quote(os.path.join(TMP_PIDS, f'destination_{scene}.pid'))}) 2>/dev/null || true; rm -f {shlex.quote(os.path.join(TMP_PIDS, f'destination_{scene}.pid'))}; fi", ignore_error=True, quiet=True)
     else:
-        for c, ign in cmds:
+        # remote cleanup using structured remote tmp paths
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_cmds = [
+            (f"runc kill {scene} KILL", True),
+            (f"runc delete {scene}", True),
+            (f"sh -c 'for f in {shlex.quote(os.path.join(remote_tmp,'pids', f'recvtty_{scene}_*.pid'))}; do if [ -f \"$f\" ]; then kill -TERM $(cat \"$f\") 2>/dev/null || true; rm -f \"$f\"; fi; done'", True),
+        ]
+        for c, ign in remote_cmds:
             run_remote_cmd(c, DEST_IP, ignore_error=ign, quiet=True)
         run_remote_cmd("ps aux | grep 'recvtty' | grep -v grep | awk '{print $2}' | xargs -r kill -9", DEST_IP, ignore_error=True, quiet=True)
-        run_remote_cmd(f"if [ -f /tmp/destination_{scene}.pid ]; then kill -TERM $(cat /tmp/destination_{scene}.pid) 2>/dev/null || true; rm -f /tmp/destination_{scene}.pid; fi", DEST_IP, ignore_error=True, quiet=True)
+        run_remote_cmd(f"if [ -f {shlex.quote(os.path.join(remote_tmp,'pids', f'destination_{scene}.pid'))} ]; then kill -TERM $(cat {shlex.quote(os.path.join(remote_tmp,'pids', f'destination_{scene}.pid'))}) 2>/dev/null || true; rm -f {shlex.quote(os.path.join(remote_tmp,'pids', f'destination_{scene}.pid'))}; fi", DEST_IP, ignore_error=True, quiet=True)
+        # Ensure the container is actually deleted on remote host (robust retries)
+        try:
+            ok = ensure_deleted_remote(DEST_IP, scene)
+            if not ok:
+                print(f"[clean] warning: remote container {scene} may still exist on {DEST_IP}")
+        except Exception as e:
+            print(f"[clean] ensure_deleted_remote failed for {scene} on {DEST_IP}: {e}")
 
 
 def source_clean_migration(scene: str):
-    run_cmd("kill -9 $(cat /tmp/recvtty_source.pid) 2>/dev/null", ignore_error=True, quiet=True)
+    run_cmd(f"kill -9 $(cat {shlex.quote(os.path.join(TMP_PIDS, 'recvtty_source.pid'))}) 2>/dev/null || true", ignore_error=True, quiet=True)
     unmount_local_migration_tmpfs(scene)
-    run_cmd(f"runc kill {scene}", ignore_error=True, quiet=True)
+    run_cmd(f"runc kill {scene} KILL", ignore_error=True, quiet=True)
     run_cmd(f"runc delete {scene}", ignore_error=True, quiet=True)
     run_cmd("ps aux | grep 'inotifywait' | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True, quiet=True)
     run_cmd("ps aux | grep 'sync_rootfs' | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True, quiet=True)
@@ -630,6 +1526,14 @@ def safe_clean_all(quiet: bool = False):
             print(msg)
 
     _log("[clean] Performing robust clean of defog containers and tmp artifacts...")
+
+    # Ensure network shaping is cleared first (local and remote) so there's no leftover
+    # tc configuration after runs. This is best-effort and won't fail the cleanup.
+    try:
+        clean_configure_network()
+    except Exception as e:
+        _log(f"[clean] warning: clean_configure_network failed: {e}")
+
     try:
         res = run_cmd("runc list -q", quiet=True)
         names = [ln.strip() for ln in res.stdout.splitlines()]
@@ -655,8 +1559,33 @@ def safe_clean_all(quiet: bool = False):
             if n not in res.stdout:
                 break
             time.sleep(0.2)
-    # remove tmp bundles and recvtty artifacts
+
+    # Ensure remote hosts also have the containers removed (best-effort)
+    try:
+        if DEST_IP and DEST_IP not in ('127.0.0.1', 'localhost', SOURCE_IP):
+            for n in candidates:
+                try:
+                    ensure_deleted_remote(DEST_IP, n)
+                except Exception as _e:
+                    _log(f"[clean] ensure_deleted_remote failed for {n} on {DEST_IP}: {_e}")
+    except Exception:
+        pass
+    try:
+        if CLIENT_IP and CLIENT_IP not in ('127.0.0.1', 'localhost', SOURCE_IP):
+            for n in candidates:
+                try:
+                    ensure_deleted_remote(CLIENT_IP, n)
+                except Exception as _e:
+                    _log(f"[clean] ensure_deleted_remote failed for {n} on {CLIENT_IP}: {_e}")
+    except Exception:
+        pass
+    # remove tmp bundles and recvtty artifacts (include structured TMP_ROOT)
     run_cmd("rm -rf /tmp/fog_bundle.* /tmp/*_start.pid /tmp/*_loop.pid /tmp/recvtty_*.pid /tmp/recvtty-*.log /tmp/recvtty_debug.log", ignore_error=True, quiet=True)
+    # remove our structured tmp area if present
+    try:
+        run_cmd(f"rm -rf {shlex.quote(TMP_ROOT)}", ignore_error=True, quiet=True)
+    except Exception:
+        pass
     # kill any lingering recvtty processes
     run_cmd("ps aux | grep recvtty | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True, quiet=True)
     # additional attempt: pgrep/pkill for recvtty to handle different invocation forms
@@ -740,8 +1669,13 @@ def ensure_assets_in_bundle(bundle_path, scene):
         else:
             print(f"[data] missing canonical asset {src} for {scene} - continuing")
 
-# ensure cleanup runs at process exit
-atexit.register(safe_clean_all)
+# ensure cleanup runs at process exit (but don't auto-run when user requested help)
+# If the user passed -h/--help, argparse will print help and exit; avoid running cleanup in that case.
+if not any(arg in ('-h', '--help') for arg in sys.argv):
+    atexit.register(safe_clean_all)
+else:
+    # Avoid performing destructive cleaning when only showing help
+    print("[clean] Skipping atexit safe_clean_all registration due to help request")
 
 
 def ensure_deleted(container: str, attempts: int = 6, delay: float = 0.5) -> bool:
@@ -754,10 +1688,26 @@ def ensure_deleted(container: str, attempts: int = 6, delay: float = 0.5) -> boo
             names = []
         if container not in names:
             return True
-        run_cmd(f"runc kill {shlex.quote(container)}", ignore_error=True, quiet=True)
         run_cmd(f"runc kill {shlex.quote(container)} KILL", ignore_error=True, quiet=True)
         run_cmd(f"runc delete {shlex.quote(container)}", ignore_error=True, quiet=True)
         time.sleep(delay)
+    return False
+
+
+def ensure_deleted_remote(target_ip: str, container: str, attempts: int = 6, delay: float = 0.5) -> bool:
+    """Wait for a container to disappear on a remote host, trying kill/delete repeatedly via ssh."""
+    for i in range(attempts):
+        try:
+            r = run_remote_cmd("runc list -q", target_ip, ignore_error=True, quiet=True)
+            names = [ln.strip() for ln in (getattr(r, 'stdout', '') or '').splitlines()]
+        except Exception:
+            names = []
+        if container not in names:
+            return True
+        run_remote_cmd(f"runc kill {shlex.quote(container)} KILL", target_ip, ignore_error=True, quiet=True)
+        run_remote_cmd(f"runc delete {shlex.quote(container)}", target_ip, ignore_error=True, quiet=True)
+        time.sleep(delay)
+    print(f"[clean][warn] failed to delete remote container {container} on {target_ip}")
     return False
 
 
@@ -801,18 +1751,26 @@ def verify_no_persistence(bundle_path: str, bundle: str) -> None:
                 print(f"[warn] redis appendonly enabled in {rc}")
         except Exception:
             pass
-    # Influx check
+    # Influx check (only warn if bundle appears to contain Influx or mentions influx in args)
     cfg = os.path.join(bundle_path, 'config.json')
     if os.path.exists(cfg):
         try:
             import json as _json
             cfgj = _json.load(open(cfg))
             args = cfgj.get('process', {}).get('args', [])
-            joined = ' '.join(args)
-            if '--object-store=memory' in joined or '--object-store=tmpfs' in joined or '--object-store=memory' in joined:
-                print(f"[info] Influx object-store appears memory-backed in {cfg}")
-            else:
-                print(f"[warn] Influx persistence may be enabled (no --object-store=memory) in {cfg}")
+            joined = ' '.join(args).lower()
+            influx_bin_paths = [
+                os.path.join(bundle_path, 'rootfs', 'usr', 'bin', 'influxdb3'),
+                os.path.join(bundle_path, 'rootfs', 'usr', 'local', 'bin', 'influxdb3'),
+                os.path.join(bundle_path, 'rootfs', 'usr', 'bin', 'influxd'),
+                os.path.join(bundle_path, 'rootfs', 'usr', 'local', 'bin', 'influxd'),
+            ]
+            influx_present = any(os.path.exists(p) for p in influx_bin_paths) or 'influx' in joined or 'influxdb' in joined
+            if influx_present:
+                if '--object-store=memory' in joined or '--object-store=tmpfs' in joined:
+                    print(f"[info] Influx object-store appears memory-backed in {cfg}")
+                else:
+                    print(f"[warn] Influx persistence may be enabled (no --object-store=memory) in {cfg}")
         except Exception:
             pass
 
@@ -864,7 +1822,9 @@ def start_service(scene: str, host: str, port: int):
             ]
             if os.path.exists(exec_sh):
                 cfgj['process']['args'] = ['sh', '-lc', f"/root/scripts/execute.sh --server --port {int(port)} && exec sleep infinity"]
-                cfgj['process']['terminal'] = False
+                # Preserve explicit terminal requests; default to detached mode only when unspecified
+                if 'terminal' not in cfgj.get('process', {}):
+                    cfgj['process']['terminal'] = False
                 with open(cfg, 'w') as _cfh:
                     _json.dump(cfgj, _cfh)
                 print(f"[start] patched {cfg} to pass --port {int(port)} to execute.sh")
@@ -906,6 +1866,8 @@ def start_service(scene: str, host: str, port: int):
     if os.path.exists(console_sock):
         try:
             run_cmd(f"PATH=$PATH:/root/go/bin recvtty -m null {shlex.quote(console_sock)} > {shlex.quote(recvtty_log)} 2>&1 & echo $! > {shlex.quote(recvtty_pid)}", quiet=True, ignore_error=True)
+            # record that recvtty was started (pidfile may be created asynchronously)
+            print(f"[start] recvtty started for {scene} on {console_sock} (pidfile {recvtty_pid})")
             console_opt = f"--console-socket {shlex.quote(console_sock)}"
         except Exception:
             console_opt = ''
@@ -922,6 +1884,7 @@ def start_service(scene: str, host: str, port: int):
                     run_cmd(f"PATH=$PATH:/root/go/bin recvtty -m null {shlex.quote(temp_console)} > {shlex.quote(recvtty_log)} 2>&1 & echo $! > {shlex.quote(recvtty_pid)}", quiet=True, ignore_error=True)
                     # If the socket was created, use it; otherwise patch the bundle to remove terminal requirement
                     if os.path.exists(temp_console):
+                        print(f"[start] temporary recvtty socket created {temp_console} (pidfile {recvtty_pid})")
                         console_opt = f"--console-socket {shlex.quote(temp_console)}"
                     else:
                         try:
@@ -939,7 +1902,7 @@ def start_service(scene: str, host: str, port: int):
             pass
 
     # ensure no conflicting container: stop/delete and wait for disappearance to avoid race "container with given ID already exists"
-    run_cmd(f"runc kill {scene}", ignore_error=True, quiet=True)
+    run_cmd(f"runc kill {scene} KILL", ignore_error=True, quiet=True)
     run_cmd(f"runc delete {scene}", ignore_error=True, quiet=True)
     try:
         ensure_deleted(scene)
@@ -1360,7 +2323,7 @@ def is_container_running(container: str) -> bool:
 
 
 def restart_container_for_migration(scene: str, port: int):
-    run_cmd(f"runc kill {shlex.quote(scene)}", ignore_error=True, quiet=True)
+    run_cmd(f"runc kill {shlex.quote(scene)} KILL", ignore_error=True, quiet=True)
     run_cmd(f"runc delete {shlex.quote(scene)}", ignore_error=True, quiet=True)
     try:
         ensure_deleted(scene)
@@ -1382,12 +2345,15 @@ def ensure_service_ready(scene: str, port: int, endpoint: str, max_wait_seconds:
     def poll_basic_http(label: str) -> bool:
         deadline = time.time() + wait_secs
         while time.time() < deadline:
+            # Prefer host-level HTTP check first; if service is reachable, treat as ready even if runc state is inconsistent
+            if basic_http_ready():
+                return True
             if not is_container_running(scene):
                 print(f"[health] {scene} not running during {label}; restarting")
                 restart_container_for_migration(scene, port)
+                # give container a moment to come up before re-checking
+                time.sleep(1.0)
                 continue
-            if basic_http_ready():
-                return True
             time.sleep(1.0)
         return False
 
@@ -1620,11 +2586,11 @@ def run_bench(scene: str, port: int):
 
     if local_bench:
         backend = detect_backend_from_bench(local_bench)
-        asset = info.get('asset')
         files_arg = ''
-        if asset:
-            if scene == 'aeneas' and ',' in asset:
-                parts = [p.strip() for p in asset.split(',') if p.strip()]
+        # If caller requested specific files to use, construct appropriate args; otherwise let the bench use its defaults
+        if BENCH_FILES:
+            if scene == 'aeneas' and ',' in BENCH_FILES:
+                parts = [p.strip() for p in BENCH_FILES.split(',') if p.strip()]
                 pairs = []
                 for i in range(0, len(parts)-1, 2):
                     a = parts[i]
@@ -1633,18 +2599,31 @@ def run_bench(scene: str, port: int):
                 if pairs:
                     files_arg = f" --pairs {shlex.quote(','.join(pairs))}"
             else:
-                parts = [p.strip() for p in asset.split(',') if p.strip()]
-                basenames = ','.join([os.path.basename(p) for p in parts])
-                files_arg = f" --files {shlex.quote(basenames)}"
+                parts = [p.strip() for p in BENCH_FILES.split(',') if p.strip()]
+                if len(parts) == 1:
+                    if local_bench and _bench_supports_flag(local_bench, '--file'):
+                        files_arg = f" --file {shlex.quote(os.path.basename(parts[0]))}"
+                    elif local_bench and _bench_supports_flag(local_bench, '--files'):
+                        files_arg = f" --files {shlex.quote(os.path.basename(parts[0]))}"
+                    else:
+                        files_arg = f" --file {shlex.quote(os.path.basename(parts[0]))}"
+                else:
+                    basenames = ','.join([os.path.basename(p) for p in parts])
+                    files_arg = f" --files {shlex.quote(basenames)}"
+
+        dataset_arg = ''
+        if BENCH_DATASET and local_bench and _bench_supports_flag(local_bench, '--dataset'):
+            dataset_arg = f" --dataset {shlex.quote(BENCH_DATASET)}"
+
         if backend == 'redis':
-            cmd = f"{py} {shlex.quote(local_bench)} --redis-host 127.0.0.1 --redis-port {int(port)} --threads 4 --duration 30 --dataset /runc/datasets"
+            cmd = f"{py} {shlex.quote(local_bench)} --redis-host 127.0.0.1 --redis-port {int(port)} --threads 4 --duration 30{dataset_arg}"
         elif backend == 'influxdb':
-            cmd = f"{py} {shlex.quote(local_bench)} --influx-url http://127.0.0.1:{int(port)} --threads 4 --duration 30 --dataset /runc/datasets"
+            cmd = f"{py} {shlex.quote(local_bench)} --influx-url http://127.0.0.1:{int(port)} --threads 4 --duration 30{dataset_arg}"
         elif backend == 'elasticsearch':
             cmd = f"{py} {shlex.quote(local_bench)} --es-host 127.0.0.1 --es-port {int(port)} --threads 4 --rps 100 --duration 30"
         elif backend == 'http':
             url = f"http://127.0.0.1:{int(port)}{info.get('endpoint','/')}"
-            cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --dataset /runc/datasets{files_arg}"
+            cmd = f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)}{dataset_arg}{files_arg}"
         else:
             # Legacy fallback based on path
             if os.path.sep + 'redis' + os.path.sep in local_bench:
@@ -1679,7 +2658,58 @@ def run_bench(scene: str, port: int):
     return None
 
 
-def build_bench_command(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, out_path: Optional[str] = None, metrics_out: Optional[str] = None, metrics_interval: float = 1.0, backend: Optional[str] = None) -> Optional[str]:
+def _derive_dataset_for_scene(scene: str, info: dict) -> str | None:
+    """Best-effort derive a per-scene dataset directory.
+
+    Examples:
+      /runc/datasets/ocr/images/0001.png -> /runc/datasets/ocr
+      /runc/datasets/compress/sample.bin -> /runc/datasets/compress
+    Returns None when no sensible dataset dir can be determined.
+    """
+    try:
+        asset = info.get('asset')
+        if not asset:
+            return None
+        parts = [p.strip() for p in str(asset).split(',') if p.strip()]
+        abs_paths = [os.path.abspath(p) for p in parts if p]
+        base = os.path.abspath('/runc/datasets')
+        try:
+            common = os.path.commonpath(abs_paths)
+        except Exception:
+            common = abs_paths[0] if abs_paths else None
+        if common and common.startswith(base):
+            rel = os.path.relpath(common, base)
+            first = rel.split(os.sep)[0] if rel and rel != '.' else ''
+            if first:
+                return os.path.join(base, first)
+            return base
+        for p in abs_paths:
+            if p.startswith(base):
+                rel = os.path.relpath(p, base)
+                first = rel.split(os.sep)[0]
+                return os.path.join(base, first)
+        return os.path.dirname(abs_paths[0]) if abs_paths else None
+    except Exception:
+        return None
+
+
+def _bench_supports_flag(local_bench: str | None, flag: str) -> bool:
+    """Heuristic: return True if `local_bench` script appears to accept `flag` (e.g. '--file')."""
+    if not local_bench or not os.path.exists(local_bench):
+        return False
+    try:
+        txt = open(local_bench, 'r', encoding='utf-8', errors='ignore').read(8192)
+        import re as _re
+        if _re.search(r"add_argument\(\s*['\"]" + _re.escape(flag) + r"['\"]", txt):
+            return True
+        if flag in txt:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def build_bench_command(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, out_path: Optional[str] = None, metrics_out: Optional[str] = None, metrics_interval: float = 1.0, backend: Optional[str] = None, bench_dataset: Optional[str] = None, bench_files: Optional[str] = None) -> Optional[str]:
     py = shlex.quote(sys.executable)
     host = host or SOURCE_IP or DEFAULT_HOST
     info = SCENE_INFO.get(scene, {})
@@ -1699,18 +2729,30 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
 
     if local_bench:
         if backend == 'redis':
-            return f"{py} {shlex.quote(local_bench)} --redis-host {host} --redis-port {int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets{metrics_args}"
+            # Do not force a dataset by default; allow bench to use its own defaults.
+            dataset_arg = ''
+            if bench_dataset and local_bench and _bench_supports_flag(local_bench, '--dataset'):
+                dataset_arg = f" --dataset {shlex.quote(bench_dataset)}"
+            return f"{py} {shlex.quote(local_bench)} --redis-host {host} --redis-port {int(port)} --threads {int(threads)} --duration {int(duration)}{dataset_arg}{metrics_args}"
         if backend == 'influxdb':
-            return f"{py} {shlex.quote(local_bench)} --influx-url http://{host}:{int(port)} --threads {int(threads)} --duration {int(duration)} --dataset /runc/datasets{metrics_args}"
+            dataset_arg = ''
+            if bench_dataset and local_bench and _bench_supports_flag(local_bench, '--dataset'):
+                dataset_arg = f" --dataset {shlex.quote(bench_dataset)}"
+            return f"{py} {shlex.quote(local_bench)} --influx-url http://{host}:{int(port)} --threads {int(threads)} --duration {int(duration)}{dataset_arg}{metrics_args}"
         if backend == 'elasticsearch':
             return f"{py} {shlex.quote(local_bench)} --es-host {host} --es-port {int(port)} --threads {int(threads)} --rps 100 --duration {int(duration)}{metrics_args}"
         if backend == 'http':
             url = f"http://{host}:{int(port)}{endpoint}"
             files_args = ''
+            dataset_arg = ''
+            # Only pass dataset if explicitly requested by the caller
+            if bench_dataset and local_bench and _bench_supports_flag(local_bench, '--dataset'):
+                dataset_arg = f" --dataset {shlex.quote(bench_dataset)}"
             asset = info.get('asset')
-            if asset:
-                if scene == 'aeneas' and ',' in asset:
-                    parts = [p.strip() for p in asset.split(',') if p.strip()]
+            # Only pass explicit asset file(s) when the caller requested them via bench_files
+            if bench_files:
+                if scene == 'aeneas' and ',' in bench_files:
+                    parts = [p.strip() for p in bench_files.split(',') if p.strip()]
                     pairs = []
                     for i in range(0, len(parts)-1, 2):
                         a = parts[i]
@@ -1719,10 +2761,19 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
                     if pairs:
                         files_args = f" --pairs {shlex.quote(','.join(pairs))}"
                 else:
-                    parts = [p.strip() for p in asset.split(',') if p.strip()]
-                    basenames = ','.join([os.path.basename(p) for p in parts])
-                    files_args = f" --files {shlex.quote(basenames)}"
-            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)} --dataset /runc/datasets --out {shlex.quote(out_path)}{files_args}{metrics_args}"
+                    parts = [p.strip() for p in bench_files.split(',') if p.strip()]
+                    if len(parts) == 1:
+                        # Prefer --file when available (most benches accept it); fall back to --files
+                        if local_bench and _bench_supports_flag(local_bench, '--file'):
+                            files_args = f" --file {shlex.quote(os.path.basename(parts[0]))}"
+                        elif local_bench and _bench_supports_flag(local_bench, '--files'):
+                            files_args = f" --files {shlex.quote(os.path.basename(parts[0]))}"
+                        else:
+                            files_args = f" --file {shlex.quote(os.path.basename(parts[0]))}"
+                    else:
+                        basenames = ','.join([os.path.basename(p) for p in parts])
+                        files_args = f" --files {shlex.quote(basenames)}"
+            return f"{py} {shlex.quote(local_bench)} --url {shlex.quote(url)} --duration {int(duration)} --threads {int(threads)}{dataset_arg} --out {shlex.quote(out_path)}{files_args}{metrics_args}"
         if backend == 'jmeter':
             return f"{py} {shlex.quote(local_bench)} --host {host} --port {int(port)} --duration {int(duration)} --threads {int(threads)} --out {shlex.quote(out_path)}{metrics_args}"
     elif bench:
@@ -1736,7 +2787,7 @@ def build_bench_command(scene: str, port: int, host: Optional[str] = None, durat
     return None
 
 
-def start_bench_background(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, remote: bool = False, exp_name: str = 'pre-copy', run_index: int = 1) -> Optional[str]:
+def start_bench_background(scene: str, port: int, host: Optional[str] = None, duration: int = 600, threads: int = 2, remote: bool = False, exp_name: str = 'pre-copy', run_index: int = 1, bench_dataset: Optional[str] = None, bench_files: Optional[str] = None) -> Optional[str]:
     info = SCENE_INFO.get(scene, {})
     bundle = info.get('bundle', scene)
     local_bench = find_local_bench_for_bundle(scene) or find_local_bench_for_bundle(bundle)
@@ -1747,47 +2798,113 @@ def start_bench_background(scene: str, port: int, host: Optional[str] = None, du
     if backend == 'jmeter' and remote:
         print(f"[bench] backend jmeter detected for {scene}; skipping background bench on remote")
         return None
-    cmd = build_bench_command(
-        scene,
-        port,
-        host=host,
-        duration=duration,
-        threads=threads,
-        out_path=raw_out,
-        metrics_out=metrics_out,
-        metrics_interval=1.0,
-        backend=backend,
-    )
+
+    # If running remotely, prefer to write outputs into the structured remote tmp area
+    if remote:
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_workdir = os.path.join(remote_tmp, 'workloads', scene)
+        remote_raw_out = os.path.join(remote_workdir, os.path.basename(raw_out))
+        remote_metrics_out = os.path.join(remote_workdir, os.path.basename(metrics_out))
+        cmd = build_bench_command(
+            scene,
+            port,
+            host=host,
+            duration=duration,
+            threads=threads,
+            out_path=remote_raw_out,
+            metrics_out=remote_metrics_out,
+            metrics_interval=1.0,
+            backend=backend,
+            bench_dataset=bench_dataset,
+            bench_files=bench_files,
+        )
+    else:
+        # Ensure local workload output directory exists
+        try:
+            os.makedirs(os.path.dirname(raw_out), exist_ok=True)
+            os.makedirs(os.path.dirname(metrics_out), exist_ok=True)
+        except Exception:
+            pass
+        cmd = build_bench_command(
+            scene,
+            port,
+            host=host,
+            duration=duration,
+            threads=threads,
+            out_path=raw_out,
+            metrics_out=metrics_out,
+            metrics_interval=1.0,
+            backend=backend,
+            bench_dataset=bench_dataset,
+            bench_files=bench_files,
+        )
+
     if not cmd:
         print(f"[bench] no bench command for {scene}, skipping background load")
         return None
-    pidfile = f"/tmp/bench_{scene}.pid"
-    log = f"/tmp/bench_{scene}.log"
-    full = f"nohup {cmd} > {log} 2>&1 & echo $! > {pidfile}"
+
+    # local paths
+    pidfile = os.path.join(TMP_PIDS, f"bench_{scene}.pid")
+    log = os.path.join(TMP_BENCH_LOGS, f"bench_{scene}.log")
+
+    # If running remotely, prefer invoking 'python3' on the remote host instead of
+    # using the local sys.executable path which may not exist on the remote system.
     if remote:
+        cmd = cmd.replace(shlex.quote(sys.executable), 'python3')
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_log = os.path.join(remote_tmp, 'logs', 'bench', f"bench_{scene}.log")
+        remote_pidfile = os.path.join(remote_tmp, 'pids', f"bench_{scene}.pid")
+        # Ensure remote workload dir exists so benches can write metrics to it
+        # remote_raw_out/remote_metrics_out were passed into build_bench_command earlier
+        # create parent directories for log/pid and the workload outputs
+        try:
+            # compute families
+            remote_out_dir = os.path.join(remote_tmp, 'workloads', scene)
+            mkdirs = [os.path.dirname(remote_log), os.path.dirname(remote_pidfile), remote_out_dir]
+            mkdirs_cmd = ' '.join(shlex.quote(d) for d in mkdirs)
+        except Exception:
+            mkdirs_cmd = f"{shlex.quote(os.path.dirname(remote_log))} {shlex.quote(os.path.dirname(remote_pidfile))}"
+        full = f"mkdir -p {mkdirs_cmd} ; nohup {cmd} > {shlex.quote(remote_log)} 2>&1 & echo $! > {shlex.quote(remote_pidfile)}"
         run_remote_cmd(full, CLIENT_IP, ignore_error=True)
+        return remote_pidfile
     else:
+        full = f"nohup {cmd} > {shlex.quote(log)} 2>&1 & echo $! > {shlex.quote(pidfile)}"
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            os.makedirs(os.path.dirname(pidfile), exist_ok=True)
+        except Exception:
+            pass
         run_cmd(full, ignore_error=True)
-    return pidfile
+        return pidfile
 
 
 def stop_bench_background(scene: str, remote: bool = False):
-    pidfile = f"/tmp/bench_{scene}.pid"
+    pidfile = os.path.join(TMP_PIDS, f"bench_{scene}.pid")
     stop_cmd = (
-        f"if [ -f {pidfile} ]; then PID=$(cat {pidfile}); "
+        f"if [ -f {shlex.quote(pidfile)} ]; then PID=$(cat {shlex.quote(pidfile)}); "
         "if [ -n \"$PID\" ]; then kill $PID 2>/dev/null || true; "
         "for i in 1 2 3 4 5 6 7 8 9 10; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 0.2; done; "
         "if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null || true; fi; "
         "fi; "
-        f"rm -f {pidfile}; fi"
+        f"rm -f {shlex.quote(pidfile)}; fi"
     )
     if remote:
-        run_remote_cmd(stop_cmd, CLIENT_IP, ignore_error=True)
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_pidfile = os.path.join(remote_tmp, 'pids', f"bench_{scene}.pid")
+        remote_stop_cmd = (
+            f"if [ -f {shlex.quote(remote_pidfile)} ]; then PID=$(cat {shlex.quote(remote_pidfile)}); "
+            "if [ -n \"$PID\" ]; then kill $PID 2>/dev/null || true; "
+            "for i in 1 2 3 4 5 6 7 8 9 10; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 0.2; done; "
+            "if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null || true; fi; "
+            "fi; "
+            f"rm -f {shlex.quote(remote_pidfile)}; fi"
+        )
+        run_remote_cmd(remote_stop_cmd, CLIENT_IP, ignore_error=True)
     else:
         run_cmd(stop_cmd, ignore_error=True)
 
 
-def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_index: int, bench_duration: int = 600, bench_threads: int = 2, apply_network: bool = True, bench_host: Optional[str] = None):
+def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_index: int, bench_duration: int = 600, bench_threads: int = 2, apply_network: bool = True, bench_host: Optional[str] = None, bench_dataset: Optional[str] = None, bench_files: Optional[str] = None):
     print(f"[mig] preparing migration for scene={scene} run={run_index} exp={exp_name}")
     destination_prepare_migration(scene, port)
     source_prepare_migration(scene, port)
@@ -1801,15 +2918,27 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
         return
 
     bench_remote = bool(CLIENT_IP and CLIENT_IP != SOURCE_IP)
+    # Resolve bench host: prefer explicit bench_host; for remote clients, default to VIP so
+    # load generators target the virtual IP (required for VIP transfer testing).
+    resolved_bench_host = bench_host if bench_host is not None else (VIP if bench_remote else SOURCE_IP)
+    print(f"[bench] resolved bench host: {resolved_bench_host}")
+
+    # If the bench targets the VIP, ensure the VIP is present on the source before starting the bench.
+    if resolved_bench_host == VIP:
+        if not ensure_vip_on_source():
+            raise RuntimeError("VIP not present on source and could not be restored; aborting run")
+
     pidfile = start_bench_background(
         scene,
         port,
-        host=bench_host or SOURCE_IP,
+        host=resolved_bench_host,
         duration=bench_duration,
         threads=bench_threads,
         remote=bench_remote,
         exp_name=exp_name,
         run_index=run_index,
+        bench_dataset=bench_dataset,
+        bench_files=bench_files,
     )
 
     if apply_network:
@@ -1818,11 +2947,56 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
         except Exception as e:
             print(f"[net] configure_network error: {e}")
 
-    time.sleep(10)
+    # Wait a randomized ramp-up time (bench runs 20-30s before migration starts)
+    try:
+        delay_secs = random.uniform(12.0, 16.0)
+        print(f"[mig] waiting {delay_secs:.1f}s before starting migration to let bench ramp up")
+        time.sleep(delay_secs)
+    except Exception:
+        # Fallback minimal wait
+        time.sleep(10)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     source_script_path = os.path.join(script_dir, SOURCE_SCRIPT)
     is_local_run = SOURCE_IP in LOCAL_HOSTS and DEST_IP in LOCAL_HOSTS
 
+    # Determine whether we should include the --shell-job flag based on the destination bundle's config
+    try:
+        needs_console = False
+        cfg_path = f"/runc/containers/{scene}/config.json"
+        if DEST_IP in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+            try:
+                cfg = json.load(open(cfg_path))
+                needs_console = bool(cfg.get('process', {}).get('terminal', False))
+            except Exception:
+                needs_console = False
+        else:
+            probe_cmd = (
+                "python3 - <<'PY'\n"
+                "import json\n"
+                f"cfg='{cfg_path}'\n"
+                "try:\n"
+                "    data=json.load(open(cfg))\n"
+                "    print(bool(data.get('process', {}).get('terminal', False)))\n"
+                "except Exception:\n"
+                "    print(False)\n"
+                "PY"
+            )
+            try:
+                res = run_remote_cmd(probe_cmd, DEST_IP, ignore_error=True, quiet=True)
+                out = (getattr(res, 'stdout', '') or '').strip().lower()
+                needs_console = out.startswith('true')
+            except Exception:
+                needs_console = False
+    except Exception:
+        needs_console = False
+
+    # Remove the --shell-job flag when the bundle doesn't require a console
+    if not needs_console:
+        parts = shlex.split(exp_args)
+        parts = [p for p in parts if p != '--shell-job']
+        exp_args = ' '.join(parts)
+
+    # Pass BANDWIDTH to the source script only for local-loopback runs (used for migration-local simulations).
     cmd_list = [sys.executable, source_script_path]
     if is_local_run:
         cmd_list += ["--bandwidth", BANDWIDTH]
@@ -1831,54 +3005,98 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
         cmd_list.append('--file-locks')
     cmd_list += [scene, DEST_IP]
     print("[mig] Running migration:", " ".join(cmd_list))
-    result = run_cmd(cmd_list, quiet=True, cwd=script_dir)
-    stdout = getattr(result, 'stdout', '') or ''
-    if stdout:
-        print(stdout.rstrip())
-    header = None
-    stats = None
-    params = []
-    metrics_dict = None
-    try:
-        header, stats, params = extract_stats_from_output(stdout)
-        if header and stats:
-            keys = header.split("\t")
-            vals = stats.split("\t")
-            metrics_dict = {k: v for k, v in zip(keys, vals)}
-        if stats:
-            params_summary = f"exp: {exp_args} | scene={scene}"
-            append_result(
-                exp_name,
-                scene,
-                run_index,
-                stats,
-                header,
-                params_summary,
-                is_secure=SEC_MODE,
-                extra_param_lines=params,
-                first_in_run=(run_index == 1),
-                results_dir=get_run_dir(),
-            )
-            print(f"[mig] wrote stats for {exp_name} run {run_index}")
-    except Exception as e:
-        print(f"[mig] failed to write stats: {e}")
 
-    stop_bench_background(scene, remote=bench_remote)
-    source_clean_migration(scene)
-    destination_clean_migration(scene)
-    if apply_network:
-        clean_configure_network()
-
-    return {
-        "header": header,
-        "stats": stats,
-        "params": params,
-        "metrics": metrics_dict,
-        "stdout": stdout,
+    # Ensure cleanup always runs even if the migration run raises/returns early
+    run_result_payload = {
+        "header": None,
+        "stats": None,
+        "params": [],
+        "metrics": None,
+        "stdout": "",
     }
 
+    try:
+        try:
+            result = run_cmd(cmd_list, quiet=True, cwd=script_dir)
+            stdout = getattr(result, 'stdout', '') or ''
+        except Exception as exc:
+            print(f"[mig] migration command failed: {exc}")
+            # If run_cmd raised SystemExit inside, this will be handled by outer exception flow
+            stdout = getattr(exc, 'stdout', '') or ''
+            result = None
 
-def run_migration_local_once(scene: str, port: int, exp_args: str, exp_name: str, run_index: int, bench_duration: int = 600, bench_threads: int = 2):
+        if stdout:
+            print(stdout.rstrip())
+
+        header = None
+        stats = None
+        params = []
+        metrics_dict = None
+        try:
+            header, stats, params = extract_stats_from_output(stdout)
+            if header and stats:
+                keys = header.split("\t")
+                vals = stats.split("\t")
+                metrics_dict = {k: v for k, v in zip(keys, vals)}
+            if stats:
+                params_summary = f"exp: {exp_args} | scene={scene}"
+                append_result(
+                    exp_name,
+                    scene,
+                    run_index,
+                    stats,
+                    header,
+                    params_summary,
+                    is_secure=SEC_MODE,
+                    extra_param_lines=params,
+                    first_in_run=(run_index == 1),
+                    results_dir=get_run_dir(),
+                )
+                print(f"[mig] wrote stats for {exp_name} run {run_index}")
+        except Exception as e:
+            print(f"[mig] failed to write stats: {e}")
+
+        # Populate run_result_payload for return
+        run_result_payload["header"] = header
+        run_result_payload["stats"] = stats
+        run_result_payload["params"] = params
+        run_result_payload["metrics"] = metrics_dict
+        run_result_payload["stdout"] = stdout
+
+    finally:
+        # Always attempt to stop bench, clean source/destination and reset network
+        try:
+            stop_bench_background(scene, remote=bench_remote)
+        except Exception as e:
+            print(f"[clean] stop_bench_background failed: {e}")
+        # Attempt to fetch remote bench metrics so results are available locally
+        try:
+            if bench_remote:
+                fetched = fetch_remote_workload_metrics(scene, exp_name, run_index, remote_host=CLIENT_IP)
+                if fetched:
+                    run_result_payload.setdefault('fetched_bench_files', []).extend(fetched)
+                else:
+                    run_result_payload.setdefault('warnings', []).append('bench_metrics_not_fetched')
+        except Exception as e:
+            print(f"[bench] fetch_remote_workload_metrics failed: {e}")
+        try:
+            source_clean_migration(scene)
+        except Exception as e:
+            print(f"[clean] source_clean_migration failed: {e}")
+        try:
+            destination_clean_migration(scene)
+        except Exception as e:
+            print(f"[clean] destination_clean_migration failed: {e}")
+        if apply_network:
+            try:
+                clean_configure_network()
+            except Exception as e:
+                print(f"[clean] clean_configure_network failed: {e}")
+
+    return run_result_payload
+
+
+def run_migration_local_once(scene: str, port: int, exp_args: str, exp_name: str, run_index: int, bench_duration: int = 600, bench_threads: int = 2, apply_network: bool = False):
     global SOURCE_IP, DEST_IP, CLIENT_IP
 
     prev_source, prev_dest, prev_client = SOURCE_IP, DEST_IP, CLIENT_IP
@@ -1892,8 +3110,10 @@ def run_migration_local_once(scene: str, port: int, exp_args: str, exp_name: str
             run_index,
             bench_duration=bench_duration,
             bench_threads=bench_threads,
-            apply_network=False,
+            apply_network=apply_network,
             bench_host=DEFAULT_HOST,
+            bench_dataset=BENCH_DATASET,
+            bench_files=BENCH_FILES,
         )
     finally:
         SOURCE_IP, DEST_IP, CLIENT_IP = prev_source, prev_dest, prev_client
@@ -1973,7 +3193,6 @@ def create_baseline(bundle_path: Optional[str], scene: str):
 def stop_and_clean(container: Optional[str], bundle_path: Optional[str], scene: str):
     # Attempt to stop and remove the container robustly, then clean tmp artifacts
     if container:
-        run_cmd(f"runc kill {shlex.quote(container)}", ignore_error=True, quiet=True)
         run_cmd(f"runc kill {shlex.quote(container)} KILL", ignore_error=True, quiet=True)
         run_cmd(f"runc delete {shlex.quote(container)}", ignore_error=True, quiet=True)
         ensure_deleted(container)
@@ -1996,7 +3215,7 @@ def stop_and_clean(container: Optional[str], bundle_path: Optional[str], scene: 
     run_cmd("ps aux | grep recvtty | grep -v grep | awk '{print $2}' | xargs -r kill -9", ignore_error=True, quiet=True)
 
 
-def run_scene(scene: str, start_port: int, collect_baseline: bool, skip_bench: bool, keep_containers: bool, local: bool = False, bandwidth: str = '50mbit', simulate_transfer: bool = False):
+def run_scene(scene: str, start_port: int, collect_baseline: bool, keep_containers: bool, local: bool = False, bandwidth: str = '50mbit', simulate_transfer: bool = False):
     global KEEP_RUNNING
     # If user didn't explicitly override start_port (default 8080), prefer per-scene default_port when available
     info = SCENE_INFO.get(scene, {})
@@ -2017,9 +3236,7 @@ def run_scene(scene: str, start_port: int, collect_baseline: bool, skip_bench: b
         smoke_ok = run_smoke(container, scene, port)
         if not smoke_ok:
             print(f"[run] {scene} smoke failed")
-        bench = None
-        if not skip_bench:
-            bench = run_bench(scene, port)
+        bench = run_bench(scene, port)
         arr = collect_results(bundle_path, scene, 0)
 
         # Local-mode simulation: pre-dump/dump/transfer/restore (simulated)
@@ -2067,6 +3284,7 @@ def run_scene(scene: str, start_port: int, collect_baseline: bool, skip_bench: b
 
 def main():
     global SOURCE_IP, DEST_IP, CLIENT_IP, SOURCE_SCRIPT, DEST_SCRIPT, SEC_MODE, BANDWIDTH
+    global KEEP_RUNNING
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--scenes', default='all')
@@ -2075,20 +3293,22 @@ def main():
     parser.add_argument('--clean-first', action='store_true')
     parser.add_argument('--collect-baseline', action='store_true')
     parser.add_argument('--keep-containers', action='store_true')
-    parser.add_argument('--skip-bench', action='store_true')
     parser.add_argument('--local', action='store_true', help='Run in local simulation mode (simulate pre-dump/transfer/restore)')
     parser.add_argument('--bandwidth', default='50mbit', help='Bandwidth to simulate in local mode or network shaping (e.g., 50mbit)')
     parser.add_argument('--simulate-transfer', action='store_true', help='If set, actually sleep to simulate transfer times')
-    parser.add_argument('--mode', choices=['smoke', 'migration', 'migration-local'], default='smoke', help='smoke: existing bench/start; migration: run source/destination hot migration; migration-local: run hot migration locally without ssh')
+    parser.add_argument('--mode', choices=['smoke', 'migration', 'migration-local'], default='smoke', help='smoke: existing bench/start; migration: run source/destination live-migration; migration-local: run live-migration locally without ssh')
     parser.add_argument('--experiment-types', default='pre-copy', help='Comma-separated experiment types (pre-copy, pre-copy-dirtymap, post-copy, hybrid, hybrid-dirtymap) for migration mode')
     parser.add_argument('--sec', action='store_true', help='Use secure source/destination scripts (source-sec.py/destination-sec.py)')
     parser.add_argument('--source-ip', default=SOURCE_IP)
     parser.add_argument('--dest-ip', default=DEST_IP)
     parser.add_argument('--client-ip', default=CLIENT_IP)
     parser.add_argument('--bench-host', default=None, help='Override bench target host (default SOURCE_IP)')
+    parser.add_argument('--bench-dataset', default=None, help='Optional dataset path to pass to benches via --dataset (default: do not pass, let bench choose)')
+    parser.add_argument('--bench-files', default=None, help='Optional comma-separated file(s) to pass to benches via --file/--files or --pairs for aeneas (default: do not pass)')
     parser.add_argument('--bench-duration', type=int, default=600, help='Bench duration for migration mode background load')
     parser.add_argument('--bench-threads', type=int, default=2, help='Bench threads/concurrency for migration mode background load')
     parser.add_argument('--skip-network-shaping', action='store_true', help='Skip tc shaping during migration mode')
+    parser.add_argument('--stop-on-error', action='store_true', help='Stop the full test run on first error (default: continue)')
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
@@ -2097,6 +3317,10 @@ def main():
     BANDWIDTH = args.bandwidth
     SEC_MODE = bool(args.sec)
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(SEC_MODE)
+    # apply optional bench overrides
+    global BENCH_DATASET, BENCH_FILES
+    BENCH_DATASET = getattr(args, 'bench_dataset', None)
+    BENCH_FILES = getattr(args, 'bench_files', None)
     ensure_dirs()
 
     if args.mode != 'migration-local':
@@ -2119,7 +3343,7 @@ def main():
 
     port = args.start_port
 
-    # Migration mode (hot migration aligned with redis/influx flows)
+    # Migration mode (live-migration aligned with redis/influx flows)
     if args.mode == 'migration':
         exp_list = []
         if args.experiment_types:
@@ -2132,6 +3356,17 @@ def main():
             if not exp_args:
                 print(f"[mig] unknown experiment type {exp_name}, skipping")
                 continue
+
+            # Ensure VIP is present on source at the start of this experiment
+            try:
+                if not ensure_vip_on_source():
+                    print(f"[vip] failed to ensure VIP on source before experiment {exp_name}; aborting further experiments")
+                    KEEP_RUNNING = False
+                    break
+            except Exception as e:
+                print(f"[vip] ensure_vip_on_source error at experiment start: {e}")
+                KEEP_RUNNING = False
+                break
             for scene in scenes:
                 scene_info = SCENE_INFO.get(scene, {})
                 scene_metrics = []
@@ -2142,18 +3377,112 @@ def main():
                     print(f"--- MIGRATION {scene} (run {r+1}) exp={exp_name} ---")
                     safe_clean_all(quiet=True)
                     clean_configure_network()
-                    mig_data = run_migration_once(
-                        scene,
-                        run_port,
-                        exp_args,
-                        exp_name,
-                        r + 1,
-                        bench_duration=args.bench_duration,
-                        bench_threads=args.bench_threads,
-                        apply_network=not args.skip_network_shaping,
-                        bench_host=args.bench_host,
-                    )
-                    run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': True}
+
+                    # Pre-run: ensure no leftover bench/container on remote target or local source.
+                    bench_remote_pre = bool(args.client_ip and args.client_ip != args.source_ip)
+                    try:
+                        # stop any leftover bench from previous runs
+                        stop_bench_background(scene, remote=bench_remote_pre)
+                    except Exception as e:
+                        print(f"[pre-run] warning: stop_bench_background failed: {e}")
+                    try:
+                        # aggressively ensure destination is cleaned on remote
+                        destination_clean_migration(scene)
+                    except Exception as e:
+                        print(f"[pre-run] warning: destination_clean_migration failed: {e}")
+                    try:
+                        # ensure source is clean too
+                        source_clean_migration(scene)
+                    except Exception as e:
+                        print(f"[pre-run] warning: source_clean_migration failed: {e}")
+
+                    # small delay to let remote cleanup settle
+                    time.sleep(0.5)
+
+                    mig_data = None
+                    run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': False}
+                    try:
+                        mig_data = run_migration_once(
+                            scene,
+                            run_port,
+                            exp_args,
+                            exp_name,
+                            r + 1,
+                            bench_duration=args.bench_duration,
+                            bench_threads=args.bench_threads,
+                            apply_network=not args.skip_network_shaping,
+                            bench_host=args.bench_host,
+                            bench_dataset=getattr(args, 'bench_dataset', None),
+                            bench_files=getattr(args, 'bench_files', None),
+                        )
+                        run_result['ok'] = True
+                    except Exception as _e:
+                        # Record the failure but continue to next run/scene; collect diagnostics and clean up
+                        tb = _traceback.format_exc()
+                        print(f"[mig] scene {scene} run {r+1} failed: {_e}", file=sys.stderr)
+                        run_result['error'] = str(_e)
+                        run_result['error_trace'] = tb
+
+                        # Collect diagnostics (local + remote when available)
+                        try:
+                            diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                            run_result['error_files'] = diag_files
+                        except Exception as _d_e:
+                            print(f"[mig] diagnostics collection failed: {_d_e}", file=sys.stderr)
+                        # Attempt to fetch bench metrics from client if bench was remote
+                        try:
+                            if bench_remote_pre:
+                                fetched = fetch_remote_workload_metrics(scene, exp_name, r + 1, remote_host=CLIENT_IP)
+                                if fetched:
+                                    run_result.setdefault('fetched_bench_files', []).extend(fetched)
+                        except Exception as _f_e:
+                            print(f"[bench] fetch failed during exception handling: {_f_e}")
+
+                        # Persist a per-run error file into results/errors
+                        try:
+                            errpath = write_run_error_file(run_result, scene, r + 1, exp_name)
+                            if errpath:
+                                run_result['error_file'] = errpath
+                        except Exception:
+                            pass
+
+                        # Ensure robust cleanup before next run
+                        try:
+                            stop_bench_background(scene, remote=bench_remote)
+                        except Exception:
+                            pass
+                        try:
+                            destination_clean_migration(scene)
+                        except Exception:
+                            pass
+                        try:
+                            source_clean_migration(scene)
+                        except Exception:
+                            pass
+                        try:
+                            safe_clean_all(quiet=True)
+                        except Exception:
+                            pass
+
+                        # Attempt to restore VIP back to source even when a run failed
+                        try:
+                            ok_vip_fail = ensure_vip_on_source()
+                            run_result['vip_restored'] = bool(ok_vip_fail)
+                            if not ok_vip_fail:
+                                print(f"[vip] warning: failed to restore VIP to source after failed run {r+1} for {scene}")
+                                run_result.setdefault('warnings', []).append('vip_not_restored_after_failure')
+                        except Exception as _e:
+                            print(f"[vip] ensure_vip_on_source failed during exception handling: {_e}")
+                            try:
+                                run_result['vip_restored'] = False
+                            except Exception:
+                                pass
+
+                        # Honor user preference to stop on first error
+                        if getattr(args, 'stop_on_error', False):
+                            print("[mig] stop-on-error requested: aborting further runs")
+                            KEEP_RUNNING = False
+                            break
                     if mig_data:
                         if mig_data.get('metrics'):
                             run_result['metrics'] = mig_data['metrics']
@@ -2164,6 +3493,31 @@ def main():
                             run_result['metrics_values'] = mig_data['stats']
                         if mig_data.get('params'):
                             run_result['metric_params'] = mig_data['params']
+
+                    # Post-run: ensure VIP is restored/held on the source and capture diagnostics if not
+                    try:
+                        ok_vip_after = ensure_vip_on_source()
+                        run_result['vip_restored'] = bool(ok_vip_after)
+                        if not ok_vip_after:
+                            print(f"[vip] warning: VIP not restored to source after run {r+1} for {scene}")
+                            run_result.setdefault('warnings', []).append('vip_not_restored_after_run')
+                            try:
+                                diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                                if diag_files:
+                                    run_result.setdefault('error_files', []).extend(diag_files)
+                            except Exception as _e:
+                                print(f"[vip] collect_run_diagnostics failed: {_e}")
+                            if getattr(args, 'stop_on_error', False):
+                                print("[vip] stop-on-error requested due to VIP restore failure: aborting further runs")
+                                KEEP_RUNNING = False
+                                break
+                    except Exception as e:
+                        print(f"[vip] ensure_vip_on_source raised unexpected error: {e}")
+                        try:
+                            run_result['vip_restored'] = False
+                        except Exception:
+                            pass
+
                     results.append(run_result)
                     write_run_record('migration', scene, exp_name, r + 1, run_result)
                     port = run_port + 1
@@ -2199,6 +3553,16 @@ def main():
                     continue
                 for scene in scenes:
                     scene_info = SCENE_INFO.get(scene, {})
+                    # Ensure VIP present on source before running experiments for this scene
+                    try:
+                        if not ensure_vip_on_source():
+                            print(f"[vip] failed to ensure VIP on source before running scene {scene}; aborting further runs")
+                            KEEP_RUNNING = False
+                            break
+                    except Exception as e:
+                        print(f"[vip] ensure_vip_on_source error: {e}")
+                        KEEP_RUNNING = False
+                        break
                     scene_metrics = []
                     for r in range(args.runs):
                         if not KEEP_RUNNING:
@@ -2206,16 +3570,54 @@ def main():
                         run_port = port if args.start_port != 8080 else scene_info.get('default_port', port)
                         print(f"--- MIGRATION-LOCAL {scene} (run {r+1}) exp={exp_name} ---")
                         safe_clean_all(quiet=True)
-                        mig_data = run_migration_local_once(
-                            scene,
-                            run_port,
-                            exp_args,
-                            exp_name,
-                            r + 1,
-                            bench_duration=args.bench_duration,
-                            bench_threads=args.bench_threads,
-                        )
-                        run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': True}
+                        mig_data = None
+                        run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': False}
+
+                        # If the experiment includes post-copy, we do not support running
+                        # post-copy locally. Skip and mark the run as skipped so the
+                        # summary reflects that the experiment was intentionally not run.
+                        tokens = shlex.split(exp_args or "")
+                        if any(t in ("-post", "--post") for t in tokens):
+                            print(f"[mig-local] experiment {exp_name!r} includes post-copy; skipping local run for scene {scene}")
+                            run_result['skipped'] = 'post-copy not supported in migration-local mode'
+                        else:
+                            try:
+                                mig_data = run_migration_local_once(
+                                    scene,
+                                    run_port,
+                                    exp_args,
+                                    exp_name,
+                                    r + 1,
+                                    bench_duration=args.bench_duration,
+                                    bench_threads=args.bench_threads,
+                                    apply_network=not args.skip_network_shaping,
+                                )
+                                run_result['ok'] = True
+                            except Exception as _e:
+                                tb = _traceback.format_exc()
+                                print(f"[mig-local] scene {scene} run {r+1} failed: {_e}", file=sys.stderr)
+                                run_result['error'] = str(_e)
+                                run_result['error_trace'] = tb
+                                try:
+                                    diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=None, client_ip=None)
+                                    run_result['error_files'] = diag_files
+                                except Exception as _d_e:
+                                    print(f"[mig-local] diagnostics collection failed: {_d_e}", file=sys.stderr)
+                                try:
+                                    errpath = write_run_error_file(run_result, scene, r + 1, exp_name)
+                                    if errpath:
+                                        run_result['error_file'] = errpath
+                                except Exception:
+                                    pass
+                                # cleanup
+                                try:
+                                    safe_clean_all(quiet=True)
+                                except Exception:
+                                    pass
+                                if getattr(args, 'stop_on_error', False):
+                                    print("[mig-local] stop-on-error requested: aborting further runs")
+                                    KEEP_RUNNING = False
+                                    break
                         if mig_data:
                             if mig_data.get('metrics'):
                                 run_result['metrics'] = mig_data['metrics']
@@ -2254,8 +3656,32 @@ def main():
             print(f"--- Testing {scene} (run {r}) ---")
             # ensure fresh state
             safe_clean_all()
-            ok = run_scene(scene, port, args.collect_baseline, args.skip_bench, args.keep_containers, local=args.local, bandwidth=args.bandwidth, simulate_transfer=args.simulate_transfer)
-            run_result = {'scene': scene, 'run': r, 'ok': ok}
+            try:
+                ok = run_scene(scene, port, args.collect_baseline, args.keep_containers, local=args.local, bandwidth=args.bandwidth, simulate_transfer=args.simulate_transfer)
+                run_result = {'scene': scene, 'run': r + 1, 'ok': ok}
+            except Exception as _e:
+                tb = _traceback.format_exc()
+                print(f"[smoke] scene {scene} run {r} failed: {_e}", file=sys.stderr)
+                run_result = {'scene': scene, 'run': r + 1, 'ok': False, 'error': str(_e), 'error_trace': tb}
+                try:
+                    diag_files = collect_run_diagnostics(scene, r + 1, 'smoke', dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                    run_result['error_files'] = diag_files
+                except Exception as _d_e:
+                    print(f"[smoke] diagnostics collection failed: {_d_e}", file=sys.stderr)
+                try:
+                    errpath = write_run_error_file(run_result, scene, r + 1, 'smoke')
+                    if errpath:
+                        run_result['error_file'] = errpath
+                except Exception:
+                    pass
+                try:
+                    safe_clean_all(quiet=True)
+                except Exception:
+                    pass
+                if getattr(args, 'stop_on_error', False):
+                    print("[smoke] stop-on-error requested: aborting further runs")
+                    KEEP_RUNNING = False
+                    break
             results.append(run_result)
             write_run_record('smoke', scene, None, r + 1, run_result)
             port += 1

@@ -464,7 +464,7 @@ def main():
     parser.add_argument('--frontend-url', dest='frontend_url', default=None, help='Optional HTTP frontend URL to route requests through')
     parser.add_argument('--dataset', default=None, help='Path to dataset directory (default: repo datasets/)')
     parser.add_argument('--devices', type=int, default=50, help='设备数量')
-    parser.add_argument('--sampling-rate', type=float, default=10.0, help='采样率（Hz）')
+    parser.add_argument('--sampling-rate', type=float, default=50.0, help='采样率（Hz）')
     parser.add_argument('--anomaly-rate', type=float, default=0.05, help='异常触发概率（0-1）')
     parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
     parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
