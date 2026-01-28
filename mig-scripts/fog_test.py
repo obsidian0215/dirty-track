@@ -1648,26 +1648,107 @@ def maybe_block_exec(container, reason='setns'):
         exec_fail_count[container] = 0
 
 def ensure_assets_in_bundle(bundle_path, scene):
-    mapping = {
-        'pocketsphinx':[('/runc/datasets/audio/sample.wav','psphinx.wav')],
-        # use original basenames so container-side /mnt/assets checks match SCENE_INFO asset names
-        'aeneas':[('/runc/datasets/audio/sample.mp3','sample.mp3'),('/runc/datasets/ocr/sample.xhtml','sample.xhtml')],
-        'yolo':[('/runc/datasets/images/dog.jpg','yoloimage.jpg'),('/runc/datasets/images/dog.jpg','dog.jpg')],
-        'video':[('/runc/datasets/images/dog.jpg','dog.jpg')],
-        'gocr':[('/runc/datasets/ocr/images/0001.png','0001.png')],
-        'gzip':[('/runc/datasets/compress/sample.bin','sample.bin')],
-    }
-    if scene not in mapping:
-        return
+    """Ensure canonical assets exist in the bundle's /mnt/assets.
+
+    Handles `gocr` specially by copying all images from /runc/datasets/ocr (supports both flattened and images/ layouts).
+    """
     destdir = os.path.join(bundle_path, 'rootfs', 'mnt', 'assets')
     run_cmd(f"mkdir -p {shlex.quote(destdir)}", quiet=True, ignore_error=True)
-    for src, destname in mapping[scene]:
+
+    # Special-case: place all OCR images into assets (support both /runc/datasets/ocr and /runc/datasets/ocr/images)
+    if scene == 'gocr':
+        src_dir = '/runc/datasets/ocr'
+        cand_dirs = [src_dir, os.path.join(src_dir, 'images')]
+        copied = 0
+        for d in cand_dirs:
+            if os.path.isdir(d):
+                for root, _, files in os.walk(d):
+                    for fn in files:
+                        if fn.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            src = os.path.join(root, fn)
+                            dst = os.path.join(destdir, fn)
+                            run_cmd(f"cp -f {shlex.quote(src)} {shlex.quote(dst)}", quiet=True, ignore_error=True)
+                            run_cmd(f"chmod 644 {shlex.quote(dst)}", quiet=True, ignore_error=True)
+                            copied += 1
+        if copied == 0:
+            print(f"[data] no OCR image files found under {src_dir}, skipping gocr asset copy")
+        return
+
+    # use original basenames so container-side /mnt/assets checks match SCENE_INFO asset names
+    mapping = {
+        'pocketsphinx':[('/runc/datasets/audio/sample.wav','psphinx.wav')],
+        'aeneas':[('/runc/datasets/audio/sample.mp3','sample.mp3')],
+        'yolo':[('/runc/datasets/images/dog.jpg','yoloimage.jpg'),('/runc/datasets/images/dog.jpg','dog.jpg')],
+        'video':[('/runc/datasets/images/dog.jpg','dog.jpg')],
+        'gzip':[('/runc/datasets/compress/sample.bin','sample.bin')],
+    }
+
+    for src, destname in mapping.get(scene, []):
         if os.path.exists(src):
             dst = os.path.join(destdir, destname)
             run_cmd(f"cp -f {shlex.quote(src)} {shlex.quote(dst)}", quiet=True, ignore_error=True)
             run_cmd(f"chmod 644 {shlex.quote(dst)}", quiet=True, ignore_error=True)
         else:
             print(f"[data] missing canonical asset {src} for {scene} - continuing")
+
+def normalize_ocr_dataset(remote_host: str | None = None) -> bool:
+    """Flatten /runc/datasets/ocr/images into /runc/datasets/ocr and remove sample.xhtml.
+
+    Runs locally when `remote_host` is None; otherwise runs the equivalent commands via SSH on `remote_host`.
+    Returns True on success (best-effort), False on failure.
+    """
+    base = '/runc/datasets/ocr'
+    images_dir = os.path.join(base, 'images')
+    # Remote normalization via SSH
+    if remote_host and remote_host not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        try:
+            cmd = (
+                "mkdir -p /runc/datasets/ocr; "
+                "if [ -d /runc/datasets/ocr/images ]; then mv -f /runc/datasets/ocr/images/* /runc/datasets/ocr/ || true; rmdir /runc/datasets/ocr/images 2>/dev/null || true; fi; "
+                "rm -f /runc/datasets/ocr/sample.xhtml || true; "
+                "chmod 644 /runc/datasets/ocr/* 2>/dev/null || true;"
+            )
+            run_remote_cmd(cmd, remote_host, ignore_error=True, quiet=True)
+            print(f"[data] normalized OCR dataset on remote host {remote_host}")
+            return True
+        except Exception as e:
+            print(f"[data] failed to normalize OCR dataset on {remote_host}: {e}")
+            return False
+    # Local normalization
+    try:
+        if os.path.isdir(images_dir):
+            for fn in os.listdir(images_dir):
+                src = os.path.join(images_dir, fn)
+                dst = os.path.join(base, fn)
+                try:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    shutil.move(src, dst)
+                except Exception as e:
+                    print(f"[data] failed to move {src} -> {dst}: {e}")
+            try:
+                os.rmdir(images_dir)
+            except Exception:
+                pass
+        sample = os.path.join(base, 'sample.xhtml')
+        if os.path.exists(sample):
+            try:
+                os.remove(sample)
+                print(f"[data] removed sample.xhtml in {base}")
+            except Exception as e:
+                print(f"[data] failed to remove sample.xhtml: {e}")
+        # fix permissions for images
+        for root, _, files in os.walk(base):
+            for f in files:
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.xhtml')):
+                    try:
+                        os.chmod(os.path.join(root, f), 0o644)
+                    except Exception:
+                        pass
+        return True
+    except Exception as e:
+        print(f"[data] failed to normalize OCR dataset locally: {e}")
+        return False
 
 # ensure cleanup runs at process exit (but don't auto-run when user requested help)
 # If the user passed -h/--help, argparse will print help and exit; avoid running cleanup in that case.
@@ -1799,6 +1880,12 @@ def start_service(scene: str, host: str, port: int):
             bundle_path = alt
     if not os.path.isdir(bundle_path):
         raise RuntimeError(f"missing fog_workloads bundle dir: {bundle_path}")
+
+    # Normalize local OCR dataset layout (flatten images/ and remove sample.xhtml) to satisfy gocr/aeneas expectations
+    try:
+        normalize_ocr_dataset()
+    except Exception:
+        pass
 
     ensure_assets_in_bundle(bundle_path, scene)
     # Verify no persistence misconfigurations
@@ -2795,9 +2882,16 @@ def start_bench_background(scene: str, port: int, host: Optional[str] = None, du
     if backend is None and local_bench:
         backend = detect_backend_from_bench(local_bench)
     raw_out, metrics_out = build_bench_output_paths(scene, exp_name, run_index, backend=backend)
-    if backend == 'jmeter' and remote:
-        print(f"[bench] backend jmeter detected for {scene}; skipping background bench on remote")
-        return None
+    # If remote bench and backend is jmeter: check remote machine has jmeter; if not, fallback to running locally
+    if remote and backend == 'jmeter':
+        try:
+            which_res = run_remote_cmd('which jmeter || true', CLIENT_IP, ignore_error=True, quiet=True)
+            if not (getattr(which_res, 'stdout', '') or '').strip():
+                print(f"[bench] remote jmeter not found on {CLIENT_IP}; running jmeter locally instead")
+                remote = False
+        except Exception:
+            print(f"[bench] failed to detect jmeter on remote {CLIENT_IP}; running locally")
+            remote = False
 
     # If running remotely, prefer to write outputs into the structured remote tmp area
     if remote:
@@ -2805,6 +2899,12 @@ def start_bench_background(scene: str, port: int, host: Optional[str] = None, du
         remote_workdir = os.path.join(remote_tmp, 'workloads', scene)
         remote_raw_out = os.path.join(remote_workdir, os.path.basename(raw_out))
         remote_metrics_out = os.path.join(remote_workdir, os.path.basename(metrics_out))
+        # Normalize remote OCR dataset if needed (gocr)
+        if scene == 'gocr':
+            try:
+                normalize_ocr_dataset(remote_host=CLIENT_IP)
+            except Exception as e:
+                print(f"[data] failed to normalize OCR dataset on remote {CLIENT_IP}: {e}")
         cmd = build_bench_command(
             scene,
             port,

@@ -25,7 +25,7 @@ try:
         _candidate = _os.path.join(_cur, 'common', 'bench_common.py')
         if _os.path.exists(_candidate):
             spec = _importlib_util.spec_from_file_location('bench_common', _candidate)
-            _bench_common = _importlib.util.module_from_spec(spec)
+            _bench_common = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(_bench_common)
             break
         _cur = os.path.dirname(_cur)
