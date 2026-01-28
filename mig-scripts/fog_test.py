@@ -619,7 +619,7 @@ import atexit
 
 # override SCENES with explicit scene-to-bundle/endpoint/asset/bench mapping
 SCENE_INFO = {
-    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/images/0001.png", "bench": None, "persistent": False},
+    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/0001.png", "bench": None, "persistent": False},
     "gzip": {"bundle": "gzip", "endpoint": "/compress", "asset": "/runc/datasets/compress/sample.bin", "bench": None, "persistent": False},  # gzip 为无状态；默认不需要文件锁/持久化
     "yolo": {"bundle": "yolo", "endpoint": "/detect", "asset": "/runc/datasets/images/dog.jpg", "bench": None, "persistent": False},
     "pocketsphinx": {"bundle": "pocketsphinx", "endpoint": "/transcribe", "asset": "/runc/datasets/audio/sample.wav", "bench": None, "persistent": False},
@@ -628,7 +628,7 @@ SCENE_INFO = {
     # Service-level scenes
     "sensoragg": {"bundle": "sensoragg", "endpoint": "/health", "asset": None, "bench": None, "default_port": 8181, "persistent": False},
     "cartelem": {"bundle": "cartelem", "endpoint": "/health", "asset": None, "bench": None, "default_port": 8181, "persistent": False},
-    "ipokemon": {"bundle": "ipokemon", "endpoint": "/", "asset": None, "bench": None, "default_port": 8000, "persistent": False},
+    "ipokemon": {"bundle": "ipokemon", "endpoint": "/", "asset": None, "bench": None, "default_port": 8000, "persistent": True},
     "video": {"bundle": "video", "endpoint": "redis", "asset": "/runc/datasets/images/dog.jpg", "bench": None, "default_port": 6379, "persistent": False, "backend": "redis"},
     "transportation": {"bundle": "transportation", "endpoint": "redis", "asset": None, "bench": None, "default_port": 6379, "persistent": False, "backend": "redis"},
     "industrial": {"bundle": "industrial", "endpoint": "redis", "asset": None, "bench": None, "default_port": 6379, "persistent": False, "backend": "redis"},
@@ -2741,6 +2741,49 @@ def run_bench(scene: str, port: int):
         return None
 
     if os.path.exists(outf):
+        # If metrics JSON was requested, validate it shows at least one successful op
+        if os.path.exists(metrics_out):
+            try:
+                _mj = json.load(open(metrics_out))
+                succ = _mj.get('overall', {}).get('success_ops', 0)
+                if succ <= 0:
+                    print(f"[bench] metrics {metrics_out} reports success_ops={succ}; failing bench")
+                    # attempt to surface container diagnostics when available
+                    try:
+                        if 'gocr' == scene:
+                            # show a few server logs to help triage common gocr issues
+                            l1 = run_cmd(f"runc exec {scene} head -n 50 /tmp/gocr_server.log", quiet=True, ignore_error=True, timeout=3)
+                            print(f"[health-diagn] /tmp/gocr_server.log: {(getattr(l1,'stdout','') or '')[:400]}")
+                    except Exception:
+                        pass
+                    return None
+            except Exception as e:
+                print(f"[bench] failed to parse metrics {metrics_out}: {e}")
+                # Fall through to CSV parsing below
+        # Fallback: inspect CSV for successful status codes (200-399)
+        try:
+            import csv as _csv
+            succ = 0
+            with open(outf, 'r', encoding='utf-8', errors='ignore') as _fh:
+                reader = _csv.reader(_fh)
+                try:
+                    hdr = next(reader)
+                except StopIteration:
+                    hdr = []
+                for row in reader:
+                    if not row:
+                        continue
+                    try:
+                        status = int(row[1]) if len(row) > 1 and row[1] else 0
+                        if 200 <= status < 400:
+                            succ += 1
+                    except Exception:
+                        pass
+            if succ <= 0:
+                print(f"[bench] CSV {outf} indicates 0 successful requests; failing bench")
+                return None
+        except Exception as _e:
+            print(f"[bench] failed to parse CSV {outf}: {_e}")
         return outf
     return None
 
@@ -3423,11 +3466,11 @@ def main():
     BENCH_FILES = getattr(args, 'bench_files', None)
     ensure_dirs()
 
-    if args.mode != 'migration-local':
-        if SOURCE_IP in ('127.0.0.1', 'localhost') or DEST_IP in ('127.0.0.1', 'localhost') or CLIENT_IP in (
-            '127.0.0.1', 'localhost'
-        ):
-            raise SystemExit("Loopback addresses are only allowed in migration-local mode; please provide real host IPs.")
+    # Disallow loopback addresses only for remote migration runs; smoke & migration-local allow loopback.
+    if args.mode == 'migration':
+        loopbacks = ('127.0.0.1', 'localhost', '::1')
+        if SOURCE_IP in loopbacks or DEST_IP in loopbacks or CLIENT_IP in loopbacks:
+            raise SystemExit("Loopback addresses are disallowed in 'migration' mode; please provide real host IPs (or use 'smoke' / 'migration-local').")
 
     if args.clean_first:
         safe_clean_all(quiet=True)

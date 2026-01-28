@@ -263,26 +263,69 @@ def get_lzo_files_size(directory):
 
     return total_size
 
-
-# [新函数结束]
-def final_sync_es_data(dest_ip, rootfs_path):
-    """
-    在 restore 之前，对 data 目录做一次“点名同步”，避免缺失 indices/*/index/*.lock 等深层文件。
-    """
+# File-lock helpers: canonical behavior — final-sync entire rootfs of the container to the destination
+# This is simpler and more robust than per-service special-casing: copy the whole rootfs using rsync
+# with preservation of attributes and in-place updates to avoid CRIU restore inconsistencies.
+def final_sync_rootfs(dest_ip, container):
     import os
     import subprocess
 
-    src_data = os.path.join(rootfs_path, "usr/share/elasticsearch/data") + "/"
-    dst_data = f"root@{dest_ip}:{src_data}"
+    src_container = f"/runc/containers/{container}/rootfs"
+    src_bundle = f"/runc/fog_workloads/{container}/rootfs"
 
-    # 确保目标端父目录存在
-    subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {src_data}'", shell=True, check=False, text=True)
+    if os.path.isdir(src_container):
+        src = src_container
+    elif os.path.isdir(src_bundle):
+        src = src_bundle
+    else:
+        print(f"[file-locks] no rootfs found for container {container}; skipping final sync")
+        return
 
-    # 做一次强同步（参数更稳健：权限/属性/uidgid 就位；inplace 避免重写；delete-delay 降低瞬时空窗）
-    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_data, dst_data]
-    print("[final_sync_es_data] running:", " ".join(cmd))
-    subprocess.check_call(cmd)
+    dst_dir = f"/runc/containers/{container}/rootfs"
 
+    # ensure destination parent exists
+    try:
+        subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {dst_dir}'", shell=True, check=False, text=True)
+    except Exception as e:
+        print(f"[file-locks] warning: failed to ensure dest dir on {dest_ip}: {e}")
+
+    src_arg = src.rstrip('/') + '/'
+    dst = f"root@{dest_ip}:{dst_dir}/"
+    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_arg, dst]
+    print(f"[file-locks] final-sync rootfs {src_arg} -> {dst}")
+    try:
+        subprocess.check_call(cmd)
+    except Exception as e:
+        print(f"[file-locks] rsync rootfs failed: {e}")
+
+
+def handle_file_locks(container, locks=None, dest_ip=None):
+    """Perform a final rootfs sync for the specified container(s) to avoid restore inconsistencies."""
+    import re
+
+    services = set()
+    if not locks:
+        services.add(container)
+    else:
+        for l in locks:
+            if not l:
+                continue
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", l):
+                continue
+            services.add(l)
+
+    if not services:
+        services.add(container)
+
+    for svc in services:
+        if not dest_ip:
+            print(f"[file-locks] missing dest_ip; skipping final sync for {svc}")
+            continue
+        print(f"[file-locks] final-syncing rootfs for {svc} -> {dest_ip}")
+        try:
+            final_sync_rootfs(dest_ip, svc)
+        except Exception as e:
+            print(f"[file-locks] final_sync_rootfs error for {svc}: {e}")
 
 # [tang change]定义全局变量用于累计预拷贝时间和大小
 pre_dump_time_total = 0.0  # 毫秒
@@ -1698,13 +1741,17 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
         #     error()
 
         # infinite rootfs sync
-        # 确保脚本有执行权限
-        if not os.access("./sync_rootfs.sh", os.X_OK):  # 检查是否有执行权限
-            os.chmod("./sync_rootfs.sh", 0o755)  # 添加执行权限
+        # Ensure sync script path is resolved and executable (use absolute path to avoid cwd issues)
+        sync_script = os.path.join(os.path.dirname(__file__), "sync_rootfs.sh")
+        try:
+            if not os.access(sync_script, os.X_OK):
+                os.chmod(sync_script, 0o755)
+        except Exception as e:
+            print(f"[file-locks] warning: failed to ensure executable sync script {sync_script}: {e}")
 
         # 保存日志文件句柄到全局变量
         sync_rootfs_log_file = open(mig_base + "/d_log/sync_rootfs.log", "w")
-        sync_cmd = "./sync_rootfs.sh " + dest + " " + rootfs_path
+        sync_cmd = f"{sync_script} {dest} {rootfs_path}"
 
         # 保存进程对象到全局变量
         sync_rootfs_process = subprocess.Popen(
@@ -1895,12 +1942,10 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     # if replay:
     # todo: 创建转发路由
-    # 只有elastisearch才需要
-    # final_sync_es_data(dest, rootfs_path)
+    # final rootfs synchronization is handled centrally (final_sync_rootfs) before restore
     # one-shot restore with post-copy
     # Build runc_args string for restore command
     runc_args_str = " ".join(runc_args) if runc_args else ""
-    # final_sync_es_data(dest, rootfs_path)
 
     restore_cmd = (
         '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path
@@ -2035,6 +2080,13 @@ parser.add_argument(
     type=str,
     default=None,
     help="(optional) bandwidth limit used by wrappers; ignored by the migration script itself",
+)
+# Optional: allow callers to request per-service file-lock handling (backup/truncate logs, final sync)
+parser.add_argument(
+    "--file-locks",
+    action="store_true",
+    default=False,
+    help="Flag: perform file-lock handling for the current container before migration (backup+truncate known logs).",
 )
 
 # 处理 --tcp-established 和 --shell-job 等criu参数
@@ -2178,6 +2230,16 @@ if __name__ == "__main__":
     container = container_name
     # destination IP is the second argument
     dest = args.dest
+
+    # If requested, handle file-locks (backup/truncate known files or final-sync service data)
+    if getattr(args, 'file_locks', False):
+        try:
+            print(f"[file-locks] requested for container {container}")
+            # call with None to indicate default handling for this container
+            handle_file_locks(container, None, dest)
+        except Exception as _e:
+            print(f"[file-locks] warning: {_e}")
+
     # the Pre and Lazy flags, which are used to determine the migration techniques as follows:
     # Cold = False False
     # Pre-copy = True False

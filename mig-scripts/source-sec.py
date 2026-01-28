@@ -1812,12 +1812,16 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
         # infinite rootfs sync
         # 确保脚本有执行权限
-        if not os.access("./sync_rootfs.sh", os.X_OK):  # 检查是否有执行权限
-            os.chmod("./sync_rootfs.sh", 0o755)  # 添加执行权限
+        sync_script = os.path.join(os.path.dirname(__file__), "sync_rootfs.sh")
+        try:
+            if not os.access(sync_script, os.X_OK):
+                os.chmod(sync_script, 0o755)
+        except Exception as e:
+            print(f"[file-locks] warning: failed to ensure executable sync script {sync_script}: {e}")
 
         # 保存日志文件句柄到全局变量
         sync_rootfs_log_file = open(mig_base + "/d_log/sync_rootfs.log", "w")
-        sync_cmd = "./sync_rootfs.sh " + dest + " " + rootfs_path
+        sync_cmd = f"{sync_script} {dest} {rootfs_path}"
 
         # 保存进程对象到全局变量
         sync_rootfs_process = subprocess.Popen(
@@ -1957,12 +1961,11 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     # if replay:
     # todo: 创建转发路由
-    # 只有elastisearch才需要
-    # final_sync_es_data(dest, rootfs_path)
+    # final rootfs synchronization is handled centrally (final_sync_rootfs) before restore
     # one-shot restore with post-copy
     # Build runc_args string for restore command
     runc_args_str = " ".join(runc_args) if runc_args else ""
-    # final_sync_es_data(dest, rootfs_path)
+    # final rootfs synchronization handled by `final_sync_rootfs(dest, container)` before restore
 
     restore_cmd = (
         '{ "restore" : { "path" : "' + base_path + '", "name" : "' + container + '" , "image_path" : "' + image_path

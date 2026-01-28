@@ -237,6 +237,20 @@ def run_local_bench(bench_path, backend, scene, port, duration=5, container=None
         else:
             cmd = f"python3 {shlex.quote(bench_path)} --url {shlex.quote(url)} --iters 1 --concurrency 1 --dataset {shlex.quote(DATASET)}{out_arg}"
 
+    # Detect whether the bench supports metrics output so we can validate success_ops > 0
+    supports_metrics = False
+    try:
+        bench_sample = open(bench_path, 'r', encoding='utf-8', errors='ignore').read(8192)
+        if '--metrics-out' in bench_sample or 'IntervalMetrics' in bench_sample or 'METRIC_HEADER' in bench_sample:
+            supports_metrics = True
+    except Exception:
+        supports_metrics = False
+
+    metrics_path = None
+    if supports_metrics:
+        metrics_path = f"/tmp/{scene}_bench_{int(time.time())}_metrics.json"
+        cmd = cmd + f" --metrics-out {shlex.quote(metrics_path)} --metrics-interval 1.0"
+
     print(f"[bench-run] {cmd}")
     try:
         r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=duration*6)
@@ -245,9 +259,54 @@ def run_local_bench(bench_path, backend, scene, port, duration=5, container=None
         return False, None
 
     ok = r.returncode == 0
+
+    # If bench produced a metrics JSON, inspect it for any successful ops
+    if metrics_path and os.path.exists(metrics_path):
+        try:
+            import json as _json
+            mj = _json.load(open(metrics_path))
+            succ_ops = mj.get('overall', {}).get('success_ops', 0)
+            if succ_ops <= 0:
+                print(f"[bench-run] metrics file {metrics_path} indicates success_ops=={succ_ops}; marking bench as FAILED")
+                # Print brief diagnostics for debugging
+                try:
+                    print(f"[bench-run] stdout: {(r.stdout or b'').decode('utf-8', errors='ignore')[:400]}")
+                except Exception:
+                    pass
+                return False, out if os.path.exists(out) else None
+            return True, out if os.path.exists(out) else None
+        except Exception as _e:
+            print(f"[bench-run] failed to parse metrics file {metrics_path}: {_e}")
+
     # if out exists consider it success (some benches write CSV)
     if os.path.exists(out):
-        return True, out
+        # Fallback: parse CSV and ensure at least one success status (200-399)
+        try:
+            import csv as _csv
+            succ = 0
+            with open(out, 'r', encoding='utf-8', errors='ignore') as _fh:
+                reader = _csv.reader(_fh)
+                try:
+                    hdr = next(reader)
+                except StopIteration:
+                    hdr = []
+                for row in reader:
+                    if not row:
+                        continue
+                    try:
+                        status = int(row[1]) if len(row) > 1 and row[1] else 0
+                        if 200 <= status < 400:
+                            succ += 1
+                    except Exception:
+                        pass
+            if succ <= 0:
+                print(f"[bench-run] CSV {out} indicates 0 successful requests; marking bench as FAILED")
+                return False, out
+            return True, out
+        except Exception as _e:
+            print(f"[bench-run] failed to parse CSV {out}: {_e}")
+            return True, out
+
     # also consider stdout containing metrics
     sout = (r.stdout or b'').decode('utf-8', errors='ignore')
     if 'METRIC' in sout or 'METRIC_HEADER' in sout:

@@ -185,15 +185,30 @@ if bench_common and metrics:
         pass
 
 
+def _resolve_ocr_url(url: str) -> str:
+    """Return a proper /ocr endpoint for the provided URL.
+
+    Accept either a base URL (e.g. http://127.0.0.1:8080) or a full endpoint
+    (e.g. http://127.0.0.1:8080/ocr) and normalize to a single endpoint value.
+    """
+    if not url:
+        return url
+    u = url.rstrip('/')
+    if u.endswith('/ocr'):
+        return u
+    return u + '/ocr'
+
+
 def worker_duration(url, end_time):
     sess = requests.Session()
+    target = _resolve_ocr_url(url)
     while time.time() < end_time:
         rl.acquire()
         payload = get_next_payload()
         start = time.monotonic()
         try:
             files = {'file': ('img.png', payload, 'image/png')}
-            r = sess.post(url.rstrip('/') + '/ocr', files=files, timeout=30)
+            r = sess.post(target, files=files, timeout=30)
             status = r.status_code
         except Exception as e:
             status = None
@@ -206,12 +221,13 @@ def worker_duration(url, end_time):
 
 def worker_requests(url, total_requests):
     sess = requests.Session()
+    target = _resolve_ocr_url(url)
     for _ in range(total_requests):
         payload = random.choice(inputs)
         start = time.monotonic()
         try:
             files = {'file': ('img.png', payload, 'image/png')}
-            r = sess.post(url.rstrip('/') + '/ocr', files=files, timeout=30)
+            r = sess.post(target, files=files, timeout=30)
             status = r.status_code
         except Exception as e:
             status = None
