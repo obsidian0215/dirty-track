@@ -4,6 +4,7 @@ from fcntl import ioctl
 import psutil
 import struct
 import time
+import errno
 
 # 定义字符设备路径
 DEVICE_PATH = '/dev/dirty-track'
@@ -71,10 +72,15 @@ def ioctl_set_dirty_map_path(device_fd, path):
 
 def ioctl_start_pid(device_fd, pid):
     """通过ioctl启动指定进程的脏页跟踪"""
-    # pid_t 在 Python 中可以用 struct.pack 来打包
     buf = bytearray(struct.pack('I', pid))
-    ioctl(device_fd, IOCTL_START_PID, buf)
-    ret = struct.unpack_from('I', buf)[0]
+    try:
+        ioctl(device_fd, IOCTL_START_PID, buf)
+        return True
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.ESRCH, errno.EINVAL):
+            print(f"[dirty-track] ioctl start pid {pid} ignored (errno={e.errno}): {e}")
+            return False
+        raise
 
 def ioctl_stop_pid(device_fd, pid):
     """通过ioctl停止指定进程的脏页跟踪"""
@@ -159,7 +165,7 @@ if __name__ == '__main__':
                     tmpfs_path = os.path.abspath(args.path)
                     mount_cmd = 'mount -t tmpfs none '+ tmpfs_path
                     ret = os.system(mount_cmd)
-                    if ret != 0:   
+                    if ret != 0:
                         raise SystemError(f"无法将{tmpfs_path}装载到tmpfs")
                 else:
                     raise FileNotFoundError(f"找不到设置脏页追踪的目录路径：{args.path}")
@@ -184,19 +190,11 @@ if __name__ == '__main__':
                 # time.sleep(1)
                 # 启动指定容器的脏页跟踪
                 for pid in container_pids:
-                    # time.sleep(1)
-                    ioctl_start_pid(device_fd, pid)
-                    # buffer = bytearray(struct.pack('i', pid))
-                    # # print(type(buffer))
-                    # ioctl(device_fd, IOCTL_START_PID, buffer)
-                    # ret = struct.unpack_from('i', buffer)[0]
-                    # # print("start ret = {0}".format(ret))
-                    # while ret != 0:
-                    #     print("start ret = {0}".format(ret))
-                    #     time.sleep(1)
-                    #     ret = struct.unpack('I', buffer)[0]
-
-                    print(f"启动对容器 {args.container} (PID: {pid}) 的脏页跟踪")
+                    ok = ioctl_start_pid(device_fd, pid)
+                    if ok:
+                        print(f"启动对容器 {args.container} (PID: {pid}) 的脏页跟踪")
+                    else:
+                        print(f"[dirty-track][warn] PID {pid} not trackable (ignored)")
             elif args.action == 'stop':
                 # 停止指定容器的页面跟踪
                 for pid in container_pids:

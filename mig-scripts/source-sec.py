@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import errno
 try:
     # fcntl is POSIX-only (Linux/Unix). Wrap import to allow static analysis on other platforms.
     import fcntl
@@ -173,8 +174,14 @@ def ioctl_set_dirty_map_path(device_fd, path):
 def ioctl_start_pid(device_fd, pid):
     # pid_t在Python中可以用struct.pack来打包
     buf = bytearray(struct.pack("I", pid))
-    ioctl(device_fd, IOCTL_START_PID, buf)
-    # ret = struct.unpack_from('I', buf)[0]
+    try:
+        ioctl(device_fd, IOCTL_START_PID, buf)
+        return True
+    except OSError as e:
+        if e.errno in (errno.EAGAIN, errno.ESRCH, errno.EINVAL):
+            print(f"[dirty-track] ioctl start pid {pid} ignored (errno={e.errno}): {e}")
+            return False
+        raise
 
 
 # 通过ioctl停止指定进程的脏页跟踪
@@ -352,8 +359,15 @@ def signal_handler(signum, frame):
 # 启动所有容器进程的脏页跟踪
 def start_dirty_track(device_fd):
     for pid in container_pids:
-        ioctl_start_pid(device_fd, pid)
-        print(f"启动对PID {pid}的脏页跟踪")
+        try:
+            ok = ioctl_start_pid(device_fd, pid)
+            if ok:
+                print(f"启动对PID {pid}的脏页跟踪")
+            else:
+                print(f"[dirty-track][warn] PID {pid} not trackable (ignored); continuing")
+        except Exception as e:
+            print(f"[dirty-track][error] ioctl start pid {pid} failed: {e}")
+            # continue with other pids
 
 
 # 在pre-dump之间执行dirty-track并获取dirty-map
@@ -363,8 +377,15 @@ def execute_dirty_track(device_fd, first):
     # 启动暂时放入criu中
     if first:
         for pid in container_pids:
-            ioctl_start_pid(device_fd, pid)
-            print(f"启动对PID {pid}的脏页跟踪")
+            try:
+                ok = ioctl_start_pid(device_fd, pid)
+                if ok:
+                    print(f"启动对PID {pid}的脏页跟踪")
+                else:
+                    print(f"[dirty-track][warn] PID {pid} not trackable (ignored); continuing")
+            except Exception as e:
+                print(f"[dirty-track][error] ioctl start pid {pid} failed: {e}")
+                # continue to next pid
 
     # 等待一段时间以收集脏页数据
     time.sleep(0.2)  # 根据实际情况调整等待时间

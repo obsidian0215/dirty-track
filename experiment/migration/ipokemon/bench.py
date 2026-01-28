@@ -20,6 +20,7 @@ parser.add_argument('--threads', '--concurrency', dest='threads', type=int, defa
 parser.add_argument('--host', default='127.0.0.1', help='Target host for JMeter (JMeter -JHOST)')
 parser.add_argument('--port', type=int, default=8000, help='Target port for JMeter (JMeter -JPORT)')
 parser.add_argument('--out', default=None, help='Output JTL file (defaults to ipokemon_<ts>.jtl)')
+parser.add_argument('--jmeter-log', default=None, help='Path to write JMeter jmeter.log (defaults to same dir as --out)')
 parser.add_argument('--metrics-out', default=None, help='Output path for interval metrics (JSON)')
 parser.add_argument('--metrics-interval', type=float, default=1.0, help='Sampling interval seconds (default: 1.0)')
 args = parser.parse_args()
@@ -56,8 +57,23 @@ if not args.out:
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     args.out = f'ipokemon_{ts}.jtl'
 
-cmd = [jmeter, '-n', '-t', args.jmx, f'-JHOST={args.host}', f'-JPORT={int(args.port)}', f'-JDuration={int(args.duration)}', f'-JThreads={int(args.threads)}', '-Jjmeter.save.saveservice.output_format=csv', '-l', args.out]
+# Default jmeter log location: same directory as args.out unless explicitly provided
+if not args.jmeter_log:
+    jdir = os.path.dirname(args.out)
+    if not jdir:
+        jdir = '.'
+    args.jmeter_log = os.path.join(jdir, 'jmeter.log')
+# Ensure parent dir exists
+try:
+    jm_parent = os.path.dirname(args.jmeter_log)
+    if jm_parent:
+        os.makedirs(jm_parent, exist_ok=True)
+except Exception:
+    pass
+
+cmd = [jmeter, '-n', '-t', args.jmx, f'-JHOST={args.host}', f'-JPORT={int(args.port)}', f'-JDuration={int(args.duration)}', f'-JThreads={int(args.threads)}', '-Jjmeter.save.saveservice.output_format=csv', '-j', args.jmeter_log, '-l', args.out]
 print('[bench] running:', ' '.join(cmd))
+print('[bench] jmeter log ->', args.jmeter_log)
 
 
 def _parse_jtl_line(parts, hmap):
@@ -117,14 +133,18 @@ def _tail_jtl_for_metrics(jtl_path, metrics, stop_event, poll_interval=0.2):
 
 
 def _parse_jtl_and_print_metrics(jtl_path, duration):
-    """Parse JMeter JTL (CSV or XML) and print a simple metric summary."""
+    """Parse JMeter JTL (CSV or XML) and print a simple metric summary.
+
+    Returns a metrics dict compatible with IntervalMetrics.to_dict() (overall + samples).
+    """
     import csv
     import xml.etree.ElementTree as ET
     import math
+    import json
 
     if not os.path.exists(jtl_path):
         print('[bench] jtl file not found, no metrics')
-        return
+        return None
     try:
         # Heuristic: XML starts with '<'
         with open(jtl_path, 'r', encoding='utf-8', errors='ignore') as fh:
@@ -132,6 +152,7 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
         latencies = []
         successes = 0
         total = 0
+        timestamps = []
         if start.lstrip().startswith('<'):
             # XML JTL
             for event, elem in ET.iterparse(jtl_path):
@@ -147,6 +168,13 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
                         pass
                     if s is None or str(s).lower() in ('true', '1', 'yes'):
                         successes += 1
+                    # attempt timestamp
+                    ts = elem.attrib.get('ts') or elem.attrib.get('timeStamp') or elem.attrib.get('timestamp')
+                    if ts:
+                        try:
+                            timestamps.append(int(ts))
+                        except Exception:
+                            pass
                     elem.clear()
         else:
             # CSV JTL
@@ -161,6 +189,18 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
                 # Try to find elapsed and success columns
                 elapsed_idx = hmap.get('elapsed') if hmap else None
                 success_idx = hmap.get('success') if hmap else None
+                latency_idx = None
+                # Robust timestamp detection (handle index 0 correctly)
+                ts_idx = None
+                if hmap:
+                    if 'timestamp' in hmap:
+                        ts_idx = hmap['timestamp']
+                    elif 'time' in hmap:
+                        ts_idx = hmap['time']
+                if 'latency' in hmap:
+                    latency_idx = hmap.get('latency')
+                elif 'elapsed' in hmap:
+                    latency_idx = hmap.get('elapsed')
                 # fallback: assume elapsed at index 1
                 if elapsed_idx is None:
                     elapsed_idx = 1
@@ -169,7 +209,7 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
                         continue
                     total += 1
                     try:
-                        val = row[elapsed_idx]
+                        val = row[latency_idx] if latency_idx is not None else row[elapsed_idx]
                         latencies.append(int(float(val)))
                     except Exception:
                         pass
@@ -178,6 +218,11 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
                             s = row[success_idx]
                             if str(s).lower() in ('true', '1', 'yes'):
                                 successes += 1
+                        except Exception:
+                            pass
+                    if ts_idx is not None and ts_idx < len(row):
+                        try:
+                            timestamps.append(int(row[ts_idx]))
                         except Exception:
                             pass
                 if success_idx is None:
@@ -197,11 +242,56 @@ def _parse_jtl_and_print_metrics(jtl_path, duration):
             p95 = pct(95)
         else:
             avg_lat = p50 = p95 = 0
-        ops_per_sec = successes / max(1, int(duration))
+
+        # compute total duration from timestamps (ms) if available
+        total_duration = None
+        if timestamps:
+            try:
+                total_duration = (max(timestamps) - min(timestamps)) / 1000.0
+            except Exception:
+                total_duration = None
+        if total_duration is None or total_duration <= 0:
+            # Prefer the provided duration when sensible; otherwise fall back to 1.0s minimum
+            if duration and float(duration) > 0:
+                total_duration = float(duration)
+            else:
+                total_duration = max(1.0, float(duration or 1.0))
+
+        # Use float division to avoid integer truncation for small durations
+        ops_per_sec = float(successes) / max(1e-6, float(total_duration))
         print('METRIC_HEADER\tavg_latency_ms\tp50_ms\tp95_ms\tops_per_sec\ttotal_success')
         print(f"METRIC\t{avg_lat:.3f}\t{int(p50)}\t{int(p95)}\t{ops_per_sec:.3f}\t{int(successes)}")
+
+        # build canonical metrics dict compatible with IntervalMetrics
+        overall = {
+            'total_ops': total,
+            'success_ops': successes,
+            'throughput_ops_sec': ops_per_sec,
+            'avg_latency_ms': avg_lat,
+            'loss_rate': (total - successes) / total if total > 0 else 0,
+        }
+        sample = {
+            'elapsed_start_sec': 0,
+            'elapsed_end_sec': total_duration,
+            'interval_sec': total_duration,
+            'total_ops': total,
+            'success_ops': successes,
+            'throughput_ops_sec': ops_per_sec,
+            'avg_latency_ms': avg_lat,
+            'loss_rate': overall['loss_rate'],
+        }
+        metrics_dict = {
+            'label': 'ipokemon',
+            'interval_sec': float(getattr(args, 'metrics_interval', 1.0)),
+            'total_duration_sec': total_duration,
+            'samples': [sample],
+            'overall': overall,
+        }
+        return metrics_dict
+
     except Exception as e:
         print(f'[bench] metrics parse error: {e}')
+        return None
 
 try:
     metrics = None
@@ -229,9 +319,24 @@ try:
         tail_thread.join(timeout=2)
         metrics.stop()
         metrics.write()
-    # Try to parse JTL and print METRIC summary
+    # Try to parse JTL and print METRIC summary; also write metrics JSON when IntervalMetrics not used
     try:
-        _parse_jtl_and_print_metrics(args.out, args.duration)
+        parsed = _parse_jtl_and_print_metrics(args.out, args.duration)
+        if parsed is None:
+            print('[bench] no parsed metrics available')
+        else:
+            # If IntervalMetrics was not used (metrics is None), write fallback JSON to --metrics-out when requested
+            if not metrics and getattr(args, 'metrics_out', None):
+                try:
+                    out_path = args.metrics_out
+                    out_dir = os.path.dirname(out_path)
+                    if out_dir:
+                        os.makedirs(out_dir, exist_ok=True)
+                    with open(out_path, 'w', encoding='utf-8') as ofh:
+                        json.dump(parsed, ofh, indent=2)
+                    print(f"[bench] wrote fallback metrics JSON -> {out_path}")
+                except Exception as _e:
+                    print(f"[bench] failed to write fallback metrics JSON: {_e}")
     except Exception as _e:
         print('[bench] failed to parse jtl for metrics:', _e)
     sys.exit(0)

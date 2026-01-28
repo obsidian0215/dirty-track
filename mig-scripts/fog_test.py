@@ -28,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
 from result_writer import extract_stats_from_output, append_result, summarize_results
+import stat
+import glob
 from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 from script_defaults import choose_scripts, get_default_ips
 
@@ -614,6 +616,7 @@ EXPERIMENTS = {
 
 # Self-contained implementation: robust cleanup, per-service start/smoke/bench/collect/baseline
 import json
+import re
 import signal
 import atexit
 
@@ -1007,6 +1010,204 @@ def collect_run_diagnostics(scene: str, run_idx: int, exp_name: str, dest_ip: Op
     return saved
 
 
+def _jtl_to_metrics(jtl_path: str, duration: float | None = None, label: str | None = None, interval_sec: float = 1.0) -> dict | None:
+    """Parse a JTL file (CSV or XML) and return a metrics dict compatible with IntervalMetrics.to_dict().
+
+    This is a compact fallback used when a metrics JSON is not available. It tries multiple
+    methods to infer the total_duration (timestamps in JTL, nearby jmeter.log, provided duration),
+    and falls back to a conservative 1-second minimum to avoid zero-duration artifacts.
+    """
+    try:
+        import csv, xml.etree.ElementTree as ET, math, re
+        if not os.path.exists(jtl_path):
+            return None
+        with open(jtl_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            start = fh.read(1024)
+        latencies = []
+        successes = 0
+        total = 0
+        timestamps = []
+        if start.lstrip().startswith('<'):
+            for event, elem in ET.iterparse(jtl_path):
+                tag = (elem.tag or '').lower()
+                if 'sample' in tag:
+                    total += 1
+                    t = elem.attrib.get('t') or elem.attrib.get('time') or elem.attrib.get('elapsed')
+                    s = elem.attrib.get('s') or elem.attrib.get('success')
+                    if t is not None:
+                        try:
+                            latencies.append(float(t))
+                        except Exception:
+                            pass
+                    if s is None or str(s).lower() in ('true', '1', 'yes'):
+                        successes += 1
+                    ts = elem.attrib.get('ts') or elem.attrib.get('timestamp') or elem.attrib.get('timeStamp')
+                    if ts:
+                        try:
+                            timestamps.append(int(ts))
+                        except Exception:
+                            pass
+                    elem.clear()
+        else:
+            with open(jtl_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                reader = csv.reader(fh)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    header = []
+                hmap = {h.strip().lower(): i for i,h in enumerate(header)}
+                elapsed_idx = hmap.get('elapsed') if hmap else None
+                success_idx = hmap.get('success') if hmap else None
+                latency_idx = hmap.get('latency') if hmap else (elapsed_idx or 1)
+                # Robustly detect timestamp column (handles index 0 correctly)
+                ts_idx = None
+                if hmap:
+                    if 'timestamp' in hmap:
+                        ts_idx = hmap['timestamp']
+                    elif 'time' in hmap:
+                        ts_idx = hmap['time']
+                if elapsed_idx is None:
+                    elapsed_idx = 1
+                for row in reader:
+                    if not row:
+                        continue
+                    total += 1
+                    try:
+                        val = row[latency_idx] if latency_idx is not None and latency_idx < len(row) else row[elapsed_idx]
+                        latencies.append(float(val))
+                    except Exception:
+                        pass
+                    if success_idx is not None and success_idx < len(row):
+                        try:
+                            s = row[success_idx]
+                            if str(s).lower() in ('true','1','yes'):
+                                successes += 1
+                        except Exception:
+                            pass
+                    if ts_idx is not None and ts_idx < len(row):
+                        try:
+                            timestamps.append(int(row[ts_idx]))
+                        except Exception:
+                            pass
+                if success_idx is None:
+                    successes = total if total > 0 else 0
+
+        if latencies:
+            avg_lat = sum(latencies) / len(latencies)
+        else:
+            avg_lat = 0.0
+
+        total_duration = None
+        if timestamps:
+            try:
+                total_duration = (max(timestamps) - min(timestamps)) / 1000.0
+            except Exception:
+                total_duration = None
+
+        # helper to parse jmeter.log style summaries
+        def _parse_duration_from_log(path: str):
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as lf:
+                    data = lf.read()
+                # look for lines like "summary = 31 in 00:01:00 = 0.5/s"
+                sm = re.findall(r"summary\s*(?:\+|=)\s*\d+\s+in\s+([0-9:\.]+)", data, flags=re.I)
+                if sm:
+                    s = sm[-1].strip()
+                    if ':' in s:
+                        parts = [float(p) for p in s.split(':')]
+                        if len(parts) == 3:
+                            return parts[0]*3600 + parts[1]*60 + parts[2]
+                        elif len(parts) == 2:
+                            return parts[0]*60 + parts[1]
+                        else:
+                            return float(parts[0])
+                m2 = re.search(r"Time taken:\s*([0-9\.]+)\s*secs", data, flags=re.I)
+                if m2:
+                    return float(m2.group(1))
+
+                # More robust: parse leading timestamped log lines like:
+                # 2026-01-28 18:59:05,922 INFO o.a.j.e.StandardJMeterEngine: Running the test!
+                ts_lines = re.findall(r'^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3})', data, flags=re.M)
+                if ts_lines:
+                    try:
+                        from datetime import datetime
+                        dts = [datetime.strptime(t, '%Y-%m-%d %H:%M:%S,%f') for t in ts_lines]
+                        if dts:
+                            dur = (max(dts) - min(dts)).total_seconds()
+                            if dur and dur > 0:
+                                return dur
+                    except Exception:
+                        pass
+
+                # Also look for epoch ms embedded in parentheses such as "Running the test! (1769597945922)"
+                nums = re.findall(r'\((\d{12,})\)', data)
+                if nums:
+                    try:
+                        ints = [int(n) for n in nums]
+                        dur = (max(ints) - min(ints)) / 1000.0
+                        if dur and dur > 0:
+                            return dur
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return None
+
+        if not total_duration or total_duration <= 0:
+            if duration and float(duration) > 0:
+                total_duration = float(duration)
+            else:
+                # try to find a jmeter log alongside the jtl
+                jdir = os.path.dirname(jtl_path)
+                candidates = [
+                    os.path.join(jdir, 'jmeter.log'),
+                    os.path.join(jdir, f'remote_jmeter_{label or ""}.log'),
+                ]
+                if 'TMP_BENCH_LOGS' in globals() and label:
+                    candidates.append(os.path.join(TMP_BENCH_LOGS, f'remote_jmeter_{label}.log'))
+                parsed = None
+                for cand in [c for c in candidates if c]:
+                    if cand and os.path.exists(cand):
+                        parsed = _parse_duration_from_log(cand)
+                        if parsed and parsed > 0:
+                            total_duration = float(parsed)
+                            break
+                if not total_duration or total_duration <= 0:
+                    # conservative minimum to avoid zero-duration results
+                    total_duration = max(1.0, float(duration or 1.0))
+                    print(f"[jtl->metrics] warning: inferred duration fallback for {jtl_path} -> {total_duration}s")
+
+        ops_per_sec = float(successes) / max(1e-6, float(total_duration))
+
+        overall = {
+            'total_ops': total,
+            'success_ops': successes,
+            'throughput_ops_sec': ops_per_sec,
+            'avg_latency_ms': avg_lat,
+            'loss_rate': (total-successes)/total if total>0 else 0,
+        }
+        sample = {
+            'elapsed_start_sec': 0,
+            'elapsed_end_sec': total_duration,
+            'interval_sec': total_duration,
+            'total_ops': total,
+            'success_ops': successes,
+            'throughput_ops_sec': ops_per_sec,
+            'avg_latency_ms': avg_lat,
+            'loss_rate': overall['loss_rate'],
+        }
+        return {
+            'label': label or 'bench',
+            'interval_sec': float(interval_sec),
+            'total_duration_sec': total_duration,
+            'samples': [sample],
+            'overall': overall,
+        }
+    except Exception as e:
+        print(f"[jtl->metrics] parse error for {jtl_path}: {e}")
+        return None
+
+
 def fetch_remote_workload_metrics(scene: str, exp_name: str, run_idx: int, remote_host: str | None = None, tail_lines: int = 500, remove_remote: bool = False) -> list:
     """Fetch bench outputs (metrics JSON and raw) from remote client host into local workload dir.
 
@@ -1027,6 +1228,8 @@ def fetch_remote_workload_metrics(scene: str, exp_name: str, run_idx: int, remot
     candidates = []
     candidates.append(metrics_out)
     candidates.append(raw_out)
+    candidates.append(os.path.join(f"{RESULTS_ROOT}/{RUN_LABEL}/workloads/{scene}", os.path.basename(metrics_out)))
+    candidates.append(os.path.join(f"{RESULTS_ROOT}/{RUN_LABEL}/workloads/{scene}", os.path.basename(raw_out)))
     candidates.append(os.path.join(f"/tmp/fog_test/{RUN_LABEL}/workloads/{scene}", os.path.basename(metrics_out)))
     candidates.append(os.path.join(f"/tmp/fog_test/{RUN_LABEL}/workloads/{scene}", os.path.basename(raw_out)))
     candidates.append(os.path.join("/tmp", os.path.basename(metrics_out)))
@@ -1073,6 +1276,19 @@ def fetch_remote_workload_metrics(scene: str, exp_name: str, run_idx: int, remot
                     saved.append(local_log)
             except Exception:
                 pass
+            # also try to fetch remote jmeter log from results dir
+            try:
+                remote_jlog = os.path.join(f"{RESULTS_ROOT}", RUN_LABEL, 'workloads', scene, 'jmeter.log')
+                rj = run_remote_cmd(f"tail -n {int(tail_lines)} {shlex.quote(remote_jlog)} || true", remote_host, ignore_error=True, quiet=True)
+                jlogcontent = getattr(rj, 'stdout', '') or ''
+                if jlogcontent:
+                    local_jlog = os.path.join(TMP_BENCH_LOGS, f"remote_jmeter_{scene}.log")
+                    os.makedirs(os.path.dirname(local_jlog), exist_ok=True)
+                    with open(local_jlog, 'w', encoding='utf-8') as lf:
+                        lf.write(jlogcontent)
+                    saved.append(local_jlog)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[bench-fetch] error checking remote file {remote_path} on {remote_host}: {e}")
             continue
@@ -1081,7 +1297,265 @@ def fetch_remote_workload_metrics(scene: str, exp_name: str, run_idx: int, remot
         print(f"[bench-fetch] no remote bench metrics found on {remote_host} for {scene} run {run_idx}")
     else:
         print(f"[bench-fetch] fetched files: {saved}")
+
+    # If we fetched a metrics.json but it shows no successful ops, attempt to fetch container-side JTL
+    try:
+        # find the local copy of metrics_out if present
+        local_metrics = None
+        for p in saved:
+            if p and p.endswith('_metrics.json'):
+                local_metrics = p
+                break
+        need_jtl_fallback = False
+        if local_metrics:
+            try:
+                mj = json.load(open(local_metrics))
+                if mj.get('overall', {}).get('success_ops', 0) <= 0:
+                    need_jtl_fallback = True
+            except Exception:
+                need_jtl_fallback = True
+        else:
+            need_jtl_fallback = True
+
+        if remote_host and remote_host not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+            # Try to detect any .jtl under container tmp on remote host (used for both fallback and verification)
+            try:
+                detect_cmd = f"ls -1t /runc/containers/{shlex.quote(scene)}/rootfs/tmp/*.jtl 2>/dev/null | head -n 1"
+                r = run_remote_cmd(detect_cmd, remote_host, ignore_error=True, quiet=True)
+                cand = (getattr(r, 'stdout', '') or '').strip().splitlines()
+                if cand:
+                    remote_jtl = cand[0].strip()
+                    # fetch it
+                    cat = run_remote_cmd(f"cat {shlex.quote(remote_jtl)}", remote_host, ignore_error=True, quiet=True)
+                    content = getattr(cat, 'stdout', '') or ''
+                    if content:
+                        local_dir = os.path.dirname(metrics_out)
+                        os.makedirs(local_dir, exist_ok=True)
+                        local_jtl = os.path.join(local_dir, os.path.basename(remote_jtl))
+                        try:
+                            with open(local_jtl, 'w', encoding='utf-8') as lf:
+                                lf.write(content)
+                            saved.append(local_jtl)
+                            print(f"[bench-fetch] fetched container jtl {remote_jtl} -> {local_jtl}")
+                        except Exception as e:
+                            print(f"[bench-fetch] failed to write fetched jtl: {e}")
+
+                        # If we needed fallback (no metrics) or metrics was invalid, convert jtl to metrics now
+                        if need_jtl_fallback:
+                            try:
+                                parsed = _jtl_to_metrics(local_jtl, duration=None, label=scene, interval_sec=1.0)
+                                if parsed and metrics_out:
+                                    outdir = os.path.dirname(metrics_out)
+                                    if outdir:
+                                        os.makedirs(outdir, exist_ok=True)
+                                    with open(metrics_out, 'w', encoding='utf-8') as mf:
+                                        json.dump(parsed, mf, indent=2)
+                                    saved.append(metrics_out)
+                                    print(f"[bench-fetch] converted container jtl to metrics -> {metrics_out}")
+                            except Exception as e:
+                                print(f"[bench-fetch] failed to convert container jtl to metrics: {e}")
+
+                        # If we already had a local metrics file, compare durations and prefer JTL-derived when discrepancy is large
+                        if local_metrics:
+                            try:
+                                parsed_jtl = _jtl_to_metrics(local_jtl, duration=None, label=scene, interval_sec=1.0)
+                                if parsed_jtl:
+                                    existing_td = None
+                                    try:
+                                        existing_data = json.load(open(local_metrics))
+                                        existing_td = float(existing_data.get('total_duration_sec', 0) or 0)
+                                    except Exception:
+                                        existing_td = None
+                                    jtl_td = parsed_jtl.get('total_duration_sec')
+                                    if jtl_td and (existing_td is None or abs(existing_td - jtl_td) > max(1.0, 0.1 * jtl_td)):
+                                        # Replace existing metrics.json with JTL-derived metrics
+                                        try:
+                                            outdir = os.path.dirname(metrics_out)
+                                            if outdir:
+                                                os.makedirs(outdir, exist_ok=True)
+                                            with open(metrics_out, 'w', encoding='utf-8') as mf:
+                                                json.dump(parsed_jtl, mf, indent=2)
+                                            saved.append(metrics_out)
+                                            print(f"[bench-fetch] replaced {metrics_out} with JTL-derived metrics (jtl: {jtl_td}s, existing: {existing_td}s)")
+                                        except Exception as e:
+                                            print(f"[bench-fetch] failed to write JTL-derived metrics: {e}")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return saved
+
+
+# --- DirtyMap accuracy collection helpers ---
+
+def _write_dm_acc_row(scene: str, exp_name: str, run_idx: int, checkpoint_path: str, summary_stats: dict, final_def: dict | None = None, note: Optional[str] = None) -> None:
+    """Append a DM accuracy row into dm_acc.csv under run directory. Idempotent: skip if identical row exists."""
+    import csv
+    out_dir = get_run_dir()
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, 'dm_acc.csv')
+    header = [
+        'scene', 'exp', 'run_idx', 'checkpoint_path',
+        'iterations', 'total_predicted_total', 'total_predicted_hit', 'total_predicted_miss', 'aggregate_predicted_accuracy', 'total_deferred',
+        'final_def_json',
+        'note',
+    ]
+
+    # Idempotency: if an identical row (scene,exp,run_idx,checkpoint_path) already exists, skip
+    try:
+        if os.path.exists(csv_path):
+            with open(csv_path, 'r', encoding='utf-8', newline='') as cf:
+                reader = csv.reader(cf)
+                for r in reader:
+                    if not r:
+                        continue
+                    try:
+                        if r[0] == scene and r[1] == exp_name and r[2] == str(run_idx) and r[3] == checkpoint_path:
+                            print(f"[dm] dm_acc row for {scene} run {run_idx} already exists -> {csv_path}")
+                            return
+                    except Exception:
+                        continue
+    except Exception:
+        # On any read error, proceed to attempt write
+        pass
+
+    write_header = not os.path.exists(csv_path)
+    try:
+        with open(csv_path, 'a', encoding='utf-8', newline='') as cf:
+            writer = csv.writer(cf)
+            if write_header:
+                writer.writerow(header)
+            row = [
+                scene,
+                exp_name,
+                run_idx,
+                checkpoint_path,
+                summary_stats.get('iterations', ''),
+                summary_stats.get('total_predicted_total', ''),
+                summary_stats.get('total_predicted_hit', ''),
+                summary_stats.get('total_predicted_miss', ''),
+                summary_stats.get('aggregate_predicted_accuracy', ''),
+                summary_stats.get('total_deferred', ''),
+                json.dumps(final_def) if final_def else '',
+                note or '',
+            ]
+            writer.writerow(row)
+        print(f"[dm] appended dm_acc row for {scene} run {run_idx} -> {csv_path}")
+    except Exception as e:
+        print(f"[dm] failed to write dm_acc row: {e}")
+
+
+def _collect_dm_for_run(scene: str, run_idx: int, exp_name: str, exp_args: str, dest_ip: Optional[str] = None) -> None:
+    """If run contains dirtymap (-dm), run inspect_dm_metrics on the migrate dir (local or remote) and write CSV.
+
+    This must be called BEFORE the container migrate directories are cleaned up.
+    """
+    if not exp_args or '-dm' not in str(exp_args):
+        return
+    checkpoint_path = os.path.join('/runc/containers', scene, 'migrate')
+
+    # First, verify that predump_* or pd_log_* entries exist at the checkpoint location (local preferred, remote fallback)
+    has_local_preds = False
+    has_remote_preds = False
+
+    # Check local checkpoint first (preferred)
+    try:
+        if os.path.isdir(checkpoint_path):
+            try:
+                for ln in os.listdir(checkpoint_path):
+                    if re.match(r'predump_\d+|pd_log_\d+', ln):
+                        has_local_preds = True
+                        break
+            except Exception as e:
+                print(f"[dm] failed to list local checkpoint {checkpoint_path}: {e}")
+    except Exception as e:
+        print(f"[dm] error checking local checkpoint for {scene}: {e}")
+
+    # If local didn't have preds, try remote (only when dest_ip indicates remote)
+    if not has_local_preds and dest_ip and dest_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        try:
+            res = run_remote_cmd(f"sh -c 'ls -1 {shlex.quote(checkpoint_path)} 2>/dev/null || true'", dest_ip, ignore_error=True, quiet=True)
+            listing = (getattr(res, 'stdout', '') or '').strip()
+            if listing:
+                for ln in listing.splitlines():
+                    if re.match(r'predump_\d+|pd_log_\d+', ln):
+                        has_remote_preds = True
+                        break
+        except Exception as e:
+            print(f"[dm] failed to list remote checkpoint {checkpoint_path} on {dest_ip}: {e}")
+
+    if not (has_local_preds or has_remote_preds):
+        print(f"[dm] no predump_* or pd_log_* found under {checkpoint_path} for {scene} (run {run_idx})")
+        # Write a placeholder row so the result set explicitly records the missing inspect output
+        zero_summary = {
+            'iterations': 0,
+            'total_predicted_total': 0,
+            'total_predicted_hit': 0,
+            'total_predicted_miss': 0,
+            'aggregate_predicted_accuracy': 0.0,
+            'total_deferred': 0,
+        }
+        try:
+            _write_dm_acc_row(scene, exp_name, run_idx, checkpoint_path, zero_summary, None, note='no_predump_found')
+        except Exception as e:
+            print(f"[dm] failed to write placeholder dm row: {e}")
+        return
+
+    # If local has preds, prefer running the inspect script locally; otherwise run it remotely
+    script = '/runc/dirty-track/scripts/inspect_dm_metrics.py'
+    cmd = f"python3 {shlex.quote(script)} {shlex.quote(checkpoint_path)} --json --show-final"
+    out_json = None
+    try:
+        if has_local_preds:
+            # Local inspection
+            try:
+                r = run_cmd(cmd, ignore_error=True, quiet=True)
+                out = (getattr(r, 'stdout', '') or '').strip()
+                if out:
+                    try:
+                        out_json = json.loads(out)
+                    except Exception as e:
+                        print(f"[dm] failed to parse local inspect output for {scene}: {e}")
+            except Exception as e:
+                print(f"[dm] local inspect script failed for {scene}: {e}")
+        else:
+            # Remote inspection
+            try:
+                res = run_remote_cmd(cmd, dest_ip, ignore_error=True, quiet=True)
+                out = (getattr(res, 'stdout', '') or '').strip()
+                if out:
+                    try:
+                        out_json = json.loads(out)
+                    except Exception as e:
+                        print(f"[dm] failed to parse remote inspect output for {scene} on {dest_ip}: {e}")
+            except Exception as e:
+                print(f"[dm] remote inspect invocation failed for {scene} on {dest_ip}: {e}")
+    except Exception as e:
+        print(f"[dm] inspect invocation error: {e}")
+
+    if not out_json:
+        print(f"[dm] no inspect output for {scene} run {run_idx}")
+        try:
+            # Write a placeholder row to make missing output explicit
+            zero_summary = {
+                'iterations': 0,
+                'total_predicted_total': 0,
+                'total_predicted_hit': 0,
+                'total_predicted_miss': 0,
+                'aggregate_predicted_accuracy': 0.0,
+                'total_deferred': 0,
+            }
+            _write_dm_acc_row(scene, exp_name, run_idx, checkpoint_path, zero_summary, None, note='inspect_no_output')
+        except Exception as e:
+            print(f"[dm] failed to write placeholder dm row after inspect no output: {e}")
+        return
+
+    summary_stats = out_json.get('summary') or {}
+    final_def = out_json.get('final_def')
+    _write_dm_acc_row(scene, exp_name, run_idx, checkpoint_path, summary_stats, final_def)
 
 
 def write_run_error_file(run_result: dict, scene: str, run_idx: int, exp_name: str) -> str | None:
@@ -1222,6 +1696,10 @@ def stage_bundle_from_fog_to_containers(scene: str, remote: bool = False, target
     if remote and target not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
         run_remote_cmd(cmd, target, ignore_error=False)
         sanitize_profile(dest, remote=True, target_ip=target)
+        try:
+            ensure_dev_nodes_in_bundle(dest, remote=True, target_ip=target)
+        except Exception:
+            pass
         # Force container bundle to request a terminal for migration (so recvtty will be used)
         try:
             term_cmd = (
@@ -1260,6 +1738,10 @@ def stage_bundle_from_fog_to_containers(scene: str, remote: bool = False, target
                     print(f"[stage] forced process.terminal=true in {cfg_path_local}")
                 except Exception as e:
                     print(f"[stage] failed to set terminal true: {e}")
+        except Exception:
+            pass
+        try:
+            ensure_dev_nodes_in_bundle(dest, remote=False)
         except Exception:
             pass
     return dest
@@ -1749,6 +2231,99 @@ def normalize_ocr_dataset(remote_host: str | None = None) -> bool:
     except Exception as e:
         print(f"[data] failed to normalize OCR dataset locally: {e}")
         return False
+
+
+def ensure_dev_nodes_in_bundle(bundle_path: str, remote: bool = False, target_ip: Optional[str] = None) -> None:
+    """Ensure common device nodes exist under bundle_path/rootfs/dev.
+
+    Creates /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/tty, /dev/console, /dev/ptmx
+    """
+    devs = [
+        ('null', 'c', 1, 3, '666'),
+        ('zero', 'c', 1, 5, '666'),
+        ('random', 'c', 1, 8, '444'),
+        ('urandom', 'c', 1, 9, '444'),
+        ('tty', 'c', 5, 0, '666'),
+        ('console', 'c', 5, 1, '600'),
+        ('ptmx', 'c', 5, 2, '666'),
+    ]
+    dev_dir = os.path.join(bundle_path, 'rootfs', 'dev')
+    # Remote operation: run a compact shell loop on the remote host with sudo where needed
+    if remote and target_ip and target_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        cmd_parts = []
+        cmd_parts.append(f"sudo mkdir -p {shlex.quote(dev_dir)}")
+        for name, typ, major, minor, mode in devs:
+            path = f"{dev_dir}/{name}"
+            cmd_parts.append(f"if [ ! -c {shlex.quote(path)} ]; then sudo rm -f {shlex.quote(path)} 2>/dev/null || true; sudo mknod -m {mode} {shlex.quote(path)} {typ} {major} {minor} || true; sudo chown root:root {shlex.quote(path)} || true; sudo chmod {mode} {shlex.quote(path)} || true; fi")
+        cmd = " ; ".join(cmd_parts)
+        try:
+            run_remote_cmd(cmd, target_ip, ignore_error=True, quiet=True)
+            print(f"[bundle] ensured device nodes in remote {bundle_path} on {target_ip}")
+        except Exception as e:
+            print(f"[bundle] failed to ensure device nodes on remote {target_ip} for {bundle_path}: {e}")
+        return
+
+    # Local operations
+    try:
+        os.makedirs(dev_dir, exist_ok=True)
+    except Exception:
+        pass
+    for name, typ, major, minor, mode in devs:
+        path = os.path.join(dev_dir, name)
+        try:
+            st_mode = None
+            try:
+                st_mode = os.stat(path).st_mode
+            except Exception:
+                st_mode = None
+            # if not a character device, recreate
+            if not st_mode or not stat.S_ISCHR(st_mode):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                run_cmd(f"sudo mknod -m {mode} {shlex.quote(path)} {typ} {major} {minor}", ignore_error=True, quiet=True)
+                run_cmd(f"sudo chown root:root {shlex.quote(path)}", ignore_error=True, quiet=True)
+                run_cmd(f"sudo chmod {mode} {shlex.quote(path)}", ignore_error=True, quiet=True)
+        except Exception as e:
+            print(f"[bundle] failed to ensure device {path}: {e}")
+
+
+def ensure_dev_nodes_in_fog_workloads(remote: bool = False, target_ip: Optional[str] = None) -> None:
+    """Ensure device nodes exist for all bundles under /runc/fog_workloads on local/remote host."""
+    root = '/runc/fog_workloads'
+    if remote and target_ip and target_ip not in (None, '127.0.0.1', 'localhost', SOURCE_IP):
+        cmd = (
+            "for b in /runc/fog_workloads/*; do "
+            "if [ -d \"$b\" ]; then "
+            "devdir=\"$b/rootfs/dev\"; sudo mkdir -p \"$devdir\"; "
+            "for dev in null zero random urandom tty console ptmx; do "
+            "case \"$dev\" in "
+            "null) major=1; minor=3; mode=666;; "
+            "zero) major=1; minor=5; mode=666;; "
+            "random) major=1; minor=8; mode=444;; "
+            "urandom) major=1; minor=9; mode=444;; "
+            "tty) major=5; minor=0; mode=666;; "
+            "console) major=5; minor=1; mode=600;; "
+            "ptmx) major=5; minor=2; mode=666;; "
+            "esac; path=\"$devdir/$dev\"; if [ ! -c \"$path\" ]; then sudo rm -f \"$path\" 2>/dev/null || true; sudo mknod -m $mode \"$path\" c $major $minor || true; sudo chown root:root \"$path\" || true; sudo chmod $mode \"$path\" || true; fi; "
+            "done; fi; done"
+        )
+        try:
+            run_remote_cmd(cmd, target_ip, ignore_error=True, quiet=False)
+            print(f"[data] ensured device nodes on remote host {target_ip}")
+        except Exception as e:
+            print(f"[data] failed to ensure device nodes on remote host {target_ip}: {e}")
+        return
+
+    # Local loop
+    try:
+        for b in sorted(glob.glob(os.path.join(root, '*'))):
+            if os.path.isdir(b):
+                ensure_dev_nodes_in_bundle(b, remote=False)
+        print("[data] ensured device nodes in local fog_workloads bundles")
+    except Exception as e:
+        print(f"[data] failed to ensure device nodes locally: {e}")
 
 # ensure cleanup runs at process exit (but don't auto-run when user requested help)
 # If the user passed -h/--help, argparse will print help and exit; avoid running cleanup in that case.
@@ -2940,8 +3515,14 @@ def start_bench_background(scene: str, port: int, host: Optional[str] = None, du
     if remote:
         remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
         remote_workdir = os.path.join(remote_tmp, 'workloads', scene)
-        remote_raw_out = os.path.join(remote_workdir, os.path.basename(raw_out))
-        remote_metrics_out = os.path.join(remote_workdir, os.path.basename(metrics_out))
+        # Default to structured remote tmp area, but for JMeter-based benches prefer /runc/results
+        if backend == 'jmeter':
+            remote_results_dir = os.path.join(RESULTS_ROOT, RUN_LABEL, 'workloads', scene)
+            remote_raw_out = os.path.join(remote_results_dir, os.path.basename(raw_out))
+            remote_metrics_out = os.path.join(remote_results_dir, os.path.basename(metrics_out))
+        else:
+            remote_raw_out = os.path.join(remote_workdir, os.path.basename(raw_out))
+            remote_metrics_out = os.path.join(remote_workdir, os.path.basename(metrics_out))
         # Normalize remote OCR dataset if needed (gocr)
         if scene == 'gocr':
             try:
@@ -2995,19 +3576,26 @@ def start_bench_background(scene: str, port: int, host: Optional[str] = None, du
     if remote:
         cmd = cmd.replace(shlex.quote(sys.executable), 'python3')
         remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
-        remote_log = os.path.join(remote_tmp, 'logs', 'bench', f"bench_{scene}.log")
         remote_pidfile = os.path.join(remote_tmp, 'pids', f"bench_{scene}.pid")
-        # Ensure remote workload dir exists so benches can write metrics to it
-        # remote_raw_out/remote_metrics_out were passed into build_bench_command earlier
-        # create parent directories for log/pid and the workload outputs
-        try:
-            # compute families
+        # compute remote_log and out dir, prefer /runc/results for jmeter
+        if backend == 'jmeter':
+            remote_log = os.path.join(RESULTS_ROOT, RUN_LABEL, 'workloads', scene, 'jmeter.log')
+            remote_out_dir = os.path.join(RESULTS_ROOT, RUN_LABEL, 'workloads', scene)
+            # Use sudo to create results dir and run jmeter as root (ensures write permissions)
+            mkdir_prefix = "sudo mkdir -p"
+            run_prefix = "nohup sudo"
+        else:
+            remote_log = os.path.join(remote_tmp, 'logs', 'bench', f"bench_{scene}.log")
             remote_out_dir = os.path.join(remote_tmp, 'workloads', scene)
+            mkdir_prefix = "mkdir -p"
+            run_prefix = "nohup"
+        # Ensure remote workload dir exists so benches can write metrics to it
+        try:
             mkdirs = [os.path.dirname(remote_log), os.path.dirname(remote_pidfile), remote_out_dir]
             mkdirs_cmd = ' '.join(shlex.quote(d) for d in mkdirs)
         except Exception:
             mkdirs_cmd = f"{shlex.quote(os.path.dirname(remote_log))} {shlex.quote(os.path.dirname(remote_pidfile))}"
-        full = f"mkdir -p {mkdirs_cmd} ; nohup {cmd} > {shlex.quote(remote_log)} 2>&1 & echo $! > {shlex.quote(remote_pidfile)}"
+        full = f"{mkdir_prefix} {mkdirs_cmd} ; {run_prefix} {cmd} > {shlex.quote(remote_log)} 2>&1 & echo $! > {shlex.quote(remote_pidfile)}"
         run_remote_cmd(full, CLIENT_IP, ignore_error=True)
         return remote_pidfile
     else:
@@ -3092,7 +3680,7 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
 
     # Wait a randomized ramp-up time (bench runs 20-30s before migration starts)
     try:
-        delay_secs = random.uniform(12.0, 16.0)
+        delay_secs = random.uniform(22.0, 27.0)
         print(f"[mig] waiting {delay_secs:.1f}s before starting migration to let bench ramp up")
         time.sleep(delay_secs)
     except Exception:
@@ -3196,6 +3784,11 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
                     results_dir=get_run_dir(),
                 )
                 print(f"[mig] wrote stats for {exp_name} run {run_index}")
+                # Attempt an early DM collection immediately after stats are available (before any cleanup)
+                try:
+                    _collect_dm_for_run(scene, run_index, exp_name, exp_args, dest_ip=DEST_IP)
+                except Exception as e:
+                    print(f"[dm] early collect failed: {e}")
         except Exception as e:
             print(f"[mig] failed to write stats: {e}")
 
@@ -3222,6 +3815,16 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
                     run_result_payload.setdefault('warnings', []).append('bench_metrics_not_fetched')
         except Exception as e:
             print(f"[bench] fetch_remote_workload_metrics failed: {e}")
+
+        # Collect dirtymap accuracy stats before cleaning containers (only for runs that enabled -dm)
+        try:
+            try:
+                _collect_dm_for_run(scene, run_index, exp_name, exp_args, dest_ip=DEST_IP)
+            except Exception as e:
+                print(f"[dm] collect failed: {e}")
+        except Exception:
+            pass
+
         try:
             source_clean_migration(scene)
         except Exception as e:

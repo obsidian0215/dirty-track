@@ -887,7 +887,7 @@ static int wp_fault_track(void *data) {
                 printk(KERN_ERR "[PID %d] Final scan failed: %d\n", dti->pid, ret);
                 // 即使失败也继续，至少保存已有的dirty-map
             }
-            
+
             // 获取当前时间戳
             dti->end_time = ktime_get();
             // write dirty_map to file
@@ -1075,9 +1075,11 @@ static int start_dirty_track(pid_t pid) {
     }
     dti->mm = get_task_mm(task);
     if (!dti->mm) {
-        printk(KERN_ERR "NULL mm_struct pointer (kernel thread?)\n");
+        /* Non-fatal: kernel threads have NULL mm_struct; ignore start request and let user-space continue. */
+        printk(KERN_WARNING "NULL mm_struct pointer (kernel thread?) - ignoring start request\n");
         kfree(dti);
-        return -EINVAL;
+        /* Return EAGAIN so callers can treat this as an ignored/non-fatal condition */
+        return -EAGAIN;
     }
 
     // 获取当前时间
@@ -1251,23 +1253,23 @@ static struct file_operations fops = {
 };
 
 // 模块初始化
-static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs) 
-{ 
-    struct task_struct *child = (struct task_struct *)regs->di; 
-    struct task_struct *parent; 
-    if (!child) return 0; 
-    parent = child->real_parent; 
-    if (parent && check_dirty_track_for_pid(parent->pid)) { 
-        printk(KERN_INFO "dirty-track: Automatically tracking child %d of parent %d via kprobe\n", child->pid, parent->pid); 
-        start_dirty_track(child->pid); 
-    } 
-    return 0; 
-} 
+static int handler_pre_wake_up_new_task(struct kprobe *p, struct pt_regs *regs)
+{
+    struct task_struct *child = (struct task_struct *)regs->di;
+    struct task_struct *parent;
+    if (!child) return 0;
+    parent = child->real_parent;
+    if (parent && check_dirty_track_for_pid(parent->pid)) {
+        printk(KERN_INFO "dirty-track: Automatically tracking child %d of parent %d via kprobe\n", child->pid, parent->pid);
+        start_dirty_track(child->pid);
+    }
+    return 0;
+}
 
-static struct kprobe kp = { 
-    .symbol_name = "wake_up_new_task", 
-    .pre_handler = handler_pre_wake_up_new_task, 
-}; 
+static struct kprobe kp = {
+    .symbol_name = "wake_up_new_task",
+    .pre_handler = handler_pre_wake_up_new_task,
+};
 
 static int __init lkm_init(void) {
     int ret;
