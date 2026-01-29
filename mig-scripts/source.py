@@ -282,23 +282,39 @@ def final_sync_rootfs(dest_ip, container):
         print(f"[file-locks] no rootfs found for container {container}; skipping final sync")
         return
 
-    dst_dir = f"/runc/containers/{container}/rootfs"
+    # Select per-container subpaths to sync
+    if container == "elasticsearch" or container.startswith("elasticsearch"):
+        subpaths = ["usr/share/elasticsearch/data"]
+    elif container == "ipokemon" or container.startswith("ipokemon"):
+        subpaths = ["root/iPokeMon/ipokemon/Application/iPokeMon-CloudServer/logs"]
+    elif container == "pocketsphinx" or container.startswith("pocketsphinx"):
+        subpaths = ["usr/local/share/pocketsphinx/model"]
+    else:
+        subpaths = ["tmp"]
 
-    # ensure destination parent exists
-    try:
-        subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {dst_dir}'", shell=True, check=False, text=True)
-    except Exception as e:
-        print(f"[file-locks] warning: failed to ensure dest dir on {dest_ip}: {e}")
+    for sub in subpaths:
+        src_sub = os.path.join(src, sub)
+        if not os.path.exists(src_sub):
+            print(f"[file-locks] no source path {src_sub} for container {container}; skipping")
+            continue
 
-    src_arg = src.rstrip('/') + '/'
-    dst = f"root@{dest_ip}:{dst_dir}/"
-    cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_arg, dst]
-    print(f"[file-locks] final-sync rootfs {src_arg} -> {dst}")
-    try:
-        subprocess.check_call(cmd)
-    except Exception as e:
-        print(f"[file-locks] rsync rootfs failed: {e}")
+        dst_dir = f"/runc/containers/{container}/rootfs/{sub}"
 
+        # ensure destination parent exists
+        try:
+            subprocess.run(f"ssh {dest_ip} 'sudo mkdir -p {dst_dir}'", shell=True, check=False, text=True)
+        except Exception as e:
+            print(f"[file-locks] warning: failed to ensure dest dir on {dest_ip}: {e}")
+
+        src_arg = src_sub.rstrip('/') + '/'
+        dst = f"root@{dest_ip}:{dst_dir}/"
+        cmd = ["rsync", "-aHAX", "--numeric-ids", "--inplace", "--delete-delay", "-P", "--timeout=0", src_arg, dst]
+        print(f"[file-locks] final-sync rootfs ({sub}) {src_arg} -> {dst}")
+        try:
+            subprocess.check_call(cmd)
+        except Exception as e:
+            print(f"[file-locks] rsync rootfs ({sub}) failed: {e}")
+            # continue attempting other subpaths
 
 def handle_file_locks(container, locks=None, dest_ip=None):
     """Perform a final rootfs sync for the specified container(s) to avoid restore inconsistencies."""

@@ -622,10 +622,10 @@ import atexit
 
 # override SCENES with explicit scene-to-bundle/endpoint/asset/bench mapping
 SCENE_INFO = {
-    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/0001.png", "bench": None, "persistent": False},
-    "gzip": {"bundle": "gzip", "endpoint": "/compress", "asset": "/runc/datasets/compress/sample.bin", "bench": None, "persistent": False},  # gzip 为无状态；默认不需要文件锁/持久化
-    "yolo": {"bundle": "yolo", "endpoint": "/detect", "asset": "/runc/datasets/images/dog.jpg", "bench": None, "persistent": False},
-    "pocketsphinx": {"bundle": "pocketsphinx", "endpoint": "/transcribe", "asset": "/runc/datasets/audio/sample.wav", "bench": None, "persistent": False},
+    "gocr": {"bundle": "gocr", "endpoint": "/ocr", "asset": "/runc/datasets/ocr/0001.png", "bench": None, "persistent": True},
+    "gzip": {"bundle": "gzip", "endpoint": "/compress", "asset": "/runc/datasets/compress/sample.bin", "bench": None, "persistent": True},
+    "yolo": {"bundle": "yolo", "endpoint": "/detect", "asset": "/runc/datasets/images/dog.jpg", "bench": None, "persistent": True},
+    "pocketsphinx": {"bundle": "pocketsphinx", "endpoint": "/transcribe", "asset": "/runc/datasets/audio/sample.wav", "bench": None, "persistent": True},
     "aeneas": {"bundle": "aeneas", "endpoint": "/align", "asset": "/runc/datasets/audio/sample.mp3,/runc/datasets/ocr/sample.xhtml", "bench": None, "persistent": False},
 
     # Service-level scenes
@@ -664,6 +664,92 @@ def ensure_dirs():
         pass
 
     purge_fog_workload_baks()
+
+
+def safe_runc_list(create_if_missing: bool = True, exit_on_fail: bool = False, quiet: bool = False, timeout: float | None = None):
+    """Run 'runc list -q' safely. If it reports missing /run/runc, attempt to create it and retry.
+
+    Returns the CompletedProcess-like object from run_cmd on success or the last result on failure.
+    If exit_on_fail is True, calls sys.exit(1) when 'runc list' still fails after a retry.
+    """
+    try:
+        res = run_cmd("runc list -q", quiet=quiet, ignore_error=True, timeout=timeout)
+    except Exception as e:
+        if exit_on_fail:
+            print(f"[runc] runc list invocation failed unexpectedly: {e}")
+            sys.exit(1)
+        return None
+
+    if getattr(res, 'returncode', 1) == 0:
+        return res
+
+    stderr = (getattr(res, 'stderr', '') or '').lower()
+    if ('open /run/runc' in stderr) or ('/run/runc' in stderr and 'no such file' in stderr):
+        print("[runc] 'runc list' reported missing /run/runc; attempting to create /run/runc and retry")
+        # Try local create first (may require sudo)
+        try:
+            os.makedirs('/run/runc', exist_ok=True)
+        except Exception:
+            try:
+                run_cmd('sudo mkdir -p /run/runc', ignore_error=True, quiet=True)
+            except Exception as e:
+                print(f"[runc] failed to create /run/runc via sudo: {e}")
+
+        # Retry
+        res2 = run_cmd("runc list -q", quiet=quiet, ignore_error=True, timeout=timeout)
+        if getattr(res2, 'returncode', 1) == 0:
+            return res2
+
+        stderr2 = (getattr(res2, 'stderr', '') or '').strip()
+        print(f"[runc] 'runc list' still failing after creating /run/runc: {stderr2}")
+        if exit_on_fail:
+            sys.exit(1)
+        return res2
+
+    # Other failures
+    if exit_on_fail:
+        stderr_str = (getattr(res, 'stderr', '') or '').strip()
+        print(f"[runc] 'runc list' failed: {stderr_str}")
+        sys.exit(1)
+    return res
+
+
+def safe_remote_runc_list(target_ip: str | None, create_if_missing: bool = True, exit_on_fail: bool = False, quiet: bool = False, timeout: float | None = None):
+    """Run 'runc list -q' on a remote host and attempt to create /run/runc remotely if missing."""
+    if not target_ip:
+        return None
+    try:
+        res = run_remote_cmd('runc list -q', target_ip, ignore_error=True, quiet=quiet)
+    except Exception as e:
+        if exit_on_fail:
+            print(f"[runc-remote] failed to invoke remote runc list on {target_ip}: {e}")
+            sys.exit(1)
+        return None
+
+    if getattr(res, 'returncode', 1) == 0:
+        return res
+
+    stderr = (getattr(res, 'stderr', '') or '').lower()
+    if ('open /run/runc' in stderr) or ('/run/runc' in stderr and 'no such file' in stderr):
+        print(f"[runc-remote] remote {target_ip} 'runc list' reported missing /run/runc; attempting to create and retry")
+        try:
+            run_remote_cmd('sudo mkdir -p /run/runc', target_ip, ignore_error=True, quiet=True)
+        except Exception as e:
+            print(f"[runc-remote] failed to create /run/runc on {target_ip}: {e}")
+        res2 = run_remote_cmd('runc list -q', target_ip, ignore_error=True, quiet=quiet)
+        if getattr(res2, 'returncode', 1) == 0:
+            return res2
+        stderr2 = (getattr(res2, 'stderr', '') or '').strip()
+        print(f"[runc-remote] 'runc list' on {target_ip} still failing after creating /run/runc: {stderr2}")
+        if exit_on_fail:
+            sys.exit(1)
+        return res2
+
+    if exit_on_fail:
+        stderr_str = (getattr(res, 'stderr', '') or '').strip()
+        print(f"[runc-remote] 'runc list' failed on {target_ip}: {stderr_str}")
+        sys.exit(1)
+    return res
 
 
 def purge_fog_workload_baks():
@@ -1815,8 +1901,11 @@ def start_container_for_migration(scene: str, port: int) -> str:
     res = run_cmd(cmd, ignore_error=True, quiet=False, timeout=start_timeout)
     if getattr(res, 'returncode', 1) != 0:
         try:
-            rr = run_cmd("runc list -q", quiet=True, ignore_error=True)
-            names = [ln.strip() for ln in rr.stdout.splitlines()]
+            rr = safe_runc_list(create_if_missing=True, exit_on_fail=False, quiet=True, timeout=5)
+            if not rr or getattr(rr, 'returncode', 1) != 0:
+                names = []
+            else:
+                names = [ln.strip() for ln in rr.stdout.splitlines()]
         except Exception:
             names = []
         if scene in names:
@@ -2017,8 +2106,11 @@ def safe_clean_all(quiet: bool = False):
         _log(f"[clean] warning: clean_configure_network failed: {e}")
 
     try:
-        res = run_cmd("runc list -q", quiet=True)
-        names = [ln.strip() for ln in res.stdout.splitlines()]
+        res = safe_runc_list(create_if_missing=True, exit_on_fail=False, quiet=True)
+        if not res or getattr(res, "returncode", 1) != 0:
+            names = []
+        else:
+            names = [ln.strip() for ln in res.stdout.splitlines()]
     except Exception:
         names = []
     # build candidate set (defog-* plus explicit scene names)
@@ -2037,7 +2129,10 @@ def safe_clean_all(quiet: bool = False):
     for n in candidates:
         for attempt in range(6):
             run_cmd(f"runc delete {shlex.quote(n)}", ignore_error=True, quiet=True)
-            res = run_cmd("runc list -q", quiet=True)
+            res = safe_runc_list(create_if_missing=True, exit_on_fail=False, quiet=True)
+            if not res or getattr(res, "returncode", 1) != 0:
+                # Can't reliably list containers; break to avoid infinite retry
+                break
             if n not in res.stdout:
                 break
             time.sleep(0.2)
@@ -2111,6 +2206,48 @@ def safe_clean_all(quiet: bool = False):
                 _log(f"[clean] error inspecting socket {sock}: {e}")
     except Exception:
         pass
+
+def robust_cleanup_after_failure(scene: str, bench_remote: bool):
+    """Perform a best-effort complete cleanup after a failed run so that failures do not
+    leak state to subsequent runs. This includes stopping background bench processes,
+    deleting destination/source containers, running the global safe cleanup and clearing
+    exec failure tracking for the affected container.
+    """
+    try:
+        stop_bench_background(scene, remote=bench_remote)
+    except Exception as e:
+        print(f"[cleanup] stop_bench_background failed during failure cleanup: {e}")
+
+    try:
+        destination_clean_migration(scene)
+    except Exception as e:
+        print(f"[cleanup] destination_clean_migration failed during failure cleanup: {e}")
+
+    try:
+        source_clean_migration(scene)
+    except Exception as e:
+        print(f"[cleanup] source_clean_migration failed during failure cleanup: {e}")
+
+    try:
+        safe_clean_all(quiet=True)
+    except Exception as e:
+        print(f"[cleanup] safe_clean_all failed during failure cleanup: {e}")
+
+    # best-effort: kill stale runc execs and clear per-container exec failure counters
+    try:
+        kill_stale_runc_exec()
+    except Exception:
+        pass
+
+    try:
+        exec_fail_count.pop(scene, None)
+        exec_blocked.pop(scene, None)
+    except Exception:
+        pass
+
+    # small pause to let the system settle before next run
+    time.sleep(0.5)
+
 
 # Exec failure tracking & asset injection helpers for fog_test
 exec_fail_count = {}
@@ -2338,8 +2475,11 @@ def ensure_deleted(container: str, attempts: int = 6, delay: float = 0.5) -> boo
     """Wait for a container to disappear, trying kill/delete repeatedly."""
     for i in range(attempts):
         try:
-            r = run_cmd("runc list -q", quiet=True)
-            names = [ln.strip() for ln in r.stdout.splitlines()]
+            r = safe_runc_list(create_if_missing=True, exit_on_fail=False, quiet=True)
+            if not r or getattr(r, "returncode", 1) != 0:
+                names = []
+            else:
+                names = [ln.strip() for ln in r.stdout.splitlines()]
         except Exception:
             names = []
         if container not in names:
@@ -2354,8 +2494,11 @@ def ensure_deleted_remote(target_ip: str, container: str, attempts: int = 6, del
     """Wait for a container to disappear on a remote host, trying kill/delete repeatedly via ssh."""
     for i in range(attempts):
         try:
-            r = run_remote_cmd("runc list -q", target_ip, ignore_error=True, quiet=True)
-            names = [ln.strip() for ln in (getattr(r, 'stdout', '') or '').splitlines()]
+            r = safe_remote_runc_list(target_ip, create_if_missing=True, exit_on_fail=False, quiet=True)
+            if not r or getattr(r, 'returncode', 1) != 0:
+                names = []
+            else:
+                names = [ln.strip() for ln in (getattr(r, 'stdout', '') or '').splitlines()]
         except Exception:
             names = []
         if container not in names:
@@ -4055,6 +4198,9 @@ def main():
     parser.add_argument('--bench-threads', type=int, default=2, help='Bench threads/concurrency for migration mode background load')
     parser.add_argument('--skip-network-shaping', action='store_true', help='Skip tc shaping during migration mode')
     parser.add_argument('--stop-on-error', action='store_true', help='Stop the full test run on first error (default: continue)')
+    parser.add_argument('--results-label', type=str, default=None, help='Use a specific results label/dir under /runc/results (e.g., 20260128T160038Z)')
+    parser.add_argument('--run-start', type=int, default=1, help='Starting run index used for result filenames (default 1)')
+    parser.add_argument('--recompute', action='store_true', help='Recompute per-scene summary CSVs in results folder after runs')
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
@@ -4067,7 +4213,23 @@ def main():
     global BENCH_DATASET, BENCH_FILES
     BENCH_DATASET = getattr(args, 'bench_dataset', None)
     BENCH_FILES = getattr(args, 'bench_files', None)
+    # If user provided a specific results label, adopt it and recompute TMP paths so outputs
+    # and tmp directories target the requested results folder.
+    if getattr(args, 'results_label', None):
+        global RUN_LABEL, TMP_ROOT, TMP_LOGS, TMP_DEST_LOGS, TMP_BENCH_LOGS, TMP_RECVTTY_LOGS, TMP_PIDS
+        RUN_LABEL = args.results_label
+        TMP_ROOT = os.path.join('/tmp', 'fog_test', RUN_LABEL)
+        TMP_LOGS = os.path.join(TMP_ROOT, 'logs')
+        TMP_DEST_LOGS = os.path.join(TMP_LOGS, 'destination')
+        TMP_BENCH_LOGS = os.path.join(TMP_LOGS, 'bench')
+        TMP_RECVTTY_LOGS = os.path.join(TMP_LOGS, 'recvtty')
+        TMP_PIDS = os.path.join(TMP_ROOT, 'pids')
+
     ensure_dirs()
+
+    # Quick runc availability check: if 'runc list' reports missing /run/runc, attempt to create it and retry.
+    # On persistent failure, abort early rather than proceeding with migrations that rely on runc.
+    safe_runc_list(create_if_missing=True, exit_on_fail=True, quiet=False)
 
     # Disallow loopback addresses only for remote migration runs; smoke & migration-local allow loopback.
     if args.mode == 'migration':
@@ -4106,21 +4268,33 @@ def main():
             # Ensure VIP is present on source at the start of this experiment
             try:
                 if not ensure_vip_on_source():
-                    print(f"[vip] failed to ensure VIP on source before experiment {exp_name}; aborting further experiments")
-                    KEEP_RUNNING = False
-                    break
+                    print(f"[vip] failed to ensure VIP on source before experiment {exp_name}")
+                    # By default we continue on per-experiment errors; only abort when the user
+                    # explicitly requested stop-on-error via CLI.
+                    if getattr(args, 'stop_on_error', False):
+                        print("[vip] stop-on-error requested: aborting further experiments")
+                        KEEP_RUNNING = False
+                        break
+                    else:
+                        print("[vip] continuing despite VIP ensure failure")
+                # else: VIP present; continue
             except Exception as e:
                 print(f"[vip] ensure_vip_on_source error at experiment start: {e}")
-                KEEP_RUNNING = False
-                break
+                if getattr(args, 'stop_on_error', False):
+                    print("[vip] stop-on-error requested: aborting further experiments")
+                    KEEP_RUNNING = False
+                    break
+                else:
+                    print("[vip] continuing despite VIP ensure error")
             for scene in scenes:
                 scene_info = SCENE_INFO.get(scene, {})
                 scene_metrics = []
                 for r in range(args.runs):
                     if not KEEP_RUNNING:
                         break
+                    run_idx = int(getattr(args, 'run_start', 1)) + r
                     run_port = port if args.start_port != 8080 else scene_info.get('default_port', port)
-                    print(f"--- MIGRATION {scene} (run {r+1}) exp={exp_name} ---")
+                    print(f"--- MIGRATION {scene} (run {run_idx}) exp={exp_name} ---")
                     safe_clean_all(quiet=True)
                     clean_configure_network()
 
@@ -4146,14 +4320,14 @@ def main():
                     time.sleep(0.5)
 
                     mig_data = None
-                    run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': False}
+                    run_result = {'scene': scene, 'run': run_idx, 'exp': exp_name, 'ok': False}
                     try:
                         mig_data = run_migration_once(
                             scene,
                             run_port,
                             exp_args,
                             exp_name,
-                            r + 1,
+                            run_idx,
                             bench_duration=args.bench_duration,
                             bench_threads=args.bench_threads,
                             apply_network=not args.skip_network_shaping,
@@ -4165,20 +4339,20 @@ def main():
                     except Exception as _e:
                         # Record the failure but continue to next run/scene; collect diagnostics and clean up
                         tb = _traceback.format_exc()
-                        print(f"[mig] scene {scene} run {r+1} failed: {_e}", file=sys.stderr)
+                        print(f"[mig] scene {scene} run {run_idx} failed: {_e}", file=sys.stderr)
                         run_result['error'] = str(_e)
                         run_result['error_trace'] = tb
 
                         # Collect diagnostics (local + remote when available)
                         try:
-                            diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                            diag_files = collect_run_diagnostics(scene, run_idx, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
                             run_result['error_files'] = diag_files
                         except Exception as _d_e:
                             print(f"[mig] diagnostics collection failed: {_d_e}", file=sys.stderr)
                         # Attempt to fetch bench metrics from client if bench was remote
                         try:
                             if bench_remote_pre:
-                                fetched = fetch_remote_workload_metrics(scene, exp_name, r + 1, remote_host=CLIENT_IP)
+                                fetched = fetch_remote_workload_metrics(scene, exp_name, run_idx, remote_host=CLIENT_IP)
                                 if fetched:
                                     run_result.setdefault('fetched_bench_files', []).extend(fetched)
                         except Exception as _f_e:
@@ -4186,7 +4360,7 @@ def main():
 
                         # Persist a per-run error file into results/errors
                         try:
-                            errpath = write_run_error_file(run_result, scene, r + 1, exp_name)
+                            errpath = write_run_error_file(run_result, scene, run_idx, exp_name)
                             if errpath:
                                 run_result['error_file'] = errpath
                         except Exception:
@@ -4194,19 +4368,7 @@ def main():
 
                         # Ensure robust cleanup before next run
                         try:
-                            stop_bench_background(scene, remote=bench_remote)
-                        except Exception:
-                            pass
-                        try:
-                            destination_clean_migration(scene)
-                        except Exception:
-                            pass
-                        try:
-                            source_clean_migration(scene)
-                        except Exception:
-                            pass
-                        try:
-                            safe_clean_all(quiet=True)
+                            robust_cleanup_after_failure(scene, bench_remote_pre)
                         except Exception:
                             pass
 
@@ -4215,7 +4377,7 @@ def main():
                             ok_vip_fail = ensure_vip_on_source()
                             run_result['vip_restored'] = bool(ok_vip_fail)
                             if not ok_vip_fail:
-                                print(f"[vip] warning: failed to restore VIP to source after failed run {r+1} for {scene}")
+                                print(f"[vip] warning: failed to restore VIP to source after failed run {run_idx} for {scene}")
                                 run_result.setdefault('warnings', []).append('vip_not_restored_after_failure')
                         except Exception as _e:
                             print(f"[vip] ensure_vip_on_source failed during exception handling: {_e}")
@@ -4245,10 +4407,10 @@ def main():
                         ok_vip_after = ensure_vip_on_source()
                         run_result['vip_restored'] = bool(ok_vip_after)
                         if not ok_vip_after:
-                            print(f"[vip] warning: VIP not restored to source after run {r+1} for {scene}")
+                            print(f"[vip] warning: VIP not restored to source after run {run_idx} for {scene}")
                             run_result.setdefault('warnings', []).append('vip_not_restored_after_run')
                             try:
-                                diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                                diag_files = collect_run_diagnostics(scene, run_idx, exp_name, dest_ip=DEST_IP, client_ip=CLIENT_IP)
                                 if diag_files:
                                     run_result.setdefault('error_files', []).extend(diag_files)
                             except Exception as _e:
@@ -4265,7 +4427,7 @@ def main():
                             pass
 
                     results.append(run_result)
-                    write_run_record('migration', scene, exp_name, r + 1, run_result)
+                    write_run_record('migration', scene, exp_name, run_idx, run_result)
                     port = run_port + 1
                 append_scene_exp_summary(scene, exp_name, scene_metrics)
                 if not KEEP_RUNNING:
@@ -4302,22 +4464,31 @@ def main():
                     # Ensure VIP present on source before running experiments for this scene
                     try:
                         if not ensure_vip_on_source():
-                            print(f"[vip] failed to ensure VIP on source before running scene {scene}; aborting further runs")
-                            KEEP_RUNNING = False
-                            break
+                            print(f"[vip] failed to ensure VIP on source before running scene {scene}")
+                            if getattr(args, 'stop_on_error', False):
+                                print("[vip] stop-on-error requested: aborting further runs")
+                                KEEP_RUNNING = False
+                                break
+                            else:
+                                print("[vip] continuing despite VIP ensure failure")
                     except Exception as e:
                         print(f"[vip] ensure_vip_on_source error: {e}")
-                        KEEP_RUNNING = False
-                        break
+                        if getattr(args, 'stop_on_error', False):
+                            print("[vip] stop-on-error requested: aborting further runs")
+                            KEEP_RUNNING = False
+                            break
+                        else:
+                            print("[vip] continuing despite VIP ensure error")
                     scene_metrics = []
                     for r in range(args.runs):
                         if not KEEP_RUNNING:
                             break
+                        run_idx = int(getattr(args, 'run_start', 1)) + r
                         run_port = port if args.start_port != 8080 else scene_info.get('default_port', port)
-                        print(f"--- MIGRATION-LOCAL {scene} (run {r+1}) exp={exp_name} ---")
+                        print(f"--- MIGRATION-LOCAL {scene} (run {run_idx}) exp={exp_name} ---")
                         safe_clean_all(quiet=True)
                         mig_data = None
-                        run_result = {'scene': scene, 'run': r + 1, 'exp': exp_name, 'ok': False}
+                        run_result = {'scene': scene, 'run': run_idx, 'exp': exp_name, 'ok': False}
 
                         # If the experiment includes post-copy, we do not support running
                         # post-copy locally. Skip and mark the run as skipped so the
@@ -4333,7 +4504,7 @@ def main():
                                     run_port,
                                     exp_args,
                                     exp_name,
-                                    r + 1,
+                                    run_idx,
                                     bench_duration=args.bench_duration,
                                     bench_threads=args.bench_threads,
                                     apply_network=not args.skip_network_shaping,
@@ -4341,23 +4512,23 @@ def main():
                                 run_result['ok'] = True
                             except Exception as _e:
                                 tb = _traceback.format_exc()
-                                print(f"[mig-local] scene {scene} run {r+1} failed: {_e}", file=sys.stderr)
+                                print(f"[mig-local] scene {scene} run {run_idx} failed: {_e}", file=sys.stderr)
                                 run_result['error'] = str(_e)
                                 run_result['error_trace'] = tb
                                 try:
-                                    diag_files = collect_run_diagnostics(scene, r + 1, exp_name, dest_ip=None, client_ip=None)
+                                    diag_files = collect_run_diagnostics(scene, run_idx, exp_name, dest_ip=None, client_ip=None)
                                     run_result['error_files'] = diag_files
                                 except Exception as _d_e:
                                     print(f"[mig-local] diagnostics collection failed: {_d_e}", file=sys.stderr)
                                 try:
-                                    errpath = write_run_error_file(run_result, scene, r + 1, exp_name)
+                                    errpath = write_run_error_file(run_result, scene, run_idx, exp_name)
                                     if errpath:
                                         run_result['error_file'] = errpath
                                 except Exception:
                                     pass
                                 # cleanup
                                 try:
-                                    safe_clean_all(quiet=True)
+                                    robust_cleanup_after_failure(scene, False)
                                 except Exception:
                                     pass
                                 if getattr(args, 'stop_on_error', False):
@@ -4375,7 +4546,7 @@ def main():
                             if mig_data.get('params'):
                                 run_result['metric_params'] = mig_data['params']
                         results.append(run_result)
-                        write_run_record('migration-local', scene, exp_name, r + 1, run_result)
+                        write_run_record('migration-local', scene, exp_name, run_idx, run_result)
                         port = run_port + 1
                     append_scene_exp_summary(scene, exp_name, scene_metrics)
                     if not KEEP_RUNNING:
@@ -4399,29 +4570,30 @@ def main():
         for r in range(args.runs):
             if not KEEP_RUNNING:
                 break
-            print(f"--- Testing {scene} (run {r}) ---")
+            run_idx = int(getattr(args, 'run_start', 1)) + r
+            print(f"--- Testing {scene} (run {run_idx}) ---")
             # ensure fresh state
             safe_clean_all()
             try:
                 ok = run_scene(scene, port, args.collect_baseline, args.keep_containers, local=args.local, bandwidth=args.bandwidth, simulate_transfer=args.simulate_transfer)
-                run_result = {'scene': scene, 'run': r + 1, 'ok': ok}
+                run_result = {'scene': scene, 'run': run_idx, 'ok': ok}
             except Exception as _e:
                 tb = _traceback.format_exc()
-                print(f"[smoke] scene {scene} run {r} failed: {_e}", file=sys.stderr)
-                run_result = {'scene': scene, 'run': r + 1, 'ok': False, 'error': str(_e), 'error_trace': tb}
+                print(f"[smoke] scene {scene} run {run_idx} failed: {_e}", file=sys.stderr)
+                run_result = {'scene': scene, 'run': run_idx, 'ok': False, 'error': str(_e), 'error_trace': tb}
                 try:
-                    diag_files = collect_run_diagnostics(scene, r + 1, 'smoke', dest_ip=DEST_IP, client_ip=CLIENT_IP)
+                    diag_files = collect_run_diagnostics(scene, run_idx, 'smoke', dest_ip=DEST_IP, client_ip=CLIENT_IP)
                     run_result['error_files'] = diag_files
                 except Exception as _d_e:
                     print(f"[smoke] diagnostics collection failed: {_d_e}", file=sys.stderr)
                 try:
-                    errpath = write_run_error_file(run_result, scene, r + 1, 'smoke')
+                    errpath = write_run_error_file(run_result, scene, run_idx, 'smoke')
                     if errpath:
                         run_result['error_file'] = errpath
                 except Exception:
                     pass
                 try:
-                    safe_clean_all(quiet=True)
+                    robust_cleanup_after_failure(scene, False)
                 except Exception:
                     pass
                 if getattr(args, 'stop_on_error', False):
@@ -4429,7 +4601,7 @@ def main():
                     KEEP_RUNNING = False
                     break
             results.append(run_result)
-            write_run_record('smoke', scene, None, r + 1, run_result)
+            write_run_record('smoke', scene, None, run_idx, run_result)
             port += 1
         if not KEEP_RUNNING:
             break

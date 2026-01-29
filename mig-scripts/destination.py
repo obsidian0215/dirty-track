@@ -755,8 +755,92 @@ def perform_restore(msg):
         logger.info(f"restore stderr:\n{err[:8192]}")
 
     if lazy:
-        # 等待 lazy-pages 守护进程结束
-        lp.wait()
+        # Wait for lazy-pages process to exit, but don't block indefinitely.
+        lp_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "lp.log")
+        restore_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "restore.log")
+        lazy_wait = float(os.getenv("LAZY_PAGES_WAIT_SEC", "120"))
+        check_interval = float(os.getenv("LAZY_PAGES_CHECK_INTERVAL", "1.0"))
+
+        def _scan_logs_for_failure():
+            # Look at the tails of lp/restore logs for clear failure indicators
+            for logpath in (restore_log_file, lp_log_file):
+                try:
+                    if not os.path.exists(logpath):
+                        continue
+                    with open(logpath, "rb") as fh:
+                        fh.seek(0, os.SEEK_END)
+                        size = fh.tell()
+                        start = max(0, size - 8192)
+                        fh.seek(start)
+                        tail = fh.read().decode("utf-8", errors="replace").lower()
+                    # Common CRIU failure markers
+                    if "restoring failed" in tail or "restoring failed" in tail:
+                        return (logpath, tail[-2048:])
+                    if "error (" in tail or "can't open file" in tail or "no such file or directory" in tail:
+                        return (logpath, tail[-2048:])
+                except Exception:
+                    # best-effort, ignore read errors
+                    pass
+            return None
+
+        start_time = time.time()
+        detected_failure = False
+        detected_log = None
+        snippet = None
+
+        # initial scan (perhaps restore already logged an error)
+        initial = _scan_logs_for_failure()
+        if initial:
+            detected_failure = True
+            detected_log, snippet = initial
+
+        # poll while lp is running and no failure detected yet
+        while not detected_failure and lp.poll() is None and (time.time() - start_time) < lazy_wait:
+            time.sleep(check_interval)
+            res = _scan_logs_for_failure()
+            if res:
+                detected_failure = True
+                detected_log, snippet = res
+                break
+
+        if detected_failure:
+            logger.error("Detected restore/lazy failure in %s: %s", detected_log, (snippet or '')[:200])
+            try:
+                lp.kill()
+            except Exception:
+                pass
+            try:
+                lp.wait(timeout=5)
+            except Exception:
+                pass
+            # Mark as error and annotate stderr for reply
+            if ret == 0:
+                ret = 1
+                err = (err or "") + "\n" + f"detected failure in {detected_log}: {(snippet or '')[:400]}"
+            else:
+                err = (err or "") + "\n" + f"detected failure in {detected_log}: {(snippet or '')[:400]}"
+        elif lp.poll() is None:
+            # timed out waiting for lazy-pages to finish
+            logger.error("lazy-pages did not exit after %s seconds; killing process", lazy_wait)
+            try:
+                lp.kill()
+            except Exception as e:
+                logger.error("failed to kill lazy-pages process: %s", e)
+            try:
+                lp.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.error("lazy-pages did not terminate after kill; force-terminating")
+                try:
+                    lp.terminate()
+                except Exception:
+                    pass
+            # Consider this a failure of the lazy page transfer and annotate stderr
+            lazy_timeout_msg = f"lazy-pages timeout after {int(lazy_wait)}s; see {lp_log_file}"
+            if ret == 0:
+                ret = 1
+                err = (err or "") + "\n" + lazy_timeout_msg
+            else:
+                err = (err or "") + "\n" + lazy_timeout_msg
 
     if ret == 0:
         restore_log_path = msg["restore"]["path"] + "/migrate/r_log"
