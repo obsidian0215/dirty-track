@@ -32,6 +32,7 @@ import stat
 import glob
 from cmd_utils import run_cmd, run_remote_cmd, unmount_local_migration_tmpfs
 from script_defaults import choose_scripts, get_default_ips
+import csv
 
 # Defaults (reuse helpers that are common across wrappers)
 SOURCE_IP, DEST_IP, CLIENT_IP, VIP = get_default_ips()
@@ -850,8 +851,42 @@ def write_run_record(mode: str, scene: str, exp: Optional[str], run_idx: int, pa
         print(f"[result] per-run record -> {out_path}")
 
 
-def write_integrated_table(results: list, mode: str) -> Optional[str]:
-    rows = [r for r in results if isinstance(r, dict) and isinstance(r.get('metrics'), dict)]
+def _load_run_jsons_from_dir(label: str, mode: str) -> list:
+    """Load per-run JSON files under /runc/results/<label>/<mode> and return a list of
+    dicts in the shape expected by the integrated table writer: {'mode','exp','scene','run','metrics'}.
+
+    This handles legacy JSONs that store metrics as header/values strings.
+    """
+    rows = []
+    dir_mode = os.path.join(RESULTS_ROOT, label, mode)
+    if not os.path.isdir(dir_mode):
+        return rows
+    for path in sorted(glob.glob(os.path.join(dir_mode, "*.json"))):
+        try:
+            with open(path, 'r', encoding='utf-8') as jf:
+                j = json.load(jf)
+        except Exception:
+            continue
+        metrics = None
+        if isinstance(j.get('metrics'), dict):
+            metrics = j.get('metrics')
+        else:
+            header = j.get('metrics_header') or ''
+            values = j.get('metrics_values') or ''
+            if header and values:
+                keys = header.split('\t')
+                vals = values.split('\t')
+                metrics = {k: v for k, v in zip(keys, vals)}
+        if metrics and isinstance(metrics, dict):
+            rows.append({'mode': mode, 'exp': j.get('exp', ''), 'scene': j.get('scene', ''), 'run': j.get('run', ''), 'metrics': metrics})
+    return rows
+
+
+def regenerate_integrated_table(label: str, mode: str = 'migration') -> Optional[str]:
+    """Rebuild <mode>_integrated.tsv under /runc/results/<label> from all per-run JSONs."""
+    out_dir = os.path.join(RESULTS_ROOT, label)
+    os.makedirs(out_dir, exist_ok=True)
+    rows = _load_run_jsons_from_dir(label, mode)
     if not rows:
         return None
 
@@ -861,21 +896,238 @@ def write_integrated_table(results: list, mode: str) -> Optional[str]:
             if k not in metric_keys:
                 metric_keys.append(k)
 
+    # Sort rows by scene, exp (canonical EXPERIMENTS order when available), then numeric run
+    exp_order = list(EXPERIMENTS.keys()) if 'EXPERIMENTS' in globals() else []
+
+    def _exp_sort_key(e):
+        e = (e or '').strip()
+        if e in exp_order:
+            return (0, exp_order.index(e))
+        return (1, e)
+
+    def _row_sort_key(r):
+        scene = (r.get('scene') or '').strip()
+        exp = (r.get('exp') or '').strip()
+        run = r.get('run')
+        try:
+            run_k = int(run)
+        except Exception:
+            try:
+                run_k = int(str(run).strip())
+            except Exception:
+                run_k = str(run)
+        return (scene, _exp_sort_key(exp), run_k)
+
+    rows.sort(key=_row_sort_key)
+
     headers = ["mode", "exp", "scene", "run"] + metric_keys
-    out_dir = os.path.join(RESULTS_ROOT, RUN_LABEL)
+    out_path = os.path.join(out_dir, f"{mode}_integrated.tsv")
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\t".join(headers) + "\n")
+        for r in rows:
+            row = [mode, str(r.get("exp", "")).strip(), str(r.get("scene", "")).strip(), str(r.get("run", ""))]
+            metrics = r.get('metrics', {}) or {}
+            for key in metric_keys:
+                row.append(str(metrics.get(key, "")))
+            f.write("\t".join(row) + "\n")
+
+    print(f"[result] integrated table -> {out_path}")
+    return out_path
+
+
+def regenerate_mig_test_csvs(label: str) -> None:
+    """Regenerate per-scene `mig_test_<scene>.csv` files from the migration_integrated.tsv under results/<label>."""
+    integrated = os.path.join(RESULTS_ROOT, label, 'migration_integrated.tsv')
+
+    if not os.path.exists(integrated):
+        regenerated = regenerate_integrated_table(label, 'migration')
+        if not regenerated:
+            print(f"[result] no migration per-run JSONs found under {os.path.join(RESULTS_ROOT,label,'migration')} to regenerate summaries")
+            return
+
+    data: dict = {}
+    try:
+        with open(integrated, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            header = next(reader, None)
+            if not header or len(header) < 5:
+                print(f"[result] {integrated} missing metric columns; skipping per-scene summary generation")
+                return
+            metric_keys = [k.strip() for k in header[4:]]
+            for cols in reader:
+                if not cols or len(cols) < 4:
+                    continue
+                exp = (cols[1] or '').strip()
+                scene = (cols[2] or '').strip()
+                values = [v.strip() for v in cols[4:]]
+                for k, v in zip(metric_keys, values):
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    data.setdefault(scene, {}).setdefault(exp, {}).setdefault(k, []).append(fv)
+    except Exception as e:
+        print(f"[result] failed to parse {integrated}: {e}")
+        return
+
+    # Write per-scene CSVs
+    exp_order = list(EXPERIMENTS.keys()) if 'EXPERIMENTS' in globals() else []
+
+    def _exp_sort_key(e):
+        if e in exp_order:
+            return (0, exp_order.index(e))
+        return (1, e)
+
+    for scene, exps in data.items():
+        path = os.path.join(RESULTS_ROOT, label, f"mig_test_{scene}.csv")
+        try:
+            with open(path, 'w', encoding='utf-8') as fo:
+                fo.write("exp\tmetric\tmean\tstdev\truns\n")
+                for exp in sorted(exps.keys(), key=_exp_sort_key):
+                    for metric in sorted(exps[exp].keys()):
+                        vals = exps[exp][metric]
+                        mean = statistics.mean(vals)
+                        stdev = statistics.stdev(vals) if len(vals) > 1 else 0.0
+                        fo.write(f"{exp}\t{metric}\t{mean:.6f}\t{stdev:.6f}\t{len(vals)}\n")
+            print(f"[result] per-scene test summary -> {path}")
+        except Exception as e:
+            print(f"[result] failed to write per-scene summary {path}: {e}")
+
+
+def _regenerate_missing_perrun_jsons(label: str, mode: str = 'migration') -> None:
+    """Create minimal per-run JSON files for any rows in the integrated table missing a per-run file.
+
+    These files are marked with 'reconstructed': True so callers can tell they were synthesized.
+    """
+    integrated = os.path.join(RESULTS_ROOT, label, f"{mode}_integrated.tsv")
+    if not os.path.exists(integrated):
+        return
+    try:
+        with open(integrated, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter='\t')
+            header = next(reader, None)
+            if not header or len(header) < 5:
+                return
+            metric_keys = header[4:]
+            out_dir = os.path.join(RESULTS_ROOT, label, mode)
+            os.makedirs(out_dir, exist_ok=True)
+            for cols in reader:
+                if not cols or len(cols) < 4:
+                    continue
+                exp = cols[1]
+                scene = cols[2]
+                run_idx = cols[3]
+                metrics_vals = cols[4:]
+                metrics = {k: v for k, v in zip(metric_keys, metrics_vals)}
+                fname = f"{scene}_run-{run_idx}_{exp}.json"
+                path = os.path.join(out_dir, fname)
+                if os.path.exists(path):
+                    continue
+                payload = {
+                    'scene': scene,
+                    'run': int(run_idx) if str(run_idx).isdigit() else run_idx,
+                    'exp': exp,
+                    'ok': True,
+                    'metrics': metrics,
+                    'reconstructed': True,
+                }
+                try:
+                    with open(path, 'w', encoding='utf-8') as fo:
+                        json.dump(payload, fo, indent=2)
+                    print(f"[result] reconstructed per-run record -> {path}")
+                except Exception as e:
+                    print(f"[result] failed to write reconstructed per-run record {path}: {e}")
+    except Exception:
+        return
+
+
+def write_integrated_table(results: list, mode: str) -> Optional[str]:
+    """Write the per-mode integrated table. Prefer rebuilding from on-disk per-run JSONs when
+    available so that adding runs into an existing results label will not overwrite historical data.
+
+    The table is sorted by (scene, experiment (canonical EXPERIMENTS order), run) so
+    that per-scene summaries are grouped by experiment and easy to aggregate across runs.
+    """
+    out_dir_label = RUN_LABEL
+    disk_rows = _load_run_jsons_from_dir(out_dir_label, mode)
+    mem_rows = [r for r in (results or []) if isinstance(r, dict) and isinstance(r.get('metrics'), dict)]
+
+    if disk_rows:
+        rows = list(disk_rows)
+        existing = {(r.get('scene'), str(r.get('run')), r.get('exp')) for r in disk_rows}
+        for r in mem_rows:
+            key = (r.get('scene'), str(r.get('run')), r.get('exp'))
+            if key not in existing:
+                rows.append(r)
+    else:
+        rows = mem_rows
+
+    if not rows:
+        return None
+
+    # Collect metric keys (preserve first-seen order) and normalize them
+    metric_keys: list[str] = []
+    for r in rows:
+        for k in r.get('metrics', {}).keys():
+            kn = (k or '').strip()
+            if not kn:
+                continue
+            if kn not in metric_keys:
+                metric_keys.append(kn)
+
+    # Sort rows by scene, canonical experiment order, then numeric run
+    exp_order = list(EXPERIMENTS.keys()) if 'EXPERIMENTS' in globals() else []
+
+    def _exp_sort_key(e):
+        e = (e or '').strip()
+        if e in exp_order:
+            return (0, exp_order.index(e))
+        return (1, e)
+
+    def _row_sort_key(r):
+        scene = (r.get('scene') or '').strip()
+        exp = (r.get('exp') or '').strip()
+        run = r.get('run')
+        try:
+            run_k = int(run)
+        except Exception:
+            try:
+                run_k = int(str(run).strip())
+            except Exception:
+                run_k = str(run)
+        return (scene, _exp_sort_key(exp), run_k)
+
+    rows.sort(key=_row_sort_key)
+
+    headers = ["mode", "exp", "scene", "run"] + metric_keys
+    out_dir = os.path.join(RESULTS_ROOT, out_dir_label)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{mode}_integrated.tsv")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\t".join(headers) + "\n")
         for r in rows:
-            row = [mode, str(r.get("exp", "")), str(r.get("scene", "")), str(r.get("run", ""))]
-            metrics = r.get("metrics", {}) or {}
+            row = [mode, str((r.get("exp", "") or '').strip()), str((r.get("scene", "") or '').strip()), str(r.get("run", ""))]
+            metrics = r.get('metrics', {}) or {}
             for key in metric_keys:
-                row.append(str(metrics.get(key, "")))
+                # Normalize access by stripping metric keys
+                row.append(str(metrics.get(key, metrics.get(key.strip(), ""))))
             f.write("\t".join(row) + "\n")
 
     print(f"[result] integrated table -> {out_path}")
+    # Ensure any missing per-run JSONs are reconstructed so the migration dir contains per-run records
+    try:
+        _regenerate_missing_perrun_jsons(out_dir_label, mode)
+    except Exception as e:
+        print(f"[result] failed to regenerate missing per-run JSONs: {e}")
+
+    # Regenerate per-scene CSV summaries from the new integrated table so the results are consistent
+    try:
+        regenerate_mig_test_csvs(out_dir_label)
+    except Exception as e:
+        print(f"[result] failed to regenerate per-scene CSVs: {e}")
+
     return out_path
 
 
@@ -4439,6 +4691,14 @@ def main():
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2)
         write_integrated_table(results, "migration")
+        # When integrating into an existing results label (or when --recompute asked),
+        # regenerate per-scene summary CSVs from the integrated table so files like
+        # mig_test_gocr.csv reflect the full set of runs in the label
+        if getattr(args, 'results_label', None) or getattr(args, 'recompute', False):
+            try:
+                regenerate_mig_test_csvs(RUN_LABEL)
+            except Exception as e:
+                print(f"[result] failed to regenerate per-scene CSVs: {e}")
         print(f"[done] migration summary -> {out}")
         return
 

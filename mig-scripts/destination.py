@@ -762,25 +762,22 @@ def perform_restore(msg):
         check_interval = float(os.getenv("LAZY_PAGES_CHECK_INTERVAL", "1.0"))
 
         def _scan_logs_for_failure():
-            # Look at the tails of lp/restore logs for clear failure indicators
-            for logpath in (restore_log_file, lp_log_file):
-                try:
-                    if not os.path.exists(logpath):
-                        continue
-                    with open(logpath, "rb") as fh:
+            # Only treat an explicit 'Restoring FAILED' marker in restore.log as a definitive restore failure.
+            # Avoid treating generic 'error' messages as a fatal restore indicator.
+            try:
+                if os.path.exists(restore_log_file):
+                    with open(restore_log_file, "rb") as fh:
                         fh.seek(0, os.SEEK_END)
                         size = fh.tell()
                         start = max(0, size - 8192)
                         fh.seek(start)
-                        tail = fh.read().decode("utf-8", errors="replace").lower()
-                    # Common CRIU failure markers
-                    if "restoring failed" in tail or "restoring failed" in tail:
-                        return (logpath, tail[-2048:])
-                    if "error (" in tail or "can't open file" in tail or "no such file or directory" in tail:
-                        return (logpath, tail[-2048:])
-                except Exception:
-                    # best-effort, ignore read errors
-                    pass
+                        tail = fh.read().decode("utf-8", errors="replace")
+                    # Match case-insensitively for the explicit failure marker
+                    if "restoring failed" in tail.lower():
+                        return (restore_log_file, tail[-2048:])
+            except Exception:
+                # best-effort, ignore read errors
+                pass
             return None
 
         start_time = time.time()
