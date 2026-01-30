@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import shlex
+import signal
 from _thread import start_new_thread
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
@@ -553,24 +554,54 @@ def transfer_vip():
 
 def calculate_uffd_copy(lp_log_file):
     """
-    计算总的 UFFD 复制字节数。
+    解析 lp.log 中的页传输字节数并返回字节总数（best-effort）。
 
-    参数:
-        lp_log_file (str): lp.log 文件的路径。
+    目前支持的模式：
+    - uffd_copy: 0x.../<bytes>
+    - page-xfer: ... Received <bytes> bytes
+    - page-xfer: ... p 0x... [<count>] （count 表示页数，使用 4KB 页大小计算）
 
-    返回:
-        int: 总的 UFFD 复制字节数。
+    返回：
+        int: 估算的总复制字节数（字节）
     """
     uffd_copy_pattern = re.compile(r"uffd_copy:\s+0x[0-9a-fA-F]+/(\d+)")
-    total_uffd_copy = 0
-    with open(lp_log_file, "r") as f:
-        for line in f:
-            match = uffd_copy_pattern.search(line)
-            if match:
-                size = int(match.group(1))
-                total_uffd_copy += size
-                # print(f"UFFD copy: {size} bytes")
-    return total_uffd_copy
+    page_bytes_pattern = re.compile(r"page-xfer:.*Received\s+(\d+)\s+bytes", re.IGNORECASE)
+    p_count_pattern = re.compile(r"page-xfer:.*p\s+0x[0-9a-fA-F]+\s+\[(\d+)\]")
+    PAGE_SIZE = 4096
+
+    total_bytes = 0
+    page_count = 0
+    uffd_matches = 0
+    try:
+        with open(lp_log_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = uffd_copy_pattern.search(line)
+                if m:
+                    total_bytes += int(m.group(1))
+                    uffd_matches += 1
+                    continue
+                m = page_bytes_pattern.search(line)
+                if m:
+                    total_bytes += int(m.group(1))
+                    continue
+                m = p_count_pattern.search(line)
+                if m:
+                    cnt = int(m.group(1))
+                    page_count += cnt
+                    total_bytes += cnt * PAGE_SIZE
+    except Exception as e:
+        logger.debug("calculate_uffd_copy: failed to read %s: %s", lp_log_file, e)
+        return 0
+
+    logger.debug(
+        "calculate_uffd_copy: lp_log=%s uffd_matches=%d page_count=%d total_bytes=%d",
+        lp_log_file,
+        uffd_matches,
+        page_count,
+        total_bytes,
+    )
+
+    return total_bytes
 
 
 def parse_stats_restore(stats_restore_path):
@@ -627,41 +658,69 @@ def get_restore_time(work_path):
 
 def get_rpf_handle_time(lp_log_file):
     """
-    计算错误页面传输的总时间，从 lp.log 中匹配 'Connecting to server' 到 'page-xfer: Disconnect from the page server' 的时间间隔。
+    Best-effort 计算错误页面传输的总时间（毫秒），从 lp.log 中提取时间戳并尝试匹配开始/结束区间。
 
-    参数:
-        lp_log_file (str): lp.log 文件的路径。
+    算法：
+    - 先尝试查找连接/断开对 (Connecting / Disconnect)，累加每次传输持续时间
+    - 若未找到显式对，则回退到 page-xfer 事件的首尾时间差（span）作为估算
 
-    返回:
-        float: 错误页面传输的总持续时间（秒）。
+    返回：
+        float: 错误页面传输的总持续时间（毫秒）
     """
-    connect_pattern = re.compile(r"\(([\d\.]+)\)\s+Connecting to server\s+[\d\.]+:\d+")
-    disconnect_pattern = re.compile(r"\(([\d\.]+)\)\s+page-xfer:\s+Disconnect from the page server")
+    # 常见的时间戳形式出现在行首，如：(00.013805)
+    timestamp_pattern = re.compile(r"\(([\d\.]+)\)")
+    connect_pattern = re.compile(r"\(([\d\.]+)\)\s+(?:Connecting to(?: server)?|page-xfer: Transferring pages)\b", re.IGNORECASE)
+    disconnect_pattern = re.compile(r"\(([\d\.]+)\)\s+page-xfer:.*Disconnect", re.IGNORECASE)
+    page_xfer_event = re.compile(r"\(([\d\.]+)\)\s+page-xfer:", re.IGNORECASE)
 
     transfer_durations = []
     connect_time = None
+    first_ts = None
+    last_ts = None
 
-    with open(lp_log_file, "r") as f:
-        for line in f:
-            # 匹配错误页面传输开始
-            connect_match = connect_pattern.search(line)
-            if connect_match:
-                connect_time = float(connect_match.group(1))
-                # print(f"Error Page Transfer Started at: {connect_time} seconds")
-                continue
+    try:
+        with open(lp_log_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                ts_match = timestamp_pattern.search(line)
+                if not ts_match:
+                    continue
+                ts = float(ts_match.group(1))
+                if first_ts is None:
+                    first_ts = ts
+                last_ts = ts
 
-            # 匹配错误页面传输完成
-            disconnect_match = disconnect_pattern.search(line)
-            if disconnect_match and connect_time is not None:
-                disconnect_time = float(disconnect_match.group(1))
-                duration = disconnect_time - connect_time
-                transfer_durations.append(duration)
-                # print(f"Error Page Transfer Finished at: {disconnect_time} seconds, Duration: {duration} seconds")
-                # 重置开始时间以便处理下一个传输
-                connect_time = None
+                if connect_pattern.search(line):
+                    connect_time = ts
+                    continue
 
-    total_error_transfer_time = sum(transfer_durations)
-    return total_error_transfer_time * 1000
+                if disconnect_pattern.search(line) and connect_time is not None:
+                    duration = ts - connect_time
+                    transfer_durations.append(duration)
+                    connect_time = None
+                    continue
+
+                # 若出现 page-xfer 行但没有显式 Connecting/Disconnect 对，记录时间用于后续 span 回退
+                if page_xfer_event.search(line) and connect_time is None:
+                    # treat this as an implicit start only if we haven't seen one
+                    connect_time = connect_time or ts
+
+    except Exception as e:
+        logger.debug("get_rpf_handle_time: failed to read %s: %s", lp_log_file, e)
+        return 0.0
+
+    if transfer_durations:
+        total = sum(transfer_durations)
+        total_ms = total * 1000.0
+        logger.debug("get_rpf_handle_time: matched %d transfers -> %.2f ms", len(transfer_durations), total_ms)
+        return total_ms
+
+    # 回退到 span（first->last）作为估算
+    if first_ts is not None and last_ts is not None and last_ts >= first_ts:
+        span_ms = (last_ts - first_ts) * 1000.0
+        logger.debug("get_rpf_handle_time: fallback span estimate %.2f ms", span_ms)
+        return span_ms
+
+    return 0.0
 
 
 def perform_restore(msg):
@@ -670,7 +729,7 @@ def perform_restore(msg):
         # 获取runc_args，如果不存在则为空字符串
         runc_args_str = msg["restore"].get("runc_args", "")
     except Exception as e:
-        print(f"Error parsing restore parameters: {e}")
+        logger.warning("Error parsing restore parameters: %s", e)
         lazy = False
         runc_args_str = ""
 
@@ -716,50 +775,166 @@ def perform_restore(msg):
     cmd += " " + msg["restore"]["name"]
     # print("Restore command: " + cmd)
 
+    # 保证 lp 变量在任何分支都有定义，便于后续等待/清理
+    lp = None
+
     # 若启用post-copy，则先启动lazy-pages守护进程
     if lazy:
-        lazy_cmd = "criu lazy-pages --page-server --address " + str(source_ip)
-        lazy_cmd += " --port 27 -v4 -D "
-        lazy_cmd += msg["restore"]["image_path"]
-        lazy_cmd += " -W " + msg["restore"]["path"] + "/migrate/r_log"
-        lazy_cmd += " -o " + msg["restore"]["path"] + "/migrate/r_log/lp.log"
-        print("Running lazy-pages server: " + lazy_cmd)
-        # 启动 lazy-pages 守护进程
-        lp = subprocess.Popen(lazy_cmd, shell=True)
-        # 为了确保 lazy-pages.socket 已经创建，等待片刻
-        time.sleep(0.07)  # 等待0.07秒，可根据需要调整时间
+        lp_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "lp.log")
+        lp_cmd = [
+            "criu",
+            "lazy-pages",
+            "--page-server",
+            "--address",
+            str(source_ip),
+            "--port",
+            "27",
+            "-v4",
+            "-D",
+            msg["restore"]["image_path"],
+            "-W",
+            os.path.join(msg["restore"]["path"], "migrate", "r_log"),
+            "-o",
+            lp_log_file,
+        ]
+
+        logger.info("Starting lazy-pages server: %s", " ".join(lp_cmd))
+        try:
+            lp = subprocess.Popen(lp_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        except Exception as e:
+            logger.error("Failed to start lazy-pages server: %s", e)
+            lp = None
+        # 等待 lp 日志出现或进程保持运行，最多等待 ~5秒
+        started = False
+        for _ in range(50):
+            if lp and lp.poll() is not None:
+                logger.error("lazy-pages process exited early with code %s", lp.returncode)
+                break
+            if os.path.exists(lp_log_file):
+                started = True
+                break
+            time.sleep(0.1)
+        if not started:
+            logger.warning("lazy-pages log not present after wait; monitor will still proceed and may detect failures from restore.log")
 
     # 现在启动 runc restore 命令
     logger.info("Running restore command...")
     start_time = time.perf_counter()
     cpu_start = psutil.cpu_percent(interval=None)
-    # Run restore and capture stdout/stderr for diagnostics
-    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    restore_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "restore.log")
+    os.makedirs(os.path.dirname(restore_log_file), exist_ok=True)
+
+    # Safely build command args (avoid shell=True when possible)
     try:
-        out, err = p.communicate(timeout=30)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        out, err = p.communicate()
-    ret = p.returncode
+        cmd_args = shlex.split(cmd)
+    except Exception:
+        cmd_args = cmd
+
+    # Start runc restore in its own process group so we can cleanly terminate subtree if needed
+    try:
+        p = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=os.setsid)
+    except Exception as e:
+        logger.error("Failed to start restore command: %s", e)
+        return f"failed to start restore: {e}"
+
+    # Stream stdout/stderr to restore log and monitor for definitive failure markers
+    detected_failure = {"flag": False, "snippet": ""}
+
+    def _stream_reader(stream, collector, stream_name):
+        try:
+            for line in iter(stream.readline, ""):
+                if not line:
+                    break
+                collector.append(line)
+                try:
+                    with open(restore_log_file, "a", encoding="utf-8", errors="replace") as rf:
+                        rf.write(line)
+                except Exception:
+                    pass
+                if stream_name == "stderr":
+                    logger.warning("%s: %s", stream_name, line.rstrip())
+                else:
+                    logger.debug("%s: %s", stream_name, line.rstrip())
+                # Only treat explicit 'Restoring FAILED' as definitive failure
+                try:
+                    if "restoring failed" in line.lower():
+                        detected_failure["flag"] = True
+                        detected_failure["snippet"] = line.strip()
+                        logger.error("Detected definitive failure marker in restore output: %s", detected_failure["snippet"])
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error("Error streaming %s: %s", stream_name, e)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
+    t_out = threading.Thread(target=_stream_reader, args=(p.stdout, stdout_lines, "stdout"), daemon=True)
+    t_err = threading.Thread(target=_stream_reader, args=(p.stderr, stderr_lines, "stderr"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    # Monitor process and abort early if we see a definitive failure marker
+    while True:
+        if p.poll() is not None:
+            break
+        if detected_failure["flag"]:
+            logger.error("Definitive failure detected in restore logs; killing restore process group")
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                pass
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            break
+        time.sleep(0.1)
+
+    # Ensure streaming threads have drained
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+
+    ret = p.poll()
+    if ret is None:
+        try:
+            ret = p.wait(timeout=2)
+        except Exception:
+            ret = p.returncode if p.returncode is not None else -1
+
     end_time = time.perf_counter()
     cpu_end = psutil.cpu_percent(interval=None)
-    # 计算并记录恢复期间的 wall-clock 耗时（毫秒）和 CPU 使用变化。
     cpu_delta = cpu_end - cpu_start
     elapsed_ms = (end_time - start_time) * 1000
-    logger.info(f"restore elapsed {elapsed_ms:.3f} ms, CPU change {cpu_delta:.2f}%")
+    logger.info("restore elapsed %.3f ms, CPU change %.2f%%", elapsed_ms, cpu_delta)
 
-    # Log stdout/stderr for debugging
+    out = "".join(stdout_lines)
+    err = "".join(stderr_lines)
+
+    # Log short snippets for diagnostics
     if out:
-        logger.info(f"restore stdout:\n{out[:8192]}")
+        logger.info("restore stdout (snippet):\n%s", out[-8192:])
     if err:
-        logger.info(f"restore stderr:\n{err[:8192]}")
+        logger.info("restore stderr (snippet):\n%s", err[-8192:])
+
+    # If we detected definitive failure marker, ensure return code indicates failure and annotate error
+    if detected_failure["flag"]:
+        if ret == 0:
+            ret = 1
+        err = (err or "") + "\n" + f"detected failure in restore logs: {detected_failure['snippet']}"
 
     if lazy:
         # Wait for lazy-pages process to exit, but don't block indefinitely.
         lp_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "lp.log")
         restore_log_file = os.path.join(msg["restore"]["path"], "migrate", "r_log", "restore.log")
-        lazy_wait = float(os.getenv("LAZY_PAGES_WAIT_SEC", "120"))
-        check_interval = float(os.getenv("LAZY_PAGES_CHECK_INTERVAL", "1.0"))
 
         def _scan_logs_for_failure():
             # Only treat an explicit 'Restoring FAILED' marker in restore.log as a definitive restore failure.
@@ -780,7 +955,6 @@ def perform_restore(msg):
                 pass
             return None
 
-        start_time = time.time()
         detected_failure = False
         detected_log = None
         snippet = None
@@ -791,53 +965,26 @@ def perform_restore(msg):
             detected_failure = True
             detected_log, snippet = initial
 
-        # poll while lp is running and no failure detected yet
-        while not detected_failure and lp.poll() is None and (time.time() - start_time) < lazy_wait:
-            time.sleep(check_interval)
-            res = _scan_logs_for_failure()
-            if res:
-                detected_failure = True
-                detected_log, snippet = res
-                break
-
         if detected_failure:
             logger.error("Detected restore/lazy failure in %s: %s", detected_log, (snippet or '')[:200])
-            try:
-                lp.kill()
-            except Exception:
-                pass
-            try:
-                lp.wait(timeout=5)
-            except Exception:
-                pass
+            if lp:
+                try:
+                    os.killpg(os.getpgid(lp.pid), signal.SIGTERM)
+                except Exception:
+                    try:
+                        lp.kill()
+                    except Exception:
+                        pass
+                try:
+                    lp.wait(timeout=5)
+                except Exception:
+                    pass
             # Mark as error and annotate stderr for reply
             if ret == 0:
                 ret = 1
                 err = (err or "") + "\n" + f"detected failure in {detected_log}: {(snippet or '')[:400]}"
             else:
                 err = (err or "") + "\n" + f"detected failure in {detected_log}: {(snippet or '')[:400]}"
-        elif lp.poll() is None:
-            # timed out waiting for lazy-pages to finish
-            logger.error("lazy-pages did not exit after %s seconds; killing process", lazy_wait)
-            try:
-                lp.kill()
-            except Exception as e:
-                logger.error("failed to kill lazy-pages process: %s", e)
-            try:
-                lp.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                logger.error("lazy-pages did not terminate after kill; force-terminating")
-                try:
-                    lp.terminate()
-                except Exception:
-                    pass
-            # Consider this a failure of the lazy page transfer and annotate stderr
-            lazy_timeout_msg = f"lazy-pages timeout after {int(lazy_wait)}s; see {lp_log_file}"
-            if ret == 0:
-                ret = 1
-                err = (err or "") + "\n" + lazy_timeout_msg
-            else:
-                err = (err or "") + "\n" + lazy_timeout_msg
 
     if ret == 0:
         restore_log_path = msg["restore"]["path"] + "/migrate/r_log"
@@ -845,9 +992,29 @@ def perform_restore(msg):
         if lazy:
             lp_log_file = msg["restore"]["path"] + "/migrate/r_log/lp.log"
 
+            # 等待 lazy-pages 进程退出或 lp.log 稳定（best-effort）
+            try:
+                if 'lp' in locals() and lp:
+                    try:
+                        logger.debug("Waiting up to 15s for lazy-pages to exit")
+                        lp.wait(timeout=15)
+                        logger.debug("lazy-pages exited before timeout")
+                    except subprocess.TimeoutExpired:
+                        logger.debug("lazy-pages still running after timeout; waiting for lp.log to stabilize for 5s")
+                        if not _wait_file_stable(lp_log_file, timeout=5.0):
+                            logger.warning("lp.log did not stabilize within timeout; parsing current content for best-effort metrics")
+                else:
+                    if not _wait_file_stable(lp_log_file, timeout=10.0):
+                        logger.warning("lp.log not present or not stable; parsing current content for best-effort metrics")
+            except Exception as e:
+                logger.debug("Exception while waiting for lazy-pages/log stabilization: %s", e)
+
             total_uffd_copy = calculate_uffd_copy(lp_log_file)
             rpf_handle_time = get_rpf_handle_time(lp_log_file)
             total_uffd_copy_kb = total_uffd_copy / 1024.0
+
+            # 简要摘要便于排查（会写入 restore 日志）
+            logger.info("lp.log summary: total_uffd_copy=%d bytes (%.2f KB), rpf_handle_time=%.2f ms", total_uffd_copy, total_uffd_copy_kb, rpf_handle_time)
 
             reply = "runc restored %s successfully with %.3f ms, total_uffd_copy: %.2f KB, rpf_handle_time: %.2f ms" % (
                 msg["restore"]["name"],
@@ -867,17 +1034,28 @@ def perform_restore(msg):
 
 
 def _wait_file_stable(path, timeout=10.0, interval=0.1):
+    """Wait for a file to appear and its size to stabilize between checks.
+
+    Returns True if the file size stabilizes before timeout, otherwise False.
+    """
     import os
     import time
 
-    end = time.time() + timeout
+    end = time.time() + float(timeout)
     last = None
     while time.time() < end:
         if os.path.exists(path):
-            sz = os.path.getsize(path)
+            try:
+                sz = os.path.getsize(path)
+            except Exception:
+                sz = None
             if last is not None and sz == last:
                 return True
             last = sz
+        # avoid busy-looping
+        time.sleep(float(interval))
+    logger.debug("_wait_file_stable timed out waiting for %s after %.1f seconds", path, float(timeout))
+    return False
 def _reset_transfer_state():
     """Clear previous transfer sessions and reset per-run flags."""
     transfer_manager.reset()

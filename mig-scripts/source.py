@@ -970,26 +970,47 @@ def calculate_image(directory, exclude_pages=False):
 # create the pre-dump, which is done in case of pre-copy and hybrid migrations.
 # pre-dump contains the entire content of the container virtual memory
 # pre-dump is stored in the parent directory
-def pre_dump(mig_base, container, i, dirtymap):
+def pre_dump(mig_base, container, i, dirtymap, runc_args=None):
 
     old_cwd = os.getcwd()
     os.chdir(mig_base)
-    cmd = "runc checkpoint --pre-dump --work-path pd_log_{} --image-path parent_{}".format(i, i)
-    cmd += " " + container
+    # Build pre-dump command and include any runc_args provided
+    cmd_parts = ["runc", "checkpoint", "--pre-dump", "--work-path", f"pd_log_{i}", "--image-path", f"parent_{i}"]
+    # Include runc args (list or string)
+    if runc_args:
+        if isinstance(runc_args, (list, tuple)):
+            cmd_parts.extend(str(a) for a in runc_args)
+        elif isinstance(runc_args, str):
+            cmd_parts.extend(shlex.split(runc_args))
+    # add container and other flags
     if dirtymap:
-        cmd += " --use-dirty-map --dirty-map-dir " + dirtymap_path
-    # 只有 i>1 时才加上上一次的 parent_(i-1)
+        cmd_parts.extend(["--use-dirty-map", "--dirty-map-dir", dirtymap_path])
     if i > 1:
-        cmd += f" --parent-path ../parent_{i-1}"
-    # cmd += ' --parent-path ../parent_{}'.format(i)
-    # print(cmd)
-    # start = time.perf_counter() * 1000
-    ret = os.system(cmd)
-    # end = time.perf_counter() * 1000
-    # print ("%s finished after %.3f ms with %d" % (cmd, end - start, ret))
-    # pre_dump_time_total += (end - start)# 累计预拷贝时间
+        cmd_parts.extend(["--parent-path", f"../parent_{i-1}"])
+    cmd_parts.append(container)
+    cmd = " ".join(shlex.quote(part) for part in cmd_parts)
+    print(f"[predump] cmd: {cmd}")
+
+    # Run command and capture return code; try to detect file-locks and retry once with --file-locks if necessary
+    ret = subprocess.call(cmd, shell=True)
     os.chdir(old_cwd)
     if ret != 0:
+        # scan dump log for file-lock hint
+        dump_log = os.path.join(mig_base, f"pd_log_{i}", "dump.log")
+        try:
+            if os.path.exists(dump_log):
+                with open(dump_log, "r", encoding="utf-8", errors="ignore") as fh:
+                    tail = fh.read()[-16384:]
+                if ("file lock" in tail.lower()) or ("--file-locks" in tail.lower()) or ("you can try --file-locks" in tail.lower()):
+                    if not runc_args or "--file-locks" not in [str(x) for x in (runc_args or [])]:
+                        print(f"[predump] detected file-locks hint in {dump_log}; retrying pre-dump with --file-locks")
+                        new_args = list(runc_args or [])
+                        new_args.append("--file-locks")
+                        # retry once
+                        pre_dump(mig_base, container, i, dirtymap, runc_args=new_args)
+                        return
+        except Exception as e:
+            print(f"[predump] warning: failed to parse {dump_log}: {e}")
         error()
 
 
@@ -1393,7 +1414,7 @@ def get_dm_stop_params():
         "stop_consec": stop_consec,
     }
 
-def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_session):
+def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_session, runc_args=None):
     iter_terminate = False
     last_iter = 1
     # DM-based stopping is automatically active when dirtymap is enabled; environment variables only tune thresholds.
@@ -1408,7 +1429,7 @@ def iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve
         start_dirty_track(device_fd)
     while last_iter <= max_iter:
         last_path = parent_path[last_iter - 1]
-        pre_dump(mig_base, container, last_iter, dirtymap)
+        pre_dump(mig_base, container, last_iter, dirtymap, runc_args=runc_args)
 
         dir_size = float(getdirsize(last_path, "pages") or 0)
         less_last_path = parent_path[last_iter - 2] if last_iter > 1 else None
@@ -1648,6 +1669,20 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
     global dirtymap_path
     dirtymap_path = mig_base + "/dirty_map"
 
+    # Ensure runc_args is a normalized mutable list and auto-apply container-specific flags
+    try:
+        runc_args = list(runc_args or [])
+    except Exception:
+        runc_args = []
+
+    # Auto-add --file-locks for Elasticsearch to avoid pre-dump file-lock failures
+    try:
+        if "elasticsearch" in (container or "").lower() and "--file-locks" not in runc_args:
+            runc_args.append("--file-locks")
+            print(f"[file-locks] auto-added --file-locks to runc_args for {container}")
+    except Exception:
+        pass
+
     if pre:
         for i in range(1, max_iter + 1):
             parent_dir = f"{mig_base}/parent_{i}"
@@ -1805,7 +1840,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
                 if ret != 0:
                     error()
 
-        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_pre_session)
+        last_iter = iterate_predump(cs, mig_base, parent_path, max_iter, dest, dirtymap, resolve_pre_session, runc_args=runc_args)
         global pre_dump_iters
         pre_dump_iters = last_iter
         # 使用同步传输，所有传输已在iterate_predump中完成，无需发送确认消息
@@ -1993,7 +2028,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     # 等待恢复完成
     print("Wait for destination...")
-    max_wait_time = 200 if post else 30  # post-copy使用更长的等待时间
+    max_wait_time = 600 if post else 30  # post-copy使用更长的等待时间
     answer = None
     try:
         cs.settimeout(max_wait_time)
@@ -2230,6 +2265,56 @@ if not container_name:
 
 # print(f"Debug: container_name = '{container_name}'")
 # print(f"Debug: criu_args = {runc_args}")
+
+# Second pass (safer): include long flags, and only attach the following token as a value
+# when the flag is known to accept a value (avoid treating the container name or dest IP as a value).
+try:
+    known_value_flags = {"--page-server", "--status-fd", "--dirty-map-dir", "--parent-path", "--image-path", "--work-path"}
+    skip_flags = {"-tc", "--time-constraint", "-i", "--iter", "-z", "--compress", "--bandwidth", "-b"}
+    for idx in range(1, len(sys.argv) - 1):
+        a = sys.argv[idx]
+        b = sys.argv[idx + 1]
+        if not a.startswith("--"):
+            continue
+        if a in skip_flags:
+            continue
+        # If the following token is the container name or the dest IP, do not consume it as a flag value
+        if (b == container_name) or (b == args.dest):
+            if a not in runc_args:
+                runc_args.append(a)
+            continue
+        # If next token looks like another flag, only add the flag
+        if b.startswith("-"):
+            if a not in runc_args:
+                runc_args.append(a)
+            continue
+        # At this point b looks like a value token. Only attach it for known value-flags
+        if a in known_value_flags:
+            if a not in runc_args:
+                runc_args.append(a)
+            if b not in runc_args:
+                runc_args.append(b)
+        else:
+            # Treat as boolean flag; don't append the following token which may be the container
+            if a not in runc_args:
+                runc_args.append(a)
+except Exception:
+    pass
+
+# Normalize runc_args to remove duplicates while preserving order
+def _normalize_args_list(arr):
+    seen = set()
+    out = []
+    for a in (arr or []):
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+runc_args = _normalize_args_list(runc_args)
+# ensure runc_args is a mutable list
+runc_args = list(runc_args or [])
+print(f"runc_args normalized to: {runc_args}")
 
 if __name__ == "__main__":
 
