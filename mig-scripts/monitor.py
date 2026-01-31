@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import threading
 import time
+import csv
 from fcntl import ioctl
 import socket
 import typing
@@ -153,7 +154,7 @@ class ContainerResourceMonitor:
 
         base_path = f"/runc/containers/{container_name}/migrate/d_log"
         os.makedirs(base_path, exist_ok=True)
-        self.out_path = out_path or os.path.join(base_path, "resource_usage.tsv")
+        self.out_path = out_path or os.path.join(base_path, "resource_usage.csv")
 
         with open(f"/run/runc/{container_name}/state.json", "r") as f:
             self.init_pid = int(json.load(f)["init_process_pid"])
@@ -164,10 +165,25 @@ class ContainerResourceMonitor:
         self.effective_cpus = self._detect_effective_cpus()
 
         if not os.path.exists(self.out_path) or os.path.getsize(self.out_path) == 0:
-            with open(self.out_path, "w") as f:
-                f.write(
-                    "timestamp\trel_s\tphase\tcpu_pct\tmem_MB\thost_cpu_pct\thost_mem_MB\t"
-                    "core_usage\tmethod\tc_rx_Mbps\tc_tx_Mbps\th_rx_Mbps\th_tx_Mbps\tiface\n"
+            with open(self.out_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "timestamp",
+                        "rel_s",
+                        "phase",
+                        "cpu_pct",
+                        "mem_MB",
+                        "host_cpu_pct",
+                        "host_mem_MB",
+                        "core_usage",
+                        "method",
+                        "c_rx_Mbps",
+                        "c_tx_Mbps",
+                        "h_rx_Mbps",
+                        "h_tx_Mbps",
+                        "iface",
+                    ]
                 )
 
         self._prime()
@@ -388,10 +404,25 @@ class ContainerResourceMonitor:
 
         # write line
         try:
-            with open(self.out_path, "a") as f:
-                f.write(
-                    f"{now}\t{rel:.3f}\t{phase}\t{cpu_pct:.2f}\t{mem_mb:.2f}\t{host_cpu:.2f}\t{host_mem_mb:.2f}\t"
-                    f"{core_usage:.3f}\t{method}\t{c_rx}\t{c_tx}\t{h_rx}\t{h_tx}\t{iface}\n"
+            with open(self.out_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        f"{now}",
+                        f"{rel:.3f}",
+                        phase,
+                        f"{cpu_pct:.2f}",
+                        f"{mem_mb:.2f}",
+                        f"{host_cpu:.2f}",
+                        f"{host_mem_mb:.2f}",
+                        f"{core_usage:.3f}",
+                        method,
+                        c_rx,
+                        c_tx,
+                        h_rx,
+                        h_tx,
+                        iface,
+                    ]
                 )
         except Exception:
             pass
@@ -435,8 +466,11 @@ class HostResourceMonitor:
 
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
         if not os.path.exists(self.out_path) or os.path.getsize(self.out_path) == 0:
-            with open(self.out_path, "w") as f:
-                f.write("timestamp\trel_s\tphase\thost_cpu_pct\thost_mem_MB\th_rx_Mbps\th_tx_Mbps\tiface\n")
+            with open(self.out_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    ["timestamp", "rel_s", "phase", "host_cpu_pct", "host_mem_MB", "h_rx_Mbps", "h_tx_Mbps", "iface"]
+                )
 
         try:
             psutil.cpu_percent(None)
@@ -489,8 +523,20 @@ class HostResourceMonitor:
             c_tx = (tx - tx0) * 8.0 / dt / 1e6
             self._last_net = (now, rx, tx)
 
-        with open(self.out_path, "a") as f:
-            f.write(f"{now}\t{rel_s:.3f}\ttransfer\t{cpu_pct:.2f}\t{mem_mb:.2f}\t{c_rx if isinstance(c_rx, str) else f'{c_rx:.3f}'}\t{c_tx if isinstance(c_tx, str) else f'{c_tx:.3f}'}\t{self.iface}\n")
+        with open(self.out_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    f"{now}",
+                    f"{rel_s:.3f}",
+                    "transfer",
+                    f"{cpu_pct:.2f}",
+                    f"{mem_mb:.2f}",
+                    c_rx if isinstance(c_rx, str) else f"{c_rx:.3f}",
+                    c_tx if isinstance(c_tx, str) else f"{c_tx:.3f}",
+                    self.iface,
+                ]
+            )
 
     def _run(self):
         while not self._stop.wait(self.interval):

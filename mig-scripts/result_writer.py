@@ -1,4 +1,5 @@
 import os
+import csv
 from datetime import datetime
 from typing import Optional
 
@@ -56,7 +57,7 @@ def append_result(
     results_dir: Optional[str] = None,
 ):
     results_dir = _ensure_results_dir(results_dir)
-    fname = os.path.join(results_dir, f"{exp_name}.tsv")
+    fname = os.path.join(results_dir, f"{exp_name}.csv")
     is_new = not os.path.exists(fname)
     ts = datetime.utcnow().isoformat() + "Z"
     header_columns = ["timestamp", "container", "run"]
@@ -72,37 +73,39 @@ def append_result(
     else:
         row_values.append("")
 
-    with open(fname, "a", encoding="utf-8") as f:
+    with open(fname, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
         if is_new:
-            f.write("\t".join(header_columns) + "\n")
-        f.write("\t".join(row_values) + "\n")
+            writer.writerow(header_columns)
+        writer.writerow(row_values)
 
 
-def summarize_results(exp_name: str, out_suffix: str = "_summary.tsv"):
-    """Read <exp_name>.tsv and produce a summary table (mean/std/min/max/count) for numeric columns.
-    Summary is written to results/<exp_name>_summary.tsv and returned as a dict.
+def summarize_results(exp_name: str, out_suffix: str = "_summary.csv"):
+    """Read <exp_name>.csv and produce a summary table (mean/std/min/max/count) for numeric columns.
+    Summary is written to results/<exp_name>_summary.csv and returned as a dict.
     """
     import csv
     import statistics
 
     results_dir = _ensure_results_dir()
-    fname = os.path.join(results_dir, f"{exp_name}.tsv")
+    fname = os.path.join(results_dir, f"{exp_name}.csv")
     if not os.path.exists(fname):
         return None
 
     # Read file, skip comment lines
     rows = []
     header = None
-    with open(fname, "r", encoding="utf-8") as fr:
-        for line in fr:
-            if line.startswith("#"):
+    with open(fname, "r", encoding="utf-8", newline="") as fr:
+        reader = csv.reader(fr)
+        for row in reader:
+            if not row:
                 continue
-            line = line.rstrip("\n")
+            if row[0].startswith("#"):
+                continue
             if header is None:
-                header = line.split("\t")
+                header = row
                 continue
-            parts = line.split("\t")
-            rows.append(parts)
+            rows.append(row)
 
     if not header or not rows:
         return None
@@ -133,11 +136,19 @@ def summarize_results(exp_name: str, out_suffix: str = "_summary.tsv"):
 
     # write summary
     out_path = os.path.join(results_dir, f"{exp_name}{out_suffix}")
-    with open(out_path, "w", encoding="utf-8") as fo:
-        fo.write("metric\tmean\tstdev\tmin\tmax\tcount\n")
+    with open(out_path, "w", encoding="utf-8", newline="") as fo:
+        writer = csv.writer(fo)
+        writer.writerow(["metric", "mean", "stdev", "min", "max", "count"])
         for metric, stats in metrics.items():
-            fo.write(
-                f"{metric}\t{stats['mean']:.6f}\t{stats['stdev']:.6f}\t{stats['min']:.6f}\t{stats['max']:.6f}\t{stats['count']}\n"
+            writer.writerow(
+                [
+                    metric,
+                    f"{stats['mean']:.6f}",
+                    f"{stats['stdev']:.6f}",
+                    f"{stats['min']:.6f}",
+                    f"{stats['max']:.6f}",
+                    stats["count"],
+                ]
             )
 
     return metrics

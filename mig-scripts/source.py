@@ -235,10 +235,43 @@ def stop_sync_rootfs():
 
 # 信号处理器函数
 def signal_handler(signum, frame):
-    """处理 сигнал终止"""
-    print(f"\n接收到信号 {signum}，正在清理并退出...")
-    stop_sync_rootfs()
-    sys.exit(0)
+    """Handle termination signals: attempt post-copy cleanup before exit."""
+    try:
+        print(f"\n接收到信号 {signum}，正在清理并退出...", file=sys.stderr)
+        # attempt to clean page servers for any post-copy runs
+        try:
+            for cont, st in list(GLOBAL_MIG_STATE.items()):
+                if not st:
+                    continue
+                if st.get('postcopy_requested') or st.get('page_server_registered'):
+                    try:
+                        print(f"[signal] cleaning page-server for {cont} due to signal {signum}", file=sys.stderr)
+                        cleanup_page_servers(cont)
+                    except Exception as e:
+                        print(f"[signal] cleanup failed for {cont}: {e}", file=sys.stderr)
+        except Exception:
+            pass
+
+        # stop sync rootfs if running
+        try:
+            stop_sync_rootfs()
+        except Exception:
+            pass
+
+    finally:
+        # restore original handler for the signal and re-raise to get default termination code
+        try:
+            prev = ORIGINAL_SIGNAL_HANDLERS.get(signum)
+            if prev:
+                signal.signal(signum, prev)
+            else:
+                signal.signal(signum, signal.SIG_DFL)
+        except Exception:
+            pass
+        try:
+            os.kill(os.getpid(), signum)
+        except Exception:
+            sys.exit(1)
 
 
 # [新] 添加这个函数
@@ -547,14 +580,343 @@ def get_runc_container_pidtree(container_name):
                 continue
 
 
-def error():
-    print("Something did not work. Exiting!", file=sys.stderr)
-    # 确保在程序终止时停止 sync_rootfs 进程
-    stop_sync_rootfs()
+# Diagnostics and cleanup helpers
+LAST_CMD_INFO = {
+    'desc': None,
+    'cmd': None,
+    'ret': None,
+    'stdout': None,
+    'stderr': None,
+    'ts': None,
+}
+LAST_EXCEPTION_TEXT = None
+# Map container -> state dict: {'mig_base', 'status_write_fd', 'page_server_port', 'page_server_registered', 'registered_time', 'postcopy_requested'}
+GLOBAL_MIG_STATE = {}
+# Keep originals so we can restore them (best-effort) and call original hooks
+ORIGINAL_SIGNAL_HANDLERS = {}
+ORIGINAL_EXCEPTHOOK = None
 
-    if diskless:
-        post_process(max_iter)
-    sys.exit(-1)
+
+def record_last_cmd(desc, cmd, ret=None, stdout=None, stderr=None):
+    """Record the last executed command and its output (best-effort).
+
+    This is used by `error()` to provide richer diagnostics on failures.
+    """
+    global LAST_CMD_INFO
+    try:
+        LAST_CMD_INFO = {
+            'desc': desc,
+            'cmd': cmd,
+            'ret': ret,
+            'stdout': (stdout or '')[:8192],
+            'stderr': (stderr or '')[:8192],
+            'ts': datetime.datetime.utcnow().isoformat(),
+        }
+    except Exception:
+        # best-effort, don't let diagnostics break failure handling
+        pass
+
+
+def register_status_fd(container_name, mig_base, write_fd, port=None):
+    """Register that we created a status-fd / page-server for a given container/mig_base.
+
+    This allows cleanup on early failure.
+    """
+    GLOBAL_MIG_STATE.setdefault(container_name, {})
+    GLOBAL_MIG_STATE[container_name].update(
+        {
+            'mig_base': os.path.abspath(mig_base),
+            'status_write_fd': write_fd,
+            'page_server_port': port,
+            'registered_time': time.time(),
+            'page_server_registered': False,
+            'postcopy_requested': True,
+        }
+    )
+
+
+def mark_page_server_registered(container_name):
+    try:
+        GLOBAL_MIG_STATE.setdefault(container_name, {})['page_server_registered'] = True
+    except Exception:
+        pass
+
+
+def clear_postcopy_state(container_name):
+    """Clear recorded postcopy state for a container after successful completion."""
+    try:
+        st = GLOBAL_MIG_STATE.get(container_name)
+        if st:
+            st['postcopy_requested'] = False
+            st['page_server_registered'] = False
+            st['status_write_fd'] = None
+            st['page_server_port'] = None
+    except Exception:
+        pass
+
+
+def postcopy_atexit_cleanup():
+    """atexit handler to attempt cleanup of page-server processes for any recorded post-copy runs.
+
+    This is best-effort and intentionally conservative: it only attempts cleanup for containers
+    that have recorded that post-copy was requested or have a page-server registered.
+    """
+    try:
+        for cont, st in list(GLOBAL_MIG_STATE.items()):
+            if not st:
+                continue
+            if st.get('postcopy_requested') or st.get('page_server_registered') or st.get('status_write_fd') or st.get('page_server_port'):
+                try:
+                    print(f"[atexit] attempting post-copy cleanup for {cont}", file=sys.stderr)
+                    cleanup_page_servers(cont)
+                except Exception as e:
+                    print(f"[atexit] cleanup failed for {cont}: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[atexit] enumeration error: {e}", file=sys.stderr)
+
+
+def _tail_file(path, max_chars=4096):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - int(max_chars))
+            f.seek(start)
+            return f.read().decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def collect_diagnostics(container_name=None, mig_base=None):
+    parts = []
+    try:
+        ci = LAST_CMD_INFO
+        if ci and ci.get('cmd'):
+            parts.append("--- Last command ---")
+            parts.append(f"desc: {ci.get('desc')}")
+            parts.append(f"cmd: {ci.get('cmd')}")
+            parts.append(f"ret: {ci.get('ret')}")
+            if ci.get('stdout'):
+                parts.append("[last stdout snippet]")
+                parts.append(ci.get('stdout')[-2048:])
+            if ci.get('stderr'):
+                parts.append("[last stderr snippet]")
+                parts.append(ci.get('stderr')[-2048:])
+    except Exception:
+        pass
+
+    mb = mig_base
+    if not mb and container_name:
+        # best-effort reconstruct
+        guessed = f"/runc/containers/{container_name}/migrate"
+        if os.path.exists(guessed):
+            mb = guessed
+
+    if mb:
+        # common logs to include
+        logs = [os.path.join(mb, 'd_log', 'dump.log'), os.path.join(mb, 'd_log', 'stats-dump')]
+        try:
+            for entry in os.scandir(mb):
+                if entry.is_dir() and entry.name.startswith('pd_log_'):
+                    logs.append(os.path.join(mb, entry.name, 'dump.log'))
+        except Exception:
+            pass
+        for l in logs:
+            if os.path.exists(l):
+                tail = _tail_file(l, max_chars=4096)
+                parts.append(f"--- tail of {l} ---")
+                parts.append(tail or "<unreadable>")
+
+    return "\n\n".join(parts)
+
+
+def cleanup_page_servers(container_name=None):
+    """Attempt to find and terminate CRIU page-server / lazy-pages processes related to a migration.
+
+    Heuristics used (best-effort - be conservative when container_name provided):
+    - Any process with 'criu' in the name/cmdline and one of: '--rpc', 'page-server', 'lazy-pages', 'dump --rpc'
+    - Any process listening on the known page-server port (commonly 27) or opening files/cwd under the migration directory
+
+    The function prefers to match the container name, image path or stored mig_base (from register_status_fd) to avoid killing unrelated CRIU instances.
+    """
+    if psutil is None:
+        print("[cleanup] psutil not available; skipping page-server cleanup", file=sys.stderr)
+        return
+
+    # best-effort info about current migration state
+    mig_base = None
+    page_port = None
+    try:
+        st = GLOBAL_MIG_STATE.get(container_name, {}) if container_name else {}
+        mig_base = st.get('mig_base') if st else None
+        page_port = st.get('page_server_port') if st else None
+    except Exception:
+        mig_base = None
+        page_port = None
+
+    killed = []
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cwd']):
+            try:
+                name = (proc.info.get('name') or '').lower()
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
+                lower_cmd = cmdline.lower()
+
+                # identify CRIU-related processes
+                is_criu = ('criu' in name) or ('criu' in lower_cmd)
+
+                # identify page-server/lazy/dump rpc invocations
+                mentions_page = False
+                if '--rpc' in lower_cmd or 'dump --rpc' in lower_cmd:
+                    mentions_page = True
+                if 'page-server' in lower_cmd or 'lazy-pages' in lower_cmd or '--lazy-pages' in lower_cmd or '--page-server' in lower_cmd:
+                    mentions_page = True
+
+                # if not directly mentioned, look for processes listening on the default or registered port
+                if not mentions_page:
+                    try:
+                        for c in proc.connections(kind='inet'):
+                            if c.laddr and (c.laddr.port in (27,) or (page_port and c.laddr.port == int(page_port))):
+                                mentions_page = True
+                                break
+                    except Exception:
+                        pass
+
+                # also consider processes whose cwd or open files point to the migrate directory for this container
+                try:
+                    cwd = proc.info.get('cwd') or ''
+                    if not mentions_page and mig_base and cwd and mig_base in cwd:
+                        mentions_page = True
+                except Exception:
+                    pass
+
+                # final decision: must be a criu process and mention page-related behavior
+                if not (is_criu and mentions_page):
+                    continue
+
+                # further restrict by container_name/mig_base when provided to avoid false positives
+                if container_name:
+                    if container_name not in lower_cmd and (not mig_base or (mig_base and mig_base not in lower_cmd)) and ('image' not in lower_cmd):
+                        # Not mentioning container name or mig_base or image -> skip conservative kill
+                        continue
+
+                pid = proc.pid
+                cmdline_short = (lower_cmd[:200] + '...') if len(lower_cmd) > 200 else lower_cmd
+                reason = 'match-criu-page' if is_criu and mentions_page else 'unknown'
+                print(f"[cleanup] terminating page-server process PID={pid} reason={reason} cmd='{cmdline_short}'", file=sys.stderr)
+
+                try:
+                    # terminate process group if possible, otherwise proc.terminate()
+                    try:
+                        pgid = os.getpgid(pid)
+                        os.killpg(pgid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+                    # wait a short time for process to exit
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        # escalate
+                        try:
+                            pgid = os.getpgid(pid)
+                            os.killpg(pgid, signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                    killed.append((pid, cmdline_short))
+                except Exception as e:
+                    print(f"[cleanup] failed to kill PID {pid}: {e}", file=sys.stderr)
+                    continue
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception as e:
+        print(f"[cleanup] error enumerating processes: {e}", file=sys.stderr)
+
+    if killed:
+        print(f"[cleanup] terminated {len(killed)} page-server processes: {killed}", file=sys.stderr)
+
+
+# Improved error() that prints context and attempts cleanup
+def error(msg=None, exit_code=-1):
+    try:
+        print("Something did not work. Exiting!", file=sys.stderr)
+        if msg:
+            print(f"Error: {msg}", file=sys.stderr)
+
+        # print any recorded exception text
+        if LAST_EXCEPTION_TEXT:
+            print("Last exception:", file=sys.stderr)
+            print(LAST_EXCEPTION_TEXT, file=sys.stderr)
+
+        # print last command context
+        if LAST_CMD_INFO and LAST_CMD_INFO.get('cmd'):
+            print("--- Last command context ---", file=sys.stderr)
+            print(f"desc: {LAST_CMD_INFO.get('desc')}", file=sys.stderr)
+            print(f"cmd: {LAST_CMD_INFO.get('cmd')}", file=sys.stderr)
+            if LAST_CMD_INFO.get('ret') is not None:
+                print(f"return code: {LAST_CMD_INFO.get('ret')}", file=sys.stderr)
+            if LAST_CMD_INFO.get('stdout'):
+                print("[last stdout snippet]", file=sys.stderr)
+                print(LAST_CMD_INFO.get('stdout')[-2048:], file=sys.stderr)
+            if LAST_CMD_INFO.get('stderr'):
+                print("[last stderr snippet]", file=sys.stderr)
+                print(LAST_CMD_INFO.get('stderr')[-2048:], file=sys.stderr)
+
+        # collect and print logs related to the current migration
+        try:
+            diag = collect_diagnostics(globals().get('container'), globals().get('mig_base'))
+            if diag:
+                print("--- diagnostics ---", file=sys.stderr)
+                print(diag, file=sys.stderr)
+                # also write diagnostics to a file under the migration dir for offline analysis (best-effort)
+                try:
+                    container_name = globals().get('container')
+                    mb = None
+                    st = GLOBAL_MIG_STATE.get(container_name) if container_name else None
+                    if st and st.get('mig_base'):
+                        mb = st.get('mig_base')
+                    else:
+                        mb = globals().get('mig_base')
+                    if mb:
+                        diag_path = os.path.join(mb, 'source_error_diag.txt')
+                        with open(diag_path, 'w', encoding='utf-8') as df:
+                            df.write(diag)
+                        print(f"[diag] wrote diagnostics to {diag_path}", file=sys.stderr)
+                except Exception as _e:
+                    print(f"[diag] failed to write diagnostics file: {_e}", file=sys.stderr)
+        except Exception:
+            pass
+
+        # NOTE: page-server cleanup is NOT performed here in error(); it is performed explicitly
+        # in the post-copy failure path where we know the run used post-copy (lazy) mode.
+        # This avoids accidental termination of unrelated CRIU instances.
+
+        # ensure sync_rootfs stopped
+        try:
+            stop_sync_rootfs()
+        except Exception:
+            pass
+
+        # close any registered status write fds
+        try:
+            st = GLOBAL_MIG_STATE.get(globals().get('container'))
+            if st and st.get('status_write_fd'):
+                try:
+                    os.close(st.get('status_write_fd'))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # call post_process if diskless was enabled
+        try:
+            if globals().get('diskless'):
+                post_process(globals().get('max_iter'))
+        except Exception:
+            pass
+
+    finally:
+        sys.exit(exit_code)
 
 
 def _run_command_checked(cmd, desc):
@@ -563,6 +925,11 @@ def _run_command_checked(cmd, desc):
     if proc.returncode != 0:
         printable = " ".join(shlex.quote(part) for part in cmd)
         message = f"{desc} failed (exit {proc.returncode}): {printable}"
+        # record command for diagnostics
+        try:
+            record_last_cmd(desc, printable, ret=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+        except Exception:
+            pass
         print(message, file=sys.stderr)
         if proc.stdout:
             print("[stdout]", file=sys.stderr)
@@ -570,7 +937,8 @@ def _run_command_checked(cmd, desc):
         if proc.stderr:
             print("[stderr]", file=sys.stderr)
             print(proc.stderr.strip(), file=sys.stderr)
-        error()
+        error(message)
+
 
 
 # 迁移开始前，指定dirty-map的目录路径
@@ -1010,8 +1378,16 @@ def pre_dump(mig_base, container, i, dirtymap, runc_args=None):
                         pre_dump(mig_base, container, i, dirtymap, runc_args=new_args)
                         return
         except Exception as e:
-            print(f"[predump] warning: failed to parse {dump_log}: {e}")
-        error()
+            # record exception text for error diagnostics and then fail
+            global LAST_EXCEPTION_TEXT
+            LAST_EXCEPTION_TEXT = f"[predump] failed to parse {dump_log}: {e}"
+            print(f"[predump] warning: {LAST_EXCEPTION_TEXT}", file=sys.stderr)
+            try:
+                record_last_cmd('predump-check', f'parse {dump_log}', ret=None, stderr=LAST_EXCEPTION_TEXT)
+            except Exception:
+                pass
+        # If we reach here, predump did not produce a usable dump; fail and print diagnostics
+        error("pre-dump failed; see pd_log_*/dump.log and d_log/dump.log for details")
 
 
 def real_dump_0(mig_base, runc_args=None):
@@ -1027,12 +1403,24 @@ def real_dump_0(mig_base, runc_args=None):
     cmd += " --leave-running"
     cmd += " " + container
 
+    # record command context for diagnostics
+    try:
+        record_last_cmd("runc checkpoint parent_0", cmd)
+    except Exception:
+        pass
+
     p = subprocess.Popen(cmd, shell=True)
     ret = p.wait()
+
+    try:
+        record_last_cmd("runc checkpoint parent_0", cmd, ret=ret)
+    except Exception:
+        pass
+
     # print("%s finished after %.3f ms with %d" % (cmd, end - start, ret))
     os.chdir(old_cwd)
     if ret != 0:
-        error()
+        error(f"runc checkpoint parent_0 failed (exit {ret})")
     directory_path = f"{mig_base}/parent_0"
     esti_dump_size_post = calculate_image(directory_path, False)
     # esti_dump_size_pre = calculate_image(directory_path, True)
@@ -1095,24 +1483,87 @@ def real_dump(mig_base, precopy, postcopy, last_iter, dirtymap, replay, cs, inpu
     cmd += " " + container
 
     # postcopy时stat-dump无法准确度量检查点时间，因此需要单独计算
+    # record command context for diagnostics
+    try:
+        record_last_cmd("runc checkpoint (image)", cmd)
+    except Exception:
+        pass
+
     if postcopy:
         start = time.perf_counter() * 1000
+        # register status fd so cleanup can close it if we fail early
+        try:
+            register_status_fd(container, mig_base, write_fd, port=27)
+        except Exception:
+            pass
+
         p = subprocess.Popen(cmd, pass_fds=(write_fd,), shell=True)
-        ret = os.read(read_fd, 1)
-        if ret == b"\0":
+        # wait for CRIU to write '\0' to the status fd to indicate the page-server is up
+        try:
+            ret_rd = os.read(read_fd, 1)
+        except Exception as e_read:
+            global LAST_EXCEPTION_TEXT
+            LAST_EXCEPTION_TEXT = f"[postcopy] status-fd read failed: {e_read}"
+            try:
+                record_last_cmd('runc checkpoint (image)', cmd, ret=None, stderr=LAST_EXCEPTION_TEXT)
+            except Exception:
+                pass
+            # clean up page-server since post-copy was requested and we failed to start it
+            try:
+                print(f"[cleanup] status-fd read failed; cleaning page-server for {container}", file=sys.stderr)
+                cleanup_page_servers(container)
+            except Exception as _e:
+                print(f"[cleanup] failed during cleanup: {_e}", file=sys.stderr)
+            error(f"runc checkpoint (image) status-fd read failed: {e_read}")
+        # got a value
+        if ret_rd == b"\0":
             print("Ready for lazy page transfer")
-            os.close(read_fd)
-            os.close(write_fd)
+            try:
+                os.close(read_fd)
+            except Exception:
+                pass
+            try:
+                os.close(write_fd)
+            except Exception:
+                pass
+            # we've seen the page-server up; mark it registered so cleanup knows to kill it
+            try:
+                mark_page_server_registered(container)
+                # clear stored fd now that we've closed it
+                GLOBAL_MIG_STATE.get(container, {})['status_write_fd'] = None
+            except Exception:
+                pass
+        else:
+            # unexpected return from status fd; treat as failure and clean up page-server
+            try:
+                print(f"[cleanup] status-fd returned non-null ({ret_rd}); cleaning page-server for {container}", file=sys.stderr)
+                cleanup_page_servers(container)
+            except Exception as _e:
+                print(f"[cleanup] failed during cleanup: {_e}", file=sys.stderr)
+            error("runc checkpoint (image) failed to start page-server (status-fd returned unexpected value)")
         ret = 0
         end = time.perf_counter() * 1000
         dump_time = end - start
     else:
         p = subprocess.Popen(cmd, shell=True)
         ret = p.wait()
+
+    # record final result for diagnostics
+    try:
+        record_last_cmd("runc checkpoint (image)", cmd, ret=ret)
+    except Exception:
+        pass
+
     # print("%s finished after %.3f ms with %d" % (cmd, end - start, ret))
     os.chdir(old_cwd)
     if ret != 0:
-        error()
+        if postcopy:
+            try:
+                print(f"[cleanup] post-copy run failed; cleaning page-server for {container}", file=sys.stderr)
+                cleanup_page_servers(container)
+            except Exception as _e:
+                print(f"[cleanup] cleanup failed: {_e}", file=sys.stderr)
+        error(f"runc checkpoint (image) failed (exit {ret})")
 
     # '--tcp-established'迁移TCP连接
     if runc_args and "--tcp-established" in " ".join(runc_args):
@@ -1654,10 +2105,44 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     # 注册退出处理器和信号处理器
     atexit.register(stop_sync_rootfs)
+    # register a post-copy atexit cleanup (best-effort for unexpected exits)
+    atexit.register(postcopy_atexit_cleanup)
 
-    # 注册信号处理器
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    # 保存原始信号处理器并设置新的处理器 for common termination signals
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            ORIGINAL_SIGNAL_HANDLERS[s] = signal.getsignal(s)
+            signal.signal(s, signal_handler)
+        except Exception:
+            pass
+
+    # install a custom excepthook to ensure post-copy cleanup on unhandled exceptions
+    global ORIGINAL_EXCEPTHOOK
+    try:
+        ORIGINAL_EXCEPTHOOK = sys.excepthook
+
+        def _postcopy_excepthook(exc_type, exc_value, exc_tb):
+            try:
+                print("[excepthook] unhandled exception occurred; attempting post-copy cleanup", file=sys.stderr)
+                for cont, st in list(GLOBAL_MIG_STATE.items()):
+                    if st and (st.get('postcopy_requested') or st.get('page_server_registered')):
+                        try:
+                            cleanup_page_servers(cont)
+                        except Exception as e:
+                            print(f"[excepthook] cleanup failed for {cont}: {e}", file=sys.stderr)
+            except Exception:
+                pass
+            # delegate to original hook
+            try:
+                if ORIGINAL_EXCEPTHOOK:
+                    ORIGINAL_EXCEPTHOOK(exc_type, exc_value, exc_tb)
+            except Exception:
+                # fallback printing
+                print("Unhandled exception:", exc_value, file=sys.stderr)
+
+        sys.excepthook = _postcopy_excepthook
+    except Exception:
+        pass
 
     base_path = runc_base + container
     rootfs_path = base_path + "/rootfs"
@@ -1931,7 +2416,7 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
             ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
             default_outdir = f"/runc/containers/{container}/migrate/d_log"
             os.makedirs(default_outdir, exist_ok=True)
-            out_path = args.monitor_out or os.path.join(default_outdir, f"resource_usage.source.{ts}.tsv")
+            out_path = args.monitor_out or os.path.join(default_outdir, f"resource_usage.source.{ts}.csv")
             resmon = monitor_mod.ContainerResourceMonitor(
                 container,
                 interval=args.monitor_interval,
@@ -1951,6 +2436,16 @@ def migrate(container, dest, pre, post, replay, rootfs, max_iter, dirtymap, time
 
     try:
         real_dump(mig_base, pre, post, last_iter, dirtymap, replay, cs, inputs, runc_args)
+        # successful completion; clear postcopy state to avoid atexit/signal cleanup on success
+        try:
+            if post:
+                clear_postcopy_state(container)
+        except Exception:
+            pass
+    except Exception:
+        # any exception during the real_dump or subsequent steps will be handled by the
+        # registered excepthook/atexit/signal handlers; re-raise to propagate
+        raise
     finally:
         if resmon:
             try:

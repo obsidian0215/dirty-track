@@ -237,15 +237,15 @@ class TransferManager:
                 self.final_event.clear()
 
         # If this is the final transfer, start a host-side monitor that will record
-        # destination resource usage during the transfer and save it into d_log
+        # destination resource usage during the transfer and save it into r_log
         if is_final:
             try:
                 ts = time.strftime("%Y%m%d-%H%M%S")
                 parent_dir = os.path.abspath(os.path.join(extract_path, os.pardir))
-                out_dir = os.path.join(parent_dir, "d_log")
+                out_dir = os.path.join(parent_dir, "r_log")
                 os.makedirs(out_dir, exist_ok=True)
-                out_path = os.path.join(out_dir, f"resource_usage.dest.{ts}.tsv")
-                mon = HostResourceMonitor(out_path, interval=1.0, iface="ens33")
+                out_path = os.path.join(out_dir, f"resource_usage.dest.{ts}.csv")
+                mon = HostResourceMonitor(out_path, interval=1.0, iface="enp2s0")
                 mon.start()
                 self._session_monitors[session.token] = mon
             except Exception as e:
@@ -856,9 +856,11 @@ def perform_restore(msg):
                     logger.warning("%s: %s", stream_name, line.rstrip())
                 else:
                     logger.debug("%s: %s", stream_name, line.rstrip())
-                # Only treat explicit 'Restoring FAILED' as definitive failure
+                # Only treat explicit restore failure markers as definitive failure.
+                # Recognize both 'Restoring FAILED' and 'failure on restore' patterns (case-insensitive).
                 try:
-                    if "restoring failed" in line.lower():
+                    lowered = line.lower()
+                    if "restoring failed" in lowered or "failure on restore" in lowered:
                         detected_failure["flag"] = True
                         detected_failure["snippet"] = line.strip()
                         logger.error("Detected definitive failure marker in restore output: %s", detected_failure["snippet"])
@@ -947,8 +949,9 @@ def perform_restore(msg):
                         start = max(0, size - 8192)
                         fh.seek(start)
                         tail = fh.read().decode("utf-8", errors="replace")
-                    # Match case-insensitively for the explicit failure marker
-                    if "restoring failed" in tail.lower():
+                    # Match case-insensitively for explicit failure markers (e.g., 'Restoring FAILED' or 'failure on restore')
+                    lowered_tail = tail.lower()
+                    if "restoring failed" in lowered_tail or "failure on restore" in lowered_tail:
                         return (restore_log_file, tail[-2048:])
             except Exception:
                 # best-effort, ignore read errors

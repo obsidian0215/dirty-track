@@ -557,7 +557,7 @@ def source_run_migration(exp_args, run_index=0, exp_name="unknown"):
                 extra_param_lines=extra_param_lines,
                 first_in_run=(run_index == 1),
             )
-            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.tsv")
+            print(f"Wrote stats for {exp_name} run {run_index} -> results/{exp_name}.csv")
         else:
             print("No statistics line found in source output; skipping result write.")
     except Exception as e:

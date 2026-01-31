@@ -54,6 +54,12 @@ TMP_PIDS = os.path.join(TMP_ROOT, 'pids')
 RESULTS_ROOT = '/runc/results'
 LOCAL_HOSTS = {None, '127.0.0.1', 'localhost'}
 
+# Resource monitor defaults (overridden by CLI in main)
+MONITOR_HOST = True
+MONITOR_INTERVAL = 1.0
+MONITOR_IFACE = "ens33"
+MONITOR_CONTAINER = False
+
 
 # --- Network shaping helpers (aligned with redis_test.py / influxdb_test.py) ---
 def clean_configure_network():
@@ -883,7 +889,7 @@ def _load_run_jsons_from_dir(label: str, mode: str) -> list:
 
 
 def regenerate_integrated_table(label: str, mode: str = 'migration') -> Optional[str]:
-    """Rebuild <mode>_integrated.tsv under /runc/results/<label> from all per-run JSONs."""
+    """Rebuild <mode>_integrated.csv under /runc/results/<label> from all per-run JSONs."""
     out_dir = os.path.join(RESULTS_ROOT, label)
     os.makedirs(out_dir, exist_ok=True)
     rows = _load_run_jsons_from_dir(label, mode)
@@ -921,24 +927,25 @@ def regenerate_integrated_table(label: str, mode: str = 'migration') -> Optional
     rows.sort(key=_row_sort_key)
 
     headers = ["mode", "exp", "scene", "run"] + metric_keys
-    out_path = os.path.join(out_dir, f"{mode}_integrated.tsv")
+    out_path = os.path.join(out_dir, f"{mode}_integrated.csv")
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\t".join(headers) + "\n")
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
         for r in rows:
             row = [mode, str(r.get("exp", "")).strip(), str(r.get("scene", "")).strip(), str(r.get("run", ""))]
             metrics = r.get('metrics', {}) or {}
             for key in metric_keys:
                 row.append(str(metrics.get(key, "")))
-            f.write("\t".join(row) + "\n")
+            writer.writerow(row)
 
     print(f"[result] integrated table -> {out_path}")
     return out_path
 
 
 def regenerate_mig_test_csvs(label: str) -> None:
-    """Regenerate per-scene `mig_test_<scene>.csv` files from the migration_integrated.tsv under results/<label>."""
-    integrated = os.path.join(RESULTS_ROOT, label, 'migration_integrated.tsv')
+    """Regenerate per-scene `mig_test_<scene>.csv` files from the migration_integrated.csv under results/<label>."""
+    integrated = os.path.join(RESULTS_ROOT, label, 'migration_integrated.csv')
 
     if not os.path.exists(integrated):
         regenerated = regenerate_integrated_table(label, 'migration')
@@ -948,8 +955,8 @@ def regenerate_mig_test_csvs(label: str) -> None:
 
     data: dict = {}
     try:
-        with open(integrated, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='\t')
+        with open(integrated, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f)
             header = next(reader, None)
             if not header or len(header) < 5:
                 print(f"[result] {integrated} missing metric columns; skipping per-scene summary generation")
@@ -1000,12 +1007,12 @@ def _regenerate_missing_perrun_jsons(label: str, mode: str = 'migration') -> Non
 
     These files are marked with 'reconstructed': True so callers can tell they were synthesized.
     """
-    integrated = os.path.join(RESULTS_ROOT, label, f"{mode}_integrated.tsv")
+    integrated = os.path.join(RESULTS_ROOT, label, f"{mode}_integrated.csv")
     if not os.path.exists(integrated):
         return
     try:
-        with open(integrated, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f, delimiter='\t')
+        with open(integrated, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.reader(f)
             header = next(reader, None)
             if not header or len(header) < 5:
                 return
@@ -1103,17 +1110,18 @@ def write_integrated_table(results: list, mode: str) -> Optional[str]:
     headers = ["mode", "exp", "scene", "run"] + metric_keys
     out_dir = os.path.join(RESULTS_ROOT, out_dir_label)
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{mode}_integrated.tsv")
+    out_path = os.path.join(out_dir, f"{mode}_integrated.csv")
 
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\t".join(headers) + "\n")
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
         for r in rows:
             row = [mode, str((r.get("exp", "") or '').strip()), str((r.get("scene", "") or '').strip()), str(r.get("run", ""))]
             metrics = r.get('metrics', {}) or {}
             for key in metric_keys:
                 # Normalize access by stripping metric keys
                 row.append(str(metrics.get(key, metrics.get(key.strip(), ""))))
-            f.write("\t".join(row) + "\n")
+            writer.writerow(row)
 
     print(f"[result] integrated table -> {out_path}")
     # Ensure any missing per-run JSONs are reconstructed so the migration dir contains per-run records
@@ -1128,6 +1136,272 @@ def write_integrated_table(results: list, mode: str) -> Optional[str]:
     except Exception as e:
         print(f"[result] failed to regenerate per-scene CSVs: {e}")
 
+    return out_path
+
+
+def _normalize_ru_key(name: str) -> str:
+    try:
+        import re as _re
+
+        key = _re.sub(r"[^0-9a-zA-Z_]+", "_", str(name).strip())
+        return key.strip("_").lower()
+    except Exception:
+        return str(name).strip().lower()
+
+
+def summarize_resource_usage_csv(path: str) -> Optional[dict]:
+    """Summarize a resource usage CSV by mean/max and duration.
+
+    Returns a dict like: {samples, duration_sec, <metric>_mean, <metric>_max, ...}
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return None
+            idx = {h.strip(): i for i, h in enumerate(header) if h is not None}
+            non_numeric = {"phase", "method", "iface"}
+            rel_vals: list[float] = []
+            ts_vals: list[float] = []
+            numeric_vals: dict[str, list[float]] = {}
+            for h in header:
+                if h is None:
+                    continue
+                h_clean = str(h).strip()
+                if not h_clean:
+                    continue
+                if h_clean in non_numeric or h_clean in ("timestamp", "rel_s"):
+                    continue
+                numeric_vals[h_clean] = []
+
+            row_count = 0
+            for row in reader:
+                if not row:
+                    continue
+                row_count += 1
+                try:
+                    if "rel_s" in idx and idx["rel_s"] < len(row):
+                        v = str(row[idx["rel_s"]]).strip()
+                        if v:
+                            rel_vals.append(float(v))
+                except Exception:
+                    pass
+                try:
+                    if "timestamp" in idx and idx["timestamp"] < len(row):
+                        v = str(row[idx["timestamp"]]).strip()
+                        if v:
+                            ts_vals.append(float(v))
+                except Exception:
+                    pass
+
+                for h, col_idx in idx.items():
+                    if h in non_numeric or h in ("timestamp", "rel_s"):
+                        continue
+                    if col_idx >= len(row):
+                        continue
+                    val = str(row[col_idx]).strip()
+                    if not val or val.upper() == "NA":
+                        continue
+                    try:
+                        numeric_vals.setdefault(h, []).append(float(val))
+                    except Exception:
+                        continue
+
+            if row_count == 0:
+                return None
+
+            duration = 0.0
+            if rel_vals:
+                duration = max(rel_vals) - min(rel_vals)
+            elif ts_vals:
+                duration = max(ts_vals) - min(ts_vals)
+
+            summary: dict[str, object] = {
+                "samples": row_count,
+                "duration_sec": float(duration),
+            }
+
+            for h, vals in numeric_vals.items():
+                if not vals:
+                    continue
+                key = _normalize_ru_key(h)
+                try:
+                    summary[f"{key}_mean"] = statistics.mean(vals)
+                except Exception:
+                    summary[f"{key}_mean"] = sum(vals) / float(len(vals))
+                summary[f"{key}_max"] = max(vals)
+
+            return summary
+    except Exception as e:
+        print(f"[resource] failed to summarize {path}: {e}")
+        return None
+
+
+def _record_resource_usage(run_result: dict, role: str, path: str | None) -> None:
+    if not path:
+        return
+    try:
+        run_result.setdefault("resource_usage_paths", {})
+        run_result["resource_usage_paths"][role] = path
+    except Exception:
+        pass
+    try:
+        summary = summarize_resource_usage_csv(path)
+        if summary:
+            run_result.setdefault("resource_usage_summary", {})
+            run_result["resource_usage_summary"][role] = summary
+    except Exception:
+        pass
+
+
+def _extract_resource_usage_paths(run_record: dict) -> dict:
+    paths: dict[str, str] = {}
+    if not isinstance(run_record, dict):
+        return paths
+
+    # explicit dict of paths
+    if isinstance(run_record.get("resource_usage_paths"), dict):
+        for k, v in (run_record.get("resource_usage_paths") or {}).items():
+            if v:
+                paths[str(k)] = str(v)
+
+    # legacy fields
+    if run_record.get("host_resource_usage"):
+        paths.setdefault("host_local", str(run_record.get("host_resource_usage")))
+    if run_record.get("container_resource_usage"):
+        paths.setdefault("container_local", str(run_record.get("container_resource_usage")))
+
+    # parse param lines for resource usage pointers
+    param_lines = run_record.get("metric_params") or run_record.get("params") or []
+    key_map = {
+        "host_resource_usage": "host_local",
+        "container_resource_usage": "container_local",
+        "source_resource_usage": "container_source",
+        "dest_resource_usage": "host_dest_transfer",
+    }
+    if isinstance(param_lines, list):
+        for ln in param_lines:
+            if not isinstance(ln, str) or ":" not in ln:
+                continue
+            k, v = ln.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k in key_map and v:
+                paths.setdefault(key_map[k], v)
+
+    # optional remote resource usage map
+    if isinstance(run_record.get("remote_resource_usage"), dict):
+        for k, v in (run_record.get("remote_resource_usage") or {}).items():
+            if v:
+                paths.setdefault(str(k), str(v))
+
+    return paths
+
+
+def _load_run_records(label: str, mode: str) -> list:
+    rows = []
+    dir_mode = os.path.join(RESULTS_ROOT, label, mode)
+    if not os.path.isdir(dir_mode):
+        return rows
+    for path in sorted(glob.glob(os.path.join(dir_mode, "*.json"))):
+        try:
+            with open(path, "r", encoding="utf-8") as jf:
+                rows.append(json.load(jf))
+        except Exception:
+            continue
+    return rows
+
+
+def regenerate_resource_usage_table(label: str, modes: Optional[list[str]] = None) -> Optional[str]:
+    """Build resource_usage_integrated.csv from per-run JSONs (resource usage summaries)."""
+    if modes is None:
+        modes = ["migration", "migration-local"]
+
+    rows = []
+    for mode in modes:
+        for rec in _load_run_records(label, mode):
+            if not isinstance(rec, dict):
+                continue
+            paths = _extract_resource_usage_paths(rec)
+            summaries = rec.get("resource_usage_summary") if isinstance(rec.get("resource_usage_summary"), dict) else {}
+            row: dict[str, object] = {
+                "mode": mode,
+                "exp": rec.get("exp", ""),
+                "scene": rec.get("scene", ""),
+                "run": rec.get("run", ""),
+            }
+            for role, path in (paths or {}).items():
+                summ = None
+                if isinstance(summaries, dict) and summaries.get(role):
+                    summ = summaries.get(role)
+                else:
+                    summ = summarize_resource_usage_csv(path)
+                if not summ:
+                    continue
+                for k, v in summ.items():
+                    row[f"{role}_{k}"] = v
+            rows.append(row)
+
+    if not rows:
+        return None
+
+    # Sort rows by scene, experiment order, then run index
+    exp_order = list(EXPERIMENTS.keys()) if 'EXPERIMENTS' in globals() else []
+
+    def _exp_sort_key(e):
+        e = (e or '').strip()
+        if e in exp_order:
+            return (0, exp_order.index(e))
+        return (1, e)
+
+    def _row_sort_key(r):
+        scene = str(r.get('scene', '')).strip()
+        exp = str(r.get('exp', '')).strip()
+        run = r.get('run')
+        try:
+            run_k = int(run)
+        except Exception:
+            try:
+                run_k = int(str(run).strip())
+            except Exception:
+                run_k = str(run)
+        return (scene, _exp_sort_key(exp), run_k)
+
+    rows.sort(key=_row_sort_key)
+
+    metric_keys: list[str] = []
+    base_cols = {"mode", "exp", "scene", "run"}
+    for r in rows:
+        for k in r.keys():
+            if k in base_cols:
+                continue
+            if k not in metric_keys:
+                metric_keys.append(k)
+    metric_keys = sorted(metric_keys)
+
+    out_dir = os.path.join(RESULTS_ROOT, label)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "resource_usage_integrated.csv")
+
+    headers = ["mode", "exp", "scene", "run"] + metric_keys
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for r in rows:
+            row = [
+                r.get("mode", ""),
+                str(r.get("exp", "")),
+                str(r.get("scene", "")),
+                str(r.get("run", "")),
+            ]
+            for key in metric_keys:
+                row.append(r.get(key, ""))
+            writer.writerow(row)
+
+    print(f"[result] resource usage table -> {out_path}")
     return out_path
 
 
@@ -1929,13 +2203,14 @@ def append_scene_exp_summary(scene: str, exp_name: str, run_metrics: List[dict])
 
     out_path = os.path.join(get_run_dir(), f"mig_test_{scene}.csv")
     is_new = not os.path.exists(out_path)
-    with open(out_path, "a", encoding="utf-8") as f:
+    with open(out_path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
         if is_new:
-            f.write("exp\tmetric\tmean\tstdev\truns\n")
+            writer.writerow(["exp", "metric", "mean", "stdev", "runs"])
         for metric, vals in metric_values.items():
             mean = statistics.mean(vals)
             stdev = statistics.stdev(vals) if len(vals) > 1 else 0.0
-            f.write(f"{exp_name}\t{metric}\t{mean:.6f}\t{stdev:.6f}\t{len(vals)}\n")
+            writer.writerow([exp_name, metric, f"{mean:.6f}", f"{stdev:.6f}", len(vals)])
     return out_path
 
 
@@ -4030,6 +4305,83 @@ def stop_bench_background(scene: str, remote: bool = False):
         run_cmd(stop_cmd, ignore_error=True)
 
 
+def _start_remote_host_monitor(target_ip: str, role: str, scene: str, exp_name: str, run_index: int):
+    if not target_ip or target_ip in LOCAL_HOSTS:
+        return None
+    try:
+        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        remote_tmp = f"/tmp/fog_test/{RUN_LABEL}"
+        remote_log = os.path.join(remote_tmp, "logs", "monitor", f"host_monitor_{role}_{scene}_{exp_name}.run{run_index}.{ts}.log")
+        remote_out = os.path.join(remote_tmp, "r_log", f"resource_usage.host.{role}.{scene}.{exp_name}.run{run_index}.{ts}.csv")
+        remote_pidfile = os.path.join(remote_tmp, "pids", f"host_monitor_{role}_{scene}_{exp_name}.run{run_index}.pid")
+        cmd = (
+            f"mkdir -p {shlex.quote(os.path.dirname(remote_log))} {shlex.quote(os.path.dirname(remote_out))} {shlex.quote(os.path.dirname(remote_pidfile))} ; "
+            f"nohup python3 /runc/dirty-track/mig-scripts/host_monitor_tool.py "
+            f"--interval {float(MONITOR_INTERVAL)} --iface {shlex.quote(MONITOR_IFACE)} --out {shlex.quote(remote_out)} "
+            f"> {shlex.quote(remote_log)} 2>&1 & echo $! > {shlex.quote(remote_pidfile)}"
+        )
+        run_remote_cmd(cmd, target_ip, ignore_error=True, quiet=True)
+        return {
+            "target_ip": target_ip,
+            "role": role,
+            "scene": scene,
+            "exp": exp_name,
+            "run": run_index,
+            "pidfile": remote_pidfile,
+            "out_path": remote_out,
+            "log_path": remote_log,
+        }
+    except Exception as e:
+        print(f"[monitor] failed to start remote host monitor on {target_ip}: {e}")
+        return None
+
+
+def _stop_remote_host_monitor(info: dict) -> None:
+    if not info:
+        return
+    target_ip = info.get("target_ip")
+    pidfile = info.get("pidfile")
+    if not target_ip or not pidfile:
+        return
+    stop_cmd = (
+        f"if [ -f {shlex.quote(pidfile)} ]; then PID=$(cat {shlex.quote(pidfile)}); "
+        "if [ -n \"$PID\" ]; then kill -TERM $PID 2>/dev/null || true; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do if ! kill -0 $PID 2>/dev/null; then break; fi; sleep 0.2; done; "
+        "if kill -0 $PID 2>/dev/null; then kill -9 $PID 2>/dev/null || true; fi; fi; "
+        f"rm -f {shlex.quote(pidfile)}; fi"
+    )
+    try:
+        run_remote_cmd(stop_cmd, target_ip, ignore_error=True, quiet=True)
+    except Exception:
+        pass
+
+
+def _fetch_remote_monitor_output(info: dict, local_dir: str) -> Optional[str]:
+    if not info:
+        return None
+    target_ip = info.get("target_ip")
+    remote_path = info.get("out_path")
+    role = info.get("role", "remote")
+    if not target_ip or not remote_path:
+        return None
+    try:
+        os.makedirs(local_dir, exist_ok=True)
+    except Exception:
+        pass
+    base = os.path.basename(remote_path)
+    local_path = os.path.join(local_dir, f"remote_{role}_{target_ip}_{base}")
+    try:
+        res = run_remote_cmd(f"cat {shlex.quote(remote_path)}", target_ip, ignore_error=True, quiet=True)
+        content = getattr(res, "stdout", "") or ""
+        if not content:
+            return None
+        with open(local_path, "w", encoding="utf-8") as fo:
+            fo.write(content)
+        return local_path
+    except Exception:
+        return None
+
+
 def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_index: int, bench_duration: int = 600, bench_threads: int = 2, apply_network: bool = True, bench_host: Optional[str] = None, bench_dataset: Optional[str] = None, bench_files: Optional[str] = None):
     print(f"[mig] preparing migration for scene={scene} run={run_index} exp={exp_name}")
     destination_prepare_migration(scene, port)
@@ -4072,6 +4424,53 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
             configure_network(bandwidth=BANDWIDTH)
         except Exception as e:
             print(f"[net] configure_network error: {e}")
+
+    # Start host-level and optional container resource monitors (if enabled and running locally)
+    resmon_host = None
+    resmon_container = None
+    _monitor_mod = None
+    remote_monitors = []
+    if (MONITOR_HOST or MONITOR_CONTAINER) and SOURCE_IP in LOCAL_HOSTS:
+        try:
+            import importlib.util as _il
+            spec = _il.spec_from_file_location("monitor_mod", os.path.join(os.path.dirname(__file__), "monitor.py"))
+            _monitor_mod = _il.module_from_spec(spec)
+            spec.loader.exec_module(_monitor_mod)
+            ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+            base = os.path.join(get_run_dir(), "r_log")
+            os.makedirs(base, exist_ok=True)
+            if MONITOR_HOST:
+                out_path = os.path.join(base, f"resource_usage.host.{scene}.{exp_name}.run{run_index}.{ts}.csv")
+                resmon_host = _monitor_mod.HostResourceMonitor(out_path, interval=MONITOR_INTERVAL, iface=MONITOR_IFACE)
+                resmon_host.start()
+                print(f"[monitor] host resource monitor started -> {resmon_host.out_path}")
+            if MONITOR_CONTAINER:
+                c_out = os.path.join(base, f"resource_usage.container.{scene}.{exp_name}.run{run_index}.{ts}.csv")
+                try:
+                    resmon_container = _monitor_mod.ContainerResourceMonitor(
+                        scene, interval=MONITOR_INTERVAL, out_path=c_out, include_host=True, enable_net=True, host_iface=MONITOR_IFACE
+                    )
+                    resmon_container.start()
+                    print(f"[monitor] container resource monitor started -> {resmon_container.out_path}")
+                except Exception as ce:
+                    print(f"[monitor] failed to start container monitor for {scene}: {ce}")
+            try:
+                _monitor_mod.set_phase("bench")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[monitor] failed to start monitors: {e}")
+
+    # Start host resource monitors on remote hosts when applicable
+    if MONITOR_HOST:
+        if DEST_IP and DEST_IP not in LOCAL_HOSTS:
+            info = _start_remote_host_monitor(DEST_IP, "host_dest", scene, exp_name, run_index)
+            if info:
+                remote_monitors.append(info)
+        if SOURCE_IP and SOURCE_IP not in LOCAL_HOSTS:
+            info = _start_remote_host_monitor(SOURCE_IP, "host_source", scene, exp_name, run_index)
+            if info:
+                remote_monitors.append(info)
 
     # Wait a randomized ramp-up time (bench runs 20-30s before migration starts)
     try:
@@ -4143,6 +4542,11 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
 
     try:
         try:
+            if resmon_host:
+                try:
+                    _monitor_mod.set_phase("transfer")
+                except Exception:
+                    pass
             result = run_cmd(cmd_list, quiet=True, cwd=script_dir)
             stdout = getattr(result, 'stdout', '') or ''
         except Exception as exc:
@@ -4211,6 +4615,82 @@ def run_migration_once(scene: str, port: int, exp_args: str, exp_name: str, run_
         except Exception as e:
             print(f"[bench] fetch_remote_workload_metrics failed: {e}")
 
+        # Stop host and container monitors (if started) and expose METRIC_PARAM + add to params for return
+        try:
+            if resmon_host or resmon_container:
+                try:
+                    if _monitor_mod:
+                        _monitor_mod.set_phase("done")
+                except Exception:
+                    pass
+                if resmon_host:
+                    try:
+                        resmon_host.stop()
+                    except Exception:
+                        pass
+                    try:
+                        print(f"METRIC_PARAM\thost_resource_usage\t{resmon_host.out_path}")
+                    except Exception:
+                        pass
+                    try:
+                        run_result_payload['host_resource_usage'] = resmon_host.out_path
+                    except Exception:
+                        pass
+                    try:
+                        run_result_payload.setdefault('params', [])
+                        run_result_payload['params'].append(f"host_resource_usage: {resmon_host.out_path}")
+                    except Exception:
+                        pass
+                    try:
+                        _record_resource_usage(run_result_payload, "host_local", resmon_host.out_path)
+                    except Exception:
+                        pass
+                if resmon_container:
+                    try:
+                        resmon_container.stop()
+                    except Exception:
+                        pass
+                    try:
+                        print(f"METRIC_PARAM\tcontainer_resource_usage\t{resmon_container.out_path}")
+                    except Exception:
+                        pass
+                    try:
+                        run_result_payload['container_resource_usage'] = resmon_container.out_path
+                    except Exception:
+                        pass
+                    try:
+                        run_result_payload.setdefault('params', [])
+                        run_result_payload['params'].append(f"container_resource_usage: {resmon_container.out_path}")
+                    except Exception:
+                        pass
+                    try:
+                        _record_resource_usage(run_result_payload, "container_local", resmon_container.out_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Stop and collect remote host monitors (if any)
+        try:
+            if remote_monitors:
+                local_dir = os.path.join(get_run_dir(), "r_log")
+                for info in remote_monitors:
+                    try:
+                        _stop_remote_host_monitor(info)
+                    except Exception:
+                        pass
+                    try:
+                        local_path = _fetch_remote_monitor_output(info, local_dir)
+                        if local_path:
+                            role = info.get("role") or "remote"
+                            run_result_payload.setdefault('remote_resource_usage', {})
+                            run_result_payload['remote_resource_usage'][role] = local_path
+                            _record_resource_usage(run_result_payload, role, local_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         # Collect dirtymap accuracy stats before cleaning containers (only for runs that enabled -dm)
         try:
             try:
@@ -4258,6 +4738,99 @@ def run_migration_local_once(scene: str, port: int, exp_args: str, exp_name: str
         )
     finally:
         SOURCE_IP, DEST_IP, CLIENT_IP = prev_source, prev_dest, prev_client
+
+
+def run_monitor_only(duration: int = 8, scene_hint: Optional[str] = None):
+    """Run a short resource monitor selftest without triggering migration."""
+    scene = scene_hint or "monitor"
+    exp_name = "monitor-only"
+    run_index = 1
+    run_result = {"scene": scene, "run": run_index, "exp": exp_name, "ok": True}
+
+    resmon_host = None
+    _monitor_mod = None
+    remote_monitors = []
+
+    try:
+        if MONITOR_HOST and SOURCE_IP in LOCAL_HOSTS:
+            try:
+                import importlib.util as _il
+                spec = _il.spec_from_file_location("monitor_mod", os.path.join(os.path.dirname(__file__), "monitor.py"))
+                _monitor_mod = _il.module_from_spec(spec)
+                spec.loader.exec_module(_monitor_mod)
+                ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+                base = os.path.join(get_run_dir(), "r_log")
+                os.makedirs(base, exist_ok=True)
+                out_path = os.path.join(base, f"resource_usage.host.{scene}.{exp_name}.run{run_index}.{ts}.csv")
+                resmon_host = _monitor_mod.HostResourceMonitor(out_path, interval=MONITOR_INTERVAL, iface=MONITOR_IFACE)
+                resmon_host.start()
+                try:
+                    _monitor_mod.set_phase("monitor-only")
+                except Exception:
+                    pass
+                print(f"[monitor] host resource monitor started -> {resmon_host.out_path}")
+            except Exception as e:
+                print(f"[monitor] failed to start local host monitor: {e}")
+
+        if MONITOR_HOST:
+            if DEST_IP and DEST_IP not in LOCAL_HOSTS:
+                info = _start_remote_host_monitor(DEST_IP, "host_dest", scene, exp_name, run_index)
+                if info:
+                    remote_monitors.append(info)
+            if SOURCE_IP and SOURCE_IP not in LOCAL_HOSTS:
+                info = _start_remote_host_monitor(SOURCE_IP, "host_source", scene, exp_name, run_index)
+                if info:
+                    remote_monitors.append(info)
+
+        sleep_secs = max(1, int(duration))
+        print(f"[monitor-only] sampling for {sleep_secs}s")
+        time.sleep(sleep_secs)
+    except Exception as e:
+        run_result["ok"] = False
+        run_result["error"] = str(e)
+    finally:
+        # stop local host monitor
+        if resmon_host:
+            try:
+                if _monitor_mod:
+                    _monitor_mod.set_phase("done")
+            except Exception:
+                pass
+            try:
+                resmon_host.stop()
+            except Exception:
+                pass
+            try:
+                print(f"METRIC_PARAM\thost_resource_usage\t{resmon_host.out_path}")
+            except Exception:
+                pass
+            run_result["host_resource_usage"] = resmon_host.out_path
+            _record_resource_usage(run_result, "host_local", resmon_host.out_path)
+
+        # stop and fetch remote host monitors
+        if remote_monitors:
+            local_dir = os.path.join(get_run_dir(), "r_log")
+            for info in remote_monitors:
+                try:
+                    _stop_remote_host_monitor(info)
+                except Exception:
+                    pass
+                try:
+                    local_path = _fetch_remote_monitor_output(info, local_dir)
+                    if local_path:
+                        role = info.get("role") or "remote"
+                        run_result.setdefault("remote_resource_usage", {})
+                        run_result["remote_resource_usage"][role] = local_path
+                        _record_resource_usage(run_result, role, local_path)
+                except Exception:
+                    pass
+
+    write_run_record("monitor", scene, exp_name, run_index, run_result)
+    try:
+        regenerate_resource_usage_table(RUN_LABEL, modes=["monitor"])
+    except Exception as e:
+        print(f"[result] failed to regenerate resource usage table: {e}")
+    print("[monitor-only] finished")
 
 
 def parse_size_bytes(spec: str) -> int:
@@ -4453,6 +5026,13 @@ def main():
     parser.add_argument('--results-label', type=str, default=None, help='Use a specific results label/dir under /runc/results (e.g., 20260128T160038Z)')
     parser.add_argument('--run-start', type=int, default=1, help='Starting run index used for result filenames (default 1)')
     parser.add_argument('--recompute', action='store_true', help='Recompute per-scene summary CSVs in results folder after runs')
+    # Host-level monitoring flags
+    parser.add_argument('--monitor-host', action=argparse.BooleanOptionalAction, default=True, help='Enable host resource monitoring for migration runs (writes METRIC_PARAM\\thost_resource_usage path)')
+    parser.add_argument('--monitor-interval', type=float, default=1.0, help='Sampling interval (seconds) for host resource monitoring')
+    parser.add_argument('--monitor-iface', type=str, default=None, help='Host network interface to monitor for bandwidth (auto-detect if unset)')
+    parser.add_argument('--monitor-container', action=argparse.BooleanOptionalAction, default=False, help='Enable container-level monitoring from fog_test (if not relying on source script monitor)')
+    parser.add_argument('--monitor-only', action='store_true', help='Run monitor selftest without triggering migration')
+    parser.add_argument('--monitor-duration', type=int, default=8, help='Seconds to run monitor-only test')
     args = parser.parse_args()
 
     SOURCE_IP = args.source_ip
@@ -4461,6 +5041,12 @@ def main():
     BANDWIDTH = args.bandwidth
     SEC_MODE = bool(args.sec)
     SOURCE_SCRIPT, DEST_SCRIPT = choose_scripts(SEC_MODE)
+    # Monitor defaults assigned from args
+    global MONITOR_HOST, MONITOR_INTERVAL, MONITOR_IFACE, MONITOR_CONTAINER
+    MONITOR_HOST = bool(getattr(args, 'monitor_host', True))
+    MONITOR_INTERVAL = float(getattr(args, 'monitor_interval', 1.0))
+    MONITOR_IFACE = getattr(args, 'monitor_iface', None) or _find_primary_iface() or "ens33"
+    MONITOR_CONTAINER = bool(getattr(args, 'monitor_container', False))
     # apply optional bench overrides
     global BENCH_DATASET, BENCH_FILES
     BENCH_DATASET = getattr(args, 'bench_dataset', None)
@@ -4478,6 +5064,20 @@ def main():
         TMP_PIDS = os.path.join(TMP_ROOT, 'pids')
 
     ensure_dirs()
+
+    # Monitor-only selftest path (no migration required)
+    if getattr(args, 'monitor_only', False):
+        scenes = []
+        if args.scenes == 'all':
+            scenes = list(SCENE_INFO.keys())
+        else:
+            for s in args.scenes.split(','):
+                s = s.strip()
+                if s and s in SCENE_INFO:
+                    scenes.append(s)
+        scene_hint = scenes[0] if scenes else None
+        run_monitor_only(duration=int(getattr(args, 'monitor_duration', 8)), scene_hint=scene_hint)
+        return
 
     # Quick runc availability check: if 'runc list' reports missing /run/runc, attempt to create it and retry.
     # On persistent failure, abort early rather than proceeding with migrations that rely on runc.
@@ -4653,6 +5253,15 @@ def main():
                             run_result['metrics_values'] = mig_data['stats']
                         if mig_data.get('params'):
                             run_result['metric_params'] = mig_data['params']
+                        for key in (
+                            'host_resource_usage',
+                            'container_resource_usage',
+                            'resource_usage_paths',
+                            'resource_usage_summary',
+                            'remote_resource_usage',
+                        ):
+                            if mig_data.get(key) is not None:
+                                run_result[key] = mig_data[key]
 
                     # Post-run: ensure VIP is restored/held on the source and capture diagnostics if not
                     try:
@@ -4691,6 +5300,10 @@ def main():
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2)
         write_integrated_table(results, "migration")
+        try:
+            regenerate_resource_usage_table(RUN_LABEL)
+        except Exception as e:
+            print(f"[result] failed to regenerate resource usage table: {e}")
         # When integrating into an existing results label (or when --recompute asked),
         # regenerate per-scene summary CSVs from the integrated table so files like
         # mig_test_gocr.csv reflect the full set of runs in the label
@@ -4699,6 +5312,10 @@ def main():
                 regenerate_mig_test_csvs(RUN_LABEL)
             except Exception as e:
                 print(f"[result] failed to regenerate per-scene CSVs: {e}")
+            try:
+                regenerate_resource_usage_table(RUN_LABEL)
+            except Exception as e:
+                print(f"[result] failed to regenerate resource usage table: {e}")
         print(f"[done] migration summary -> {out}")
         return
 
@@ -4805,6 +5422,15 @@ def main():
                                 run_result['metrics_values'] = mig_data['stats']
                             if mig_data.get('params'):
                                 run_result['metric_params'] = mig_data['params']
+                            for key in (
+                                'host_resource_usage',
+                                'container_resource_usage',
+                                'resource_usage_paths',
+                                'resource_usage_summary',
+                                'remote_resource_usage',
+                            ):
+                                if mig_data.get(key) is not None:
+                                    run_result[key] = mig_data[key]
                         results.append(run_result)
                         write_run_record('migration-local', scene, exp_name, run_idx, run_result)
                         port = run_port + 1
@@ -4821,6 +5447,10 @@ def main():
         with open(out, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2)
         write_integrated_table(results, "migration-local")
+        try:
+            regenerate_resource_usage_table(RUN_LABEL)
+        except Exception as e:
+            print(f"[result] failed to regenerate resource usage table: {e}")
         print(f"[done] migration-local summary -> {out}")
         return
 
